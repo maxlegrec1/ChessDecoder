@@ -1,0 +1,28 @@
+project_name: "chess-decoder"
+run_name: "run-1"
+
+data:
+  parquet_dir: "parquets/"
+  batch_size: 32
+  num_workers: 4
+  max_seq_len: 256
+
+model:
+  embed_dim: 768
+  num_heads: 12
+  num_layers: 12
+  max_seq_len: 256
+
+training:
+  learning_rate: 5.0e-5
+  weight_decay: 0.1
+  gradient_accumulation_steps: 4
+  num_epochs: 10
+  log_every_n_steps: 1
+  save_every_n_steps: 1000
+  device: "cuda"
+
+loss:
+  move_weight: 5.0
+  board_weight: 1
+  wdl_weight: 1.0
