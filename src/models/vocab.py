@@ -222,17 +222,23 @@ policy_index = [
 # Precomputed mapping for O(1) lookup of policy token -> index
 policy_to_idx = {u: i for i, u in enumerate(policy_index)}
 
+# Board squares in order (a1, b1, ..., h8)
 squares = [f"{f}{r}" for r in "12345678" for f in "abcdefgh"]
+
+# Piece tokens: color_piece (no square info - position is implicit)
 pieces = ["king", "queen", "rook", "bishop", "knight", "pawn"]
 colors = ["white", "black"]
+piece_tokens = [f"{c}_{p}" for c in colors for p in pieces]
 
-piece_square_tokens = [
-    f"{c}_{p}_{s}" for c in colors for p in pieces for s in squares
-    if not (p == "pawn" and ((c == "white" and s[1] == "1") or (c == "black" and s[1] == "8")))
-]
+# Special tokens
 castling_tokens = ["".join(c) for r in range(1, 5) for c in itertools.combinations("KQkq", r)] + ["no_castling_rights"]
-special_tokens = ["start_pos", "end_pos", "white_to_move","black_to_move", "pad", "bos", "eos"]
-vocab = policy_index + piece_square_tokens + special_tokens + castling_tokens
+special_tokens = ["start_pos", "end_pos", "white_to_move", "black_to_move", "empty", "pad", "bos", "eos"]
+
+# Build vocabulary: policy moves + piece tokens + special tokens + castling
+vocab = policy_index + piece_tokens + special_tokens + castling_tokens
 token_to_idx = {t: i for i, t in enumerate(vocab)}
 idx_to_token = {i: t for i, t in enumerate(vocab)}
 vocab_size = len(vocab)
+
+# Position length: start_pos + 64 board tokens + end_pos + castling + side_to_move = 68
+POSITION_TOKEN_LENGTH = 68

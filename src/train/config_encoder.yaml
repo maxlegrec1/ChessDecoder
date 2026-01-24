@@ -1,0 +1,26 @@
+project_name: "chess-decoder"
+run_name: "encoder-v1"
+
+data:
+  parquet_dir: "parquets/"
+  batch_size: 256
+  num_workers: 4
+  max_seq_len: 68  # Fixed position length: start_pos + 64 board + end_pos + castling + side_to_move
+
+model:
+  embed_dim: 768
+  num_heads: 12
+  num_layers: 12
+  max_seq_len: 68
+
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.1
+  gradient_accumulation_steps: 1
+  num_epochs: 10
+  log_every_n_steps: 1
+  save_every_n_steps: 1000
+  save_every_n_epochs: 1
+  checkpoint_dir: "src/train/checkpoints/encoder"
+  device: "cuda"
+  use_scheduler: true

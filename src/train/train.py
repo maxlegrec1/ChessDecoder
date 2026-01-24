@@ -30,14 +30,14 @@ def train():
         num_layers=config["model"]["num_layers"],
         max_seq_len=config["model"]["max_seq_len"]
     ).to(device)
-    # model.load_state_dict(torch.load("src/train/checkpoints/checkpoint_epoch_6.pt"))
 
     # Dataloader
     dataloader = get_dataloader(
         config["data"]["parquet_dir"],
         batch_size=config["data"]["batch_size"],
         num_workers=config["data"].get("num_workers", 0),
-        max_seq_len=config["data"]["max_seq_len"]
+        max_seq_len=config["data"]["max_seq_len"],
+        skip_board_prob=config["data"].get("skip_board_prob", 0.0)
     )
     
     # Optimizer
@@ -172,7 +172,8 @@ def train():
                     "train/move_acc": move_acc.item(),
                     "train/board_acc": board_acc.item(),
                     "train/epoch": epoch,
-                    "train/step": step
+                    "train/step": step,
+                    "train/grad_step": step / config["training"].get("gradient_accumulation_steps", 1)
                 })
                 
             step += 1

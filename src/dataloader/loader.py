@@ -10,11 +10,12 @@ from src.dataloader.data import game_to_token_ids
 from src.models.vocab import token_to_idx
 
 class ChessIterableDataset(IterableDataset):
-    def __init__(self, parquet_dir, max_seq_len=2048, shuffle_files=True, shuffle_games=True):
+    def __init__(self, parquet_dir, max_seq_len=2048, shuffle_files=True, shuffle_games=True, skip_board_prob=0.0):
         self.parquet_dir = parquet_dir
         self.max_seq_len = max_seq_len
         self.shuffle_files = shuffle_files
         self.shuffle_games = shuffle_games
+        self.skip_board_prob = skip_board_prob
         self.pad_id = token_to_idx["pad"]
         
         # Find all parquet files
@@ -50,7 +51,7 @@ class ChessIterableDataset(IterableDataset):
                 for game_id in game_ids:
                     game_df = df[df['game_id'] == game_id].sort_values('ply')
                     
-                    ids, wdl_data = game_to_token_ids(game_df)
+                    ids, wdl_data = game_to_token_ids(game_df, skip_board_prob=self.skip_board_prob)
                     
                     # Randomly select a start position
                     # Valid start indices are 0 (start of game) and immediately after each move
@@ -105,8 +106,14 @@ class ChessIterableDataset(IterableDataset):
                 print(f"Error reading file {file_path}: {e}")
                 continue
 
-def get_dataloader(parquet_dir, batch_size=16, num_workers=0, max_seq_len=2048):
+def get_dataloader(parquet_dir, batch_size=16, num_workers=0, max_seq_len=2048, skip_board_prob=0.0):
     # shuffle=True is not supported for IterableDataset in DataLoader
     # We handle shuffling internally
-    dataset = ChessIterableDataset(parquet_dir, shuffle_files=True, shuffle_games=True, max_seq_len=max_seq_len)
+    dataset = ChessIterableDataset(
+        parquet_dir, 
+        shuffle_files=True, 
+        shuffle_games=True, 
+        max_seq_len=max_seq_len,
+        skip_board_prob=skip_board_prob
+    )
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)

@@ -1,20 +1,33 @@
 import chess
 import pandas as pd
+import random
 from src.models.vocab import token_to_idx
 
+
 def fen_to_position_tokens(fen: str):
+    """
+    Convert FEN to fixed-length position tokens.
+    
+    Output format (68 tokens total):
+        - start_pos (1 token)
+        - 64 board tokens in order a1, b1, c1, ..., h8 (each is either 'empty' or 'color_piece')
+        - end_pos (1 token)
+        - castling rights (1 token)
+        - side to move (1 token)
+    """
     board = chess.Board(fen)
     tokens = ["start_pos"]
     
-    # Deterministic board scan: a1, b1, ..., h8
+    # Fixed 64 board tokens: a1, b1, c1, ..., h8
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece:
             color = "white" if piece.color == chess.WHITE else "black"
             piece_type = chess.piece_name(piece.piece_type)
-            square_name = chess.square_name(square)
-            tokens.append(f"{color}_{piece_type}_{square_name}")
-            
+            tokens.append(f"{color}_{piece_type}")
+        else:
+            tokens.append("empty")
+    
     tokens.append("end_pos")
     
     # Castling rights
@@ -28,19 +41,24 @@ def fen_to_position_tokens(fen: str):
         tokens.append("no_castling_rights")
     else:
         tokens.append(rights)
-        
+    
     # Side to move
     tokens.append("white_to_move" if board.turn == chess.WHITE else "black_to_move")
     
     return tokens
 
-def game_to_token_ids(game_df):
+
+def game_to_token_ids(game_df, skip_board_prob=0.0):
     sequence = []
-    wdl_data = [] # (index, best_move, wdl, is_valid_wdl)
+    wdl_data = []  # (index, best_move, wdl, is_valid_wdl)
     
-    for _, row in game_df.iterrows():
-        pos_tokens = fen_to_position_tokens(row['fen'])
-        sequence.extend(pos_tokens)
+    for i, (_, row) in enumerate(game_df.iterrows()):
+        # Always include the first board, or include board with (1 - skip_board_prob)
+        include_board = (i == 0) or (random.random() > skip_board_prob)
+        
+        if include_board:
+            pos_tokens = fen_to_position_tokens(row['fen'])
+            sequence.extend(pos_tokens)
         
         # The move token is where we want to predict the move AND the WDL
         if 'played_move' in row and row['played_move']:
@@ -60,6 +78,6 @@ def game_to_token_ids(game_df):
             
             wdl = [win, draw, loss]
             wdl_data.append((move_idx, best_move, wdl, is_valid_wdl))
-            
+    
     ids = [token_to_idx[t] for t in sequence]
     return ids, wdl_data

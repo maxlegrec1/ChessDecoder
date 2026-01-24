@@ -3,9 +3,10 @@ run_name: "run-1"
 
 data:
   parquet_dir: "parquets/"
-  batch_size: 32
+  batch_size: 16
   num_workers: 4
   max_seq_len: 256
+  skip_board_prob: 0.2
 
 model:
   embed_dim: 768

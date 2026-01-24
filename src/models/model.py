@@ -1,31 +1,39 @@
 import torch
 import torch.nn as nn
 import chess
-from torchtune.modules import TransformerSelfAttentionLayer, MultiHeadAttention, FeedForward, RMSNorm
+from torchtune.modules import TransformerSelfAttentionLayer, MultiHeadAttention, FeedForward, RMSNorm, RotaryPositionalEmbeddings
 from src.dataloader.data import fen_to_position_tokens
-from src.models.vocab import token_to_idx, idx_to_token, vocab, squares
+from src.models.vocab import token_to_idx, idx_to_token
+
 
 class ChessDecoder(nn.Module):
+    """
+    Decoder chess model with causal attention and RoPE.
+    
+    Board representation is fixed 68 tokens per position:
+        - start_pos (1)
+        - 64 board tokens (each square: empty or color_piece)
+        - end_pos (1)
+        - castling (1)
+        - side_to_move (1)
+    
+    Uses RoPE for positional encoding.
+    """
+    
     def __init__(self, vocab_size, embed_dim=768, num_heads=12, num_layers=12, max_seq_len=2048):
         super().__init__()
-        # Reworked Embedding: Token + Absolute Position + Square
-        self.tok_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embedding = nn.Embedding(max_seq_len, embed_dim)
         
-        # Precompute mapping from token_id to square_id (0-63)
-        token_to_square = torch.full((vocab_size,), 64, dtype=torch.long) # 64 = No Square
-        square_to_idx = {s: i for i, s in enumerate(squares)}
-        for i, token in enumerate(vocab):
-            # piece_square tokens are formatted as "color_piece_square"
-            parts = token.split('_')
-            if len(parts) >= 3 and parts[-1] in square_to_idx:
-                token_to_square[i] = square_to_idx[parts[-1]]
-        self.register_buffer("token_to_square_map", token_to_square)
-        self.square_embedding = nn.Embedding(65, embed_dim) # 64 squares + 1 null
+        head_dim = embed_dim // num_heads
+        
+        # Token embedding only (RoPE handles positional info)
+        self.tok_embedding = nn.Embedding(vocab_size, embed_dim)
 
         from src.models.vocab import policy_index
         self.start_pos_id = token_to_idx["start_pos"]
         self.num_policy_tokens = len(policy_index)
+
+        # RoPE - shared across all layers
+        rope = RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len)
 
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
@@ -33,12 +41,12 @@ class ChessDecoder(nn.Module):
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 num_kv_heads=num_heads,
-                head_dim=embed_dim // num_heads,
+                head_dim=head_dim,
                 q_proj=nn.Linear(embed_dim, embed_dim, bias=False),
                 k_proj=nn.Linear(embed_dim, embed_dim, bias=False),
                 v_proj=nn.Linear(embed_dim, embed_dim, bias=False),
                 output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
-                pos_embeddings=None, # RoPE is removed in favor of absolute+square embeddings
+                pos_embeddings=rope,
                 max_seq_len=max_seq_len,
                 is_causal=True
             )
@@ -92,13 +100,8 @@ class ChessDecoder(nn.Module):
                     else:
                         mask[b, s_idx:, s_idx:] = True
         
-        # 2. Embedding Injection
-        # Token embedding + Global sequence position + Explicit Square embedding
+        # 2. Token embedding only (RoPE is applied in attention)
         h = self.tok_embedding(x)
-        h = h + self.pos_embedding(input_pos)
-        
-        sq_ids = self.token_to_square_map[x]
-        h = h + self.square_embedding(sq_ids)
         
         # 3. Transformer Layers
         for layer in self.layers:
