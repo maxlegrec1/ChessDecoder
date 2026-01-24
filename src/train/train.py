@@ -70,6 +70,7 @@ def train():
             target_ids = batch["target_ids"].to(device)
             wdl_targets = batch["wdl_targets"].to(device)
             wdl_mask = batch["wdl_mask"].to(device)
+            block_id = batch["block_id"].to(device)
 
             # Mixed precision forward passes and loss computation
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
@@ -79,7 +80,9 @@ def train():
 
                 # Pass 2: Prefix masking for move and value prediction
                 # This allows full bidirectional board context for better move selection.
-                policy_logits_prefix, value_logits_prefix = model(input_ids, mask_type="prefix")
+                policy_logits_prefix, value_logits_prefix = model(
+                    input_ids, mask_type="prefix", block_id=block_id
+                )
 
                 # Compute cross-entropy loss per position for both passes
                 ce_loss_causal = ce_loss_fn(policy_logits_causal.view(-1, vocab_size), target_ids.view(-1))

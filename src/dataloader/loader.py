@@ -50,44 +50,55 @@ class ChessIterableDataset(IterableDataset):
                     
                 for game_id in game_ids:
                     game_df = df[df['game_id'] == game_id].sort_values('ply')
-                    
-                    ids, wdl_data = game_to_token_ids(game_df, skip_board_prob=self.skip_board_prob)
-                    
+
+                    ids, wdl_data, block_boundaries = game_to_token_ids(game_df, skip_board_prob=self.skip_board_prob)
+
                     # Randomly select a start position
                     # Valid start indices are 0 (start of game) and immediately after each move
                     # wdl_data contains (move_idx, ...), so next position starts at move_idx + 1
                     valid_starts = [0] + [d[0] + 1 for d in wdl_data[:-1]]
-                    
+
                     # We might want to avoid starting too close to the end if we want meaningful sequences
                     # But for now, uniform choice is fine
                     start_idx = random.choice(valid_starts)
-                    
+
                     # Slice the sequence
                     ids = ids[start_idx:]
-                    
+
                     # Adjust wdl_data
                     # Filter out moves before start_idx and shift indices
-                    wdl_data = [(m_idx - start_idx, best, wdl, valid) 
-                                for m_idx, best, wdl, valid in wdl_data 
+                    wdl_data = [(m_idx - start_idx, best, wdl, valid)
+                                for m_idx, best, wdl, valid in wdl_data
                                 if m_idx >= start_idx]
-                    
+
+                    # Adjust block_boundaries for the sliced sequence
+                    adjusted_boundaries = []
+                    for (b_start, b_end) in block_boundaries:
+                        adj_start = b_start - start_idx
+                        adj_end = b_end - start_idx
+                        if adj_end > 0 and adj_start < len(ids):
+                            adjusted_boundaries.append((max(0, adj_start), min(len(ids), adj_end)))
+
                     # Truncate if necessary
                     if len(ids) > self.max_seq_len:
                         ids = ids[:self.max_seq_len]
                         wdl_data = [d for d in wdl_data if d[0] < self.max_seq_len]
-                        
+                        adjusted_boundaries = [(b_start, min(b_end, self.max_seq_len))
+                                               for (b_start, b_end) in adjusted_boundaries
+                                               if b_start < self.max_seq_len]
+
                     input_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
                     target_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
                     wdl_targets = torch.zeros((self.max_seq_len, 3), dtype=torch.float32)
                     wdl_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
-                    
+
                     seq_len = len(ids)
                     input_ids[:seq_len] = torch.tensor(ids, dtype=torch.long)
-                    
+
                     # Default target is offset by 1
                     if seq_len > 1:
                         target_ids[:seq_len-1] = input_ids[1:seq_len]
-                        
+
                     for move_idx, best_move, wdl, is_valid_wdl in wdl_data:
                         target_idx = move_idx - 1
                         if target_idx >= 0 and target_idx < self.max_seq_len:
@@ -95,12 +106,21 @@ class ChessIterableDataset(IterableDataset):
                             wdl_targets[target_idx] = torch.tensor(wdl, dtype=torch.float32)
                             if is_valid_wdl:
                                 wdl_mask[target_idx] = True
-                                
+
+                    # Build block_id tensor
+                    # Default: each position gets a unique ID (orphan/padding)
+                    max_block_num = len(adjusted_boundaries)
+                    block_id = torch.arange(self.max_seq_len, dtype=torch.long) + max_block_num
+                    # Assign block IDs to positions within blocks
+                    for block_num, (b_start, b_end) in enumerate(adjusted_boundaries):
+                        block_id[b_start:b_end] = block_num
+
                     yield {
                         "input_ids": input_ids,
                         "target_ids": target_ids,
                         "wdl_targets": wdl_targets,
-                        "wdl_mask": wdl_mask
+                        "wdl_mask": wdl_mask,
+                        "block_id": block_id,
                     }
             except Exception as e:
                 print(f"Error reading file {file_path}: {e}")

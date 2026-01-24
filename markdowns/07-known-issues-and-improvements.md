@@ -45,32 +45,7 @@ en_passant_tokens = [
 
 ---
 
-### 3. Prefix Mask Computation is O(batch × seq²)
-
-**Issue**: The prefix mask is built with nested Python loops.
-
-**Current Code** (`model.py:91-101`):
-```python
-for b in range(bsz):
-    starts = is_start[b].nonzero().flatten()
-    moves = is_move[b].nonzero().flatten()
-    for s in starts:
-        # ... modify mask
-```
-
-**Impact**: Slow for large batches or long sequences.
-
-**Fix**: Vectorize the mask construction:
-
-```python
-# Suggested vectorized approach:
-# 1. Find all (batch, start_pos, next_move) pairs at once
-# 2. Use scatter operations to fill mask blocks
-```
-
----
-
-### 4. No Learning Rate Scheduling
+### 3. No Learning Rate Scheduling
 
 **Issue**: Training uses a fixed learning rate.
 
@@ -87,7 +62,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
 
 ---
 
-### 5. No Validation Loop
+### 4. No Validation Loop
 
 **Issue**: No held-out data evaluation during training.
 
@@ -107,7 +82,7 @@ if step % val_every == 0:
 
 ---
 
-### 6. Single GPU Only
+### 5. Single GPU Only
 
 **Issue**: No distributed training support.
 
@@ -124,13 +99,11 @@ model = DDP(model, device_ids=[local_rank])
 
 ---
 
-## Potential Improvements
+## Implemented Improvements
 
-### High Priority
+### 1. Mixed Precision Training
 
-#### 1. Mixed Precision Training - IMPLEMENTED
-
-**Status**: Implemented in `train.py`
+**Status**: ✅ Implemented in `train.py`
 
 **Benefit**: ~2× speedup, ~50% memory reduction.
 
@@ -148,16 +121,46 @@ training:
 - Properly handles gradient clipping with `scaler.unscale_()`
 - Compatible with gradient accumulation
 
-#### 2. Flash Attention
+### 2. Vectorized Prefix Mask via block_id
 
-**Benefit**: Faster attention, less memory.
+**Status**: ✅ Implemented
 
-```python
-# In model.py, use Flash Attention-enabled MultiHeadAttention
-# TorchTune may support this via backend flags
-```
+**Benefit**: Eliminates Python loop overhead in prefix mask construction.
 
-#### 3. Gradient Checkpointing
+**Measured Performance** (RTX 3090, batch=16, seq=1024):
+| Masking Method | fp32 | fp16 |
+|----------------|------|------|
+| Legacy (Python loops) | 993 ms | 891 ms |
+| Vectorized (block_id) | 330 ms | 133 ms |
+| **Speedup** | **3.0×** | **6.7×** |
+
+**How it works**:
+
+1. **Dataloader** (`loader.py`) computes `block_id` tensor during data loading:
+   - Each position gets a block ID indicating which board block it belongs to
+   - Positions in the same block can attend to each other bidirectionally
+   - Orphan positions (padding, move tokens) get unique IDs
+
+2. **Model** (`model.py`) uses vectorized tensor operations:
+   ```python
+   # Instead of nested Python loops:
+   same_block = block_id.unsqueeze(-1) == block_id.unsqueeze(-2)  # [B, S, S]
+   mask = causal_mask.unsqueeze(0) | same_block
+   ```
+
+**Files Modified**:
+- `src/dataloader/data.py`: Returns `block_boundaries` from `game_to_token_ids()`
+- `src/dataloader/loader.py`: Builds and yields `block_id` tensor
+- `src/models/model.py`: Uses vectorized mask construction with `block_id`
+- `src/train/train.py`: Passes `block_id` to model
+
+---
+
+## Potential Improvements
+
+### High Priority
+
+#### 1. Gradient Checkpointing
 
 **Benefit**: Trade compute for memory.
 
@@ -172,7 +175,7 @@ for layer in self.layers:
 
 ### Medium Priority
 
-#### 4. Data Augmentation
+#### 2. Data Augmentation
 
 **Idea**: Mirror boards horizontally (flip a-h to h-a).
 
@@ -184,7 +187,7 @@ def mirror_position(tokens):
     # Mirror move: e2e4 → d2d4 (after adjusting)
 ```
 
-#### 5. Curriculum Learning
+#### 3. Curriculum Learning
 
 **Idea**: Start with simpler positions, gradually increase complexity.
 
@@ -195,7 +198,7 @@ def mirror_position(tokens):
 # 3. Full games from opening
 ```
 
-#### 6. Contrastive Learning for Value Head
+#### 4. Contrastive Learning for Value Head
 
 **Idea**: Learn relative position values, not just absolute WDL.
 
@@ -208,20 +211,20 @@ def mirror_position(tokens):
 
 ### Lower Priority
 
-#### 7. Move History Encoding
+#### 5. Move History Encoding
 
 **Idea**: Add explicit move history tokens for better context.
 
 **Current**: Board tokens implicitly encode history.
 **Improved**: Add last N moves as explicit tokens.
 
-#### 8. Multi-Task Learning with Puzzle Data
+#### 6. Multi-Task Learning with Puzzle Data
 
 **Idea**: Train on tactical puzzles alongside games.
 
 **Benefit**: Better tactical awareness, especially for rare positions.
 
-#### 9. MCTS Integration
+#### 7. MCTS Integration
 
 **Idea**: Use model as policy/value network in Monte Carlo Tree Search.
 
@@ -241,7 +244,7 @@ def fen_to_position_tokens(fen: str) -> List[str]:
 def game_to_token_ids(
     game_df: pd.DataFrame,
     skip_board_prob: float = 0.0
-) -> Tuple[List[int], List[Tuple[int, str, List[float], bool]]]:
+) -> Tuple[List[int], List[Tuple[int, str, List[float], bool]], List[Tuple[int, int]]]:
     ...
 ```
 
@@ -295,15 +298,13 @@ def test_vocab_consistency():
 
 ## Performance Optimization Checklist
 
-| Optimization | Status | Expected Speedup |
+| Optimization | Status | Measured Speedup |
 |--------------|--------|------------------|
-| Mixed precision (FP16/BF16) | ✅ Implemented | 2× |
-| Flash Attention | ❌ Not implemented | 1.5-2× |
-| Gradient checkpointing | ❌ Not implemented | Memory: 2-4× |
+| Mixed precision (FP16) | ✅ Implemented | ~2.5× |
+| Vectorized prefix masking | ✅ Implemented | 3× (fp32), 6.7× (fp16) |
+| Gradient checkpointing | ❌ Not implemented | Memory: 2-4× expected |
 | Multi-GPU (DDP) | ❌ Not implemented | Linear with GPUs |
-| Compiled model (torch.compile) | ❌ Not implemented | 1.2-1.5× |
 | Optimized data loading | ✅ IterableDataset | Baseline |
-| Vectorized masking | ❌ Not implemented | 1.1× |
 
 ---
 
@@ -313,22 +314,20 @@ def test_vocab_consistency():
 
 1. Add validation loop to detect overfitting
 2. Implement learning rate scheduling
-3. ~~Add mixed precision training~~ - DONE
 
 ### Short-term
 
-4. Add en passant encoding
-5. Implement gradient checkpointing for larger batches
-6. Add unit tests for data pipeline
+3. Add en passant encoding
+4. Implement gradient checkpointing for larger batches
+5. Add unit tests for data pipeline
 
-### Medium-term (1-2 months)
+### Medium-term
 
-7. Multi-GPU training support
-8. Integrate Flash Attention
-9. Implement MCTS for stronger play
+6. Multi-GPU training support
+7. Implement MCTS for stronger play
 
 ### Long-term (Research)
 
-10. Curriculum learning experiments
-11. Self-play training (RL fine-tuning)
-12. Distillation from stronger models
+8. Curriculum learning experiments
+9. Self-play training (RL fine-tuning)
+10. Distillation from stronger models

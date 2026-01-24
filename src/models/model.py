@@ -28,10 +28,6 @@ class ChessDecoder(nn.Module):
         # Token embedding only (RoPE handles positional info)
         self.tok_embedding = nn.Embedding(vocab_size, embed_dim)
 
-        from src.models.vocab import policy_index
-        self.start_pos_id = token_to_idx["start_pos"]
-        self.num_policy_tokens = len(policy_index)
-
         # RoPE - shared across all layers
         rope = RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len)
 
@@ -66,52 +62,47 @@ class ChessDecoder(nn.Module):
         self.policy_head = nn.Linear(embed_dim, vocab_size)
         self.value_head = nn.Linear(embed_dim, 3)
         
-    def forward(self, x, input_pos=None, mask_type="causal"):
+    def forward(self, x, input_pos=None, mask_type="causal", block_id=None):
         """
         Args:
             x (torch.Tensor): input tokens [b x s]
             input_pos (torch.Tensor): position ids [b x s]
             mask_type (str): "causal" or "prefix"
+            block_id (torch.Tensor): block IDs for each position [b x s]
+                Required for prefix mask mode. Positions with the same block_id
+                can attend to each other bidirectionally.
         """
         bsz, seq_len = x.shape
-        
+
         if input_pos is None:
             input_pos = torch.arange(seq_len, device=x.device).unsqueeze(0)
-        
+
         # 1. Mask Generation
         if mask_type == "causal":
             mask = None
         else:
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-            mask = mask.unsqueeze(0).repeat(bsz, 1, 1)
-            
-            is_start = (x == self.start_pos_id)
-            is_move = (x < self.num_policy_tokens)
-            
-            for b in range(bsz):
-                starts = is_start[b].nonzero().flatten()
-                moves = is_move[b].nonzero().flatten()
-                for s in starts:
-                    s_idx = s.item()
-                    moves_after = moves[moves > s_idx]
-                    if len(moves_after) > 0:
-                        m_idx = moves_after[0].item()
-                        mask[b, s_idx:m_idx, s_idx:m_idx] = True
-                    else:
-                        mask[b, s_idx:, s_idx:] = True
-        
+            if block_id is None:
+                raise ValueError("block_id is required for prefix mask mode")
+
+            # Causal base mask
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
+
+            # Vectorized: same_block[b,i,j] = (block_id[b,i] == block_id[b,j])
+            same_block = block_id.unsqueeze(-1) == block_id.unsqueeze(-2)  # [B, S, S]
+            mask = causal_mask.unsqueeze(0) | same_block
+
         # 2. Token embedding only (RoPE is applied in attention)
         h = self.tok_embedding(x)
-        
+
         # 3. Transformer Layers
         for layer in self.layers:
             h = layer(h, mask=mask, input_pos=input_pos)
-            
+
         h = self.norm(h)
-        
+
         policy_logits = self.policy_head(h)
         value_logits = self.value_head(h)
-        
+
         return policy_logits, value_logits
 
     @torch.no_grad()
@@ -121,13 +112,18 @@ class ChessDecoder(nn.Module):
         """
         self.eval()
         device = next(self.parameters()).device
-        
+
         # Convert FEN to tokens
         tokens = fen_to_position_tokens(fen)
         input_ids = torch.tensor([token_to_idx[t] for t in tokens], dtype=torch.long).unsqueeze(0).to(device)
-        
+
+        # Create block_id: all tokens belong to the same block (block 0)
+        # since we have a single board position
+        seq_len = input_ids.shape[1]
+        block_id = torch.zeros(1, seq_len, dtype=torch.long, device=device)
+
         # Forward pass using "prefix" mask to get full bidirectional board context
-        policy_logits, _ = self(input_ids, mask_type="prefix")
+        policy_logits, _ = self(input_ids, mask_type="prefix", block_id=block_id)
         
         # Get logits for the last token
         last_logits = policy_logits[0, -1, :]

@@ -51,33 +51,40 @@ def fen_to_position_tokens(fen: str):
 def game_to_token_ids(game_df, skip_board_prob=0.0):
     sequence = []
     wdl_data = []  # (index, best_move, wdl, is_valid_wdl)
-    
+    block_boundaries = []  # [(start_idx, end_idx), ...] for each board block
+
     for i, (_, row) in enumerate(game_df.iterrows()):
         # Always include the first board, or include board with (1 - skip_board_prob)
         include_board = (i == 0) or (random.random() > skip_board_prob)
-        
+
         if include_board:
+            block_start_idx = len(sequence)  # Track block start
             pos_tokens = fen_to_position_tokens(row['fen'])
             sequence.extend(pos_tokens)
-        
+
         # The move token is where we want to predict the move AND the WDL
         if 'played_move' in row and row['played_move']:
             # Record the index of the move token in the sequence
             move_idx = len(sequence)
             sequence.append(row['played_move'])
-            
+
+            if include_board:
+                # Block includes start_pos through side_to_move (exclusive of move token)
+                # This matches legacy behavior where mask[s_idx:m_idx, s_idx:m_idx] = True
+                block_boundaries.append((block_start_idx, move_idx))
+
             # Target for this index should be the best_move
             best_move = row['best_move']
-            
+
             # Handle WDL NaNs
             win = row['win'] if pd.notna(row['win']) else 0.0
             draw = row['draw'] if pd.notna(row['draw']) else 0.0
             loss = row['loss'] if pd.notna(row['loss']) else 0.0
-            
+
             is_valid_wdl = pd.notna(row['win']) and pd.notna(row['draw']) and pd.notna(row['loss'])
-            
+
             wdl = [win, draw, loss]
             wdl_data.append((move_idx, best_move, wdl, is_valid_wdl))
-    
+
     ids = [token_to_idx[t] for t in sequence]
-    return ids, wdl_data
+    return ids, wdl_data, block_boundaries
