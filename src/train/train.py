@@ -50,7 +50,12 @@ def train():
     # Loss functions
     ce_loss_fn = nn.CrossEntropyLoss(ignore_index=token_to_idx["pad"], reduction='none')
     mse_loss_fn = nn.MSELoss(reduction='none')
-    
+
+    # Mixed precision training
+    use_amp = config["training"].get("use_amp", False)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    print(f"Mixed precision training: {'enabled' if use_amp else 'disabled'}")
+
     step = 0
     model.train()
     
@@ -65,51 +70,53 @@ def train():
             target_ids = batch["target_ids"].to(device)
             wdl_targets = batch["wdl_targets"].to(device)
             wdl_mask = batch["wdl_mask"].to(device)
-            
-            # Pass 1: Causal masking for board prediction training
-            # This ensures the model can generate boards autoregressively.
-            policy_logits_causal, _ = model(input_ids, mask_type="causal")
-            
-            # Pass 2: Prefix masking for move and value prediction
-            # This allows full bidirectional board context for better move selection.
-            policy_logits_prefix, value_logits_prefix = model(input_ids, mask_type="prefix")
-            
-            # Compute cross-entropy loss per position for both passes
-            ce_loss_causal = ce_loss_fn(policy_logits_causal.view(-1, vocab_size), target_ids.view(-1))
-            ce_loss_causal = ce_loss_causal.view(target_ids.shape)
-            
-            ce_loss_prefix = ce_loss_fn(policy_logits_prefix.view(-1, vocab_size), target_ids.view(-1))
-            ce_loss_prefix = ce_loss_prefix.view(target_ids.shape)
-            
-            # Create masks
-            mask = target_ids != token_to_idx["pad"]  # (B, T) - exclude padding
-            
-            # Find first move index for board mask (exclude pre-first-move tokens)
-            first_move_idx = wdl_mask.int().argmax(dim=1)  # (B,)
-            has_moves = wdl_mask.any(dim=1)  # (B,)
-            first_move_idx[~has_moves] = wdl_mask.size(1)
-            indices = torch.arange(wdl_mask.size(1), device=device).unsqueeze(0)
-            pre_first_move_mask = indices < first_move_idx.unsqueeze(1)
-            
-            # Move Loss: only at move positions, using the Prefix (bidirectional) logits
-            move_mask = wdl_mask & mask
-            move_loss = (ce_loss_prefix * move_mask.float()).sum() / (move_mask.sum() + 1e-8)
-            
-            # Board Loss: at board positions, using the Causal logits (to prevent cheating)
-            board_mask = (~wdl_mask) & mask & (~pre_first_move_mask)
-            board_loss = (ce_loss_causal * board_mask.float()).sum() / (board_mask.sum() + 1e-8)
-            
-            # WDL Loss: at move positions, using the Prefix (bidirectional) logits
-            wdl_loss_raw = mse_loss_fn(value_logits_prefix, wdl_targets)
-            wdl_mask_expanded = wdl_mask.unsqueeze(-1).expand_as(wdl_loss_raw)
-            wdl_loss = (wdl_loss_raw * wdl_mask_expanded).sum() / (wdl_mask_expanded.sum() + 1e-8)
-            
-            # Total Loss
-            total_loss = (
-                config["loss"]["move_weight"] * move_loss +
-                config["loss"]["board_weight"] * board_loss +
-                config["loss"]["wdl_weight"] * wdl_loss
-            )
+
+            # Mixed precision forward passes and loss computation
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                # Pass 1: Causal masking for board prediction training
+                # This ensures the model can generate boards autoregressively.
+                policy_logits_causal, _ = model(input_ids, mask_type="causal")
+
+                # Pass 2: Prefix masking for move and value prediction
+                # This allows full bidirectional board context for better move selection.
+                policy_logits_prefix, value_logits_prefix = model(input_ids, mask_type="prefix")
+
+                # Compute cross-entropy loss per position for both passes
+                ce_loss_causal = ce_loss_fn(policy_logits_causal.view(-1, vocab_size), target_ids.view(-1))
+                ce_loss_causal = ce_loss_causal.view(target_ids.shape)
+
+                ce_loss_prefix = ce_loss_fn(policy_logits_prefix.view(-1, vocab_size), target_ids.view(-1))
+                ce_loss_prefix = ce_loss_prefix.view(target_ids.shape)
+
+                # Create masks
+                mask = target_ids != token_to_idx["pad"]  # (B, T) - exclude padding
+
+                # Find first move index for board mask (exclude pre-first-move tokens)
+                first_move_idx = wdl_mask.int().argmax(dim=1)  # (B,)
+                has_moves = wdl_mask.any(dim=1)  # (B,)
+                first_move_idx[~has_moves] = wdl_mask.size(1)
+                indices = torch.arange(wdl_mask.size(1), device=device).unsqueeze(0)
+                pre_first_move_mask = indices < first_move_idx.unsqueeze(1)
+
+                # Move Loss: only at move positions, using the Prefix (bidirectional) logits
+                move_mask = wdl_mask & mask
+                move_loss = (ce_loss_prefix * move_mask.float()).sum() / (move_mask.sum() + 1e-8)
+
+                # Board Loss: at board positions, using the Causal logits (to prevent cheating)
+                board_mask = (~wdl_mask) & mask & (~pre_first_move_mask)
+                board_loss = (ce_loss_causal * board_mask.float()).sum() / (board_mask.sum() + 1e-8)
+
+                # WDL Loss: at move positions, using the Prefix (bidirectional) logits
+                wdl_loss_raw = mse_loss_fn(value_logits_prefix, wdl_targets)
+                wdl_mask_expanded = wdl_mask.unsqueeze(-1).expand_as(wdl_loss_raw)
+                wdl_loss = (wdl_loss_raw * wdl_mask_expanded).sum() / (wdl_mask_expanded.sum() + 1e-8)
+
+                # Total Loss
+                total_loss = (
+                    config["loss"]["move_weight"] * move_loss +
+                    config["loss"]["board_weight"] * board_loss +
+                    config["loss"]["wdl_weight"] * wdl_loss
+                )
             
             # if torch.isnan(total_loss):
             #     print(f"NaN loss detected at step {step}!")
@@ -132,12 +139,14 @@ def train():
             
             # Scale loss for gradient accumulation
             loss = total_loss / config["training"].get("gradient_accumulation_steps", 1)
-            loss.backward()
-            
+            scaler.scale(loss).backward()
+
             if (step + 1) % config["training"].get("gradient_accumulation_steps", 1) == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-                optimizer.step()
-                optimizer.zero_grad()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
             
             # Metrics
             with torch.no_grad():
