@@ -43,13 +43,16 @@ class ChessIterableDataset(IterableDataset):
         for file_path in files_to_read:
             try:
                 df = pd.read_parquet(file_path)
-                game_ids = df['game_id'].unique()
+                
+                # Use groupby instead of repeated filtering - O(n) instead of O(n*m)
+                grouped = df.groupby('game_id', sort=False)
+                game_ids = list(grouped.groups.keys())
                 
                 if self.shuffle_games:
                     np.random.shuffle(game_ids)
                     
                 for game_id in game_ids:
-                    game_df = df[df['game_id'] == game_id].sort_values('ply')
+                    game_df = grouped.get_group(game_id).sort_values('ply')
 
                     ids, wdl_data, block_boundaries = game_to_token_ids(game_df, skip_board_prob=self.skip_board_prob)
 
