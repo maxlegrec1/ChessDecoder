@@ -214,3 +214,4 @@ print(tokens)
 | Gradient accumulation | 4 | 1 |
 | Max sequence length | 256 | 68 |
 | Skip board prob | 0.2 | N/A |
+| Mixed precision (use_amp) | true | N/A |

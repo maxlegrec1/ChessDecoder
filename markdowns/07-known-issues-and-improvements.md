@@ -128,22 +128,25 @@ model = DDP(model, device_ids=[local_rank])
 
 ### High Priority
 
-#### 1. Mixed Precision Training
+#### 1. Mixed Precision Training - IMPLEMENTED
 
-**Benefit**: 2× speedup, 50% memory reduction.
+**Status**: Implemented in `train.py`
 
-```python
-from torch.cuda.amp import autocast, GradScaler
+**Benefit**: ~2× speedup, ~50% memory reduction.
 
-scaler = GradScaler()
-with autocast():
-    policy_logits, value_logits = model(input_ids)
-    loss = compute_loss(...)
+**Usage**: Set `use_amp: true` in `config.yaml` (enabled by default).
 
-scaler.scale(loss).backward()
-scaler.step(optimizer)
-scaler.update()
+```yaml
+# config.yaml
+training:
+  use_amp: true  # Set to false to disable
 ```
+
+**Implementation Details**:
+- Uses `torch.autocast` with float16 for forward passes
+- Uses `torch.amp.GradScaler` for loss scaling
+- Properly handles gradient clipping with `scaler.unscale_()`
+- Compatible with gradient accumulation
 
 #### 2. Flash Attention
 
@@ -294,7 +297,7 @@ def test_vocab_consistency():
 
 | Optimization | Status | Expected Speedup |
 |--------------|--------|------------------|
-| Mixed precision (FP16/BF16) | ❌ Not implemented | 2× |
+| Mixed precision (FP16/BF16) | ✅ Implemented | 2× |
 | Flash Attention | ❌ Not implemented | 1.5-2× |
 | Gradient checkpointing | ❌ Not implemented | Memory: 2-4× |
 | Multi-GPU (DDP) | ❌ Not implemented | Linear with GPUs |
@@ -310,9 +313,9 @@ def test_vocab_consistency():
 
 1. Add validation loop to detect overfitting
 2. Implement learning rate scheduling
-3. Add mixed precision training
+3. ~~Add mixed precision training~~ - DONE
 
-### Short-term (1-2 weeks)
+### Short-term
 
 4. Add en passant encoding
 5. Implement gradient checkpointing for larger batches
