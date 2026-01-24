@@ -9,4 +9,4 @@ model.load_state_dict(torch.load("src/train/checkpoints/checkpoint_epoch_3.pt"))
 # model.load_state_dict(torch.load("checkpoints/checkpoint_epoch_4.pt"))
 model.eval()
 
-model_vs_stockfish(model, model1_name="decoder", num_games=10, temperature=0.0, elo=1500)
+model_vs_stockfish(model, model1_name="decoder", num_games=10, temperature=0.0, elo=1400)
