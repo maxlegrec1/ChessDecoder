@@ -192,7 +192,7 @@ def train():
             
         # Save checkpoint
         if (epoch + 1) % 1 == 0: # Save every epoch for now
-             torch.save(model.state_dict(), f"src/train/checkpoints/checkpoint_epoch_{epoch+1}.pt")
+             torch.save(model.state_dict(), f"{config['training']['checkpoint_dir']}/checkpoint_epoch_{epoch+1}.pt")
 
 if __name__ == "__main__":
     train()
