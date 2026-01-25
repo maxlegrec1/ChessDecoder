@@ -38,7 +38,8 @@ def train():
         embed_dim=config["model"]["embed_dim"],
         num_heads=config["model"]["num_heads"],
         num_layers=config["model"]["num_layers"],
-        max_seq_len=config["model"]["max_seq_len"]
+        max_seq_len=config["model"]["max_seq_len"],
+        d_ff=config["model"].get("d_ff")
     ).to(device)
 
     # Dataloader

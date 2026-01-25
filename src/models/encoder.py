@@ -9,8 +9,10 @@ from src.models.vocab import token_to_idx, policy_index
 class TransformerEncoderLayer(nn.Module):
     """Transformer encoder layer with bidirectional self-attention and RoPE."""
     
-    def __init__(self, embed_dim: int, num_heads: int, head_dim: int, rope: RotaryPositionalEmbeddings, max_seq_len: int = 128):
+    def __init__(self, embed_dim: int, num_heads: int, head_dim: int, rope: RotaryPositionalEmbeddings, max_seq_len: int = 128, d_ff: int = None):
         super().__init__()
+        
+        d_ff = d_ff if d_ff is not None else 4 * embed_dim
         
         self.attn = MultiHeadAttention(
             embed_dim=embed_dim,
@@ -27,9 +29,9 @@ class TransformerEncoderLayer(nn.Module):
         )
         
         self.mlp = FeedForward(
-            gate_proj=nn.Linear(embed_dim, 4 * embed_dim, bias=False),
-            down_proj=nn.Linear(4 * embed_dim, embed_dim, bias=False),
-            up_proj=nn.Linear(embed_dim, 4 * embed_dim, bias=False)
+            gate_proj=nn.Linear(embed_dim, d_ff, bias=False),
+            down_proj=nn.Linear(d_ff, embed_dim, bias=False),
+            up_proj=nn.Linear(embed_dim, d_ff, bias=False)
         )
         
         self.sa_norm = RMSNorm(dim=embed_dim)
@@ -66,7 +68,8 @@ class ChessEncoder(nn.Module):
         embed_dim: int = 768,
         num_heads: int = 12,
         num_layers: int = 12,
-        max_seq_len: int = 128
+        max_seq_len: int = 128,
+        d_ff: int = None
     ):
         super().__init__()
         
@@ -74,6 +77,7 @@ class ChessEncoder(nn.Module):
         self.num_policy_tokens = num_policy_tokens
         self.max_seq_len = max_seq_len
         head_dim = embed_dim // num_heads
+        d_ff = d_ff if d_ff is not None else 4 * embed_dim
         
         # Token embedding only (RoPE handles positional info)
         self.tok_embedding = nn.Embedding(vocab_size, embed_dim)
@@ -83,7 +87,7 @@ class ChessEncoder(nn.Module):
         
         # Transformer layers
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(embed_dim, num_heads, head_dim, rope, max_seq_len)
+            TransformerEncoderLayer(embed_dim, num_heads, head_dim, rope, max_seq_len, d_ff)
             for _ in range(num_layers)
         ])
         

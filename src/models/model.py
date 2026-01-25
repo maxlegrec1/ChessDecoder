@@ -20,10 +20,11 @@ class ChessDecoder(nn.Module):
     Uses RoPE for positional encoding.
     """
     
-    def __init__(self, vocab_size, embed_dim=768, num_heads=12, num_layers=12, max_seq_len=2048):
+    def __init__(self, vocab_size, embed_dim=768, num_heads=12, num_layers=12, max_seq_len=2048, d_ff=None):
         super().__init__()
         
         head_dim = embed_dim // num_heads
+        d_ff = d_ff if d_ff is not None else 4 * embed_dim
         
         # Token embedding only (RoPE handles positional info)
         self.tok_embedding = nn.Embedding(vocab_size, embed_dim)
@@ -47,9 +48,9 @@ class ChessDecoder(nn.Module):
                 is_causal=True
             )
             mlp = FeedForward(
-                gate_proj=nn.Linear(embed_dim, 4 * embed_dim, bias=False),
-                down_proj=nn.Linear(4 * embed_dim, embed_dim, bias=False),
-                up_proj=nn.Linear(embed_dim, 4 * embed_dim, bias=False)
+                gate_proj=nn.Linear(embed_dim, d_ff, bias=False),
+                down_proj=nn.Linear(d_ff, embed_dim, bias=False),
+                up_proj=nn.Linear(embed_dim, d_ff, bias=False)
             )
             self.layers.append(TransformerSelfAttentionLayer(
                 attn=attn, 

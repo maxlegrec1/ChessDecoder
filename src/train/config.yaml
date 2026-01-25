@@ -9,10 +9,11 @@ data:
   skip_board_prob: 0.2
 
 model:
-  embed_dim: 768
-  num_heads: 12
+  embed_dim: 1024
+  num_heads: 16
   num_layers: 12
   max_seq_len: 256
+  d_ff: 1536
 
 training:
   learning_rate: 1.0e-4
