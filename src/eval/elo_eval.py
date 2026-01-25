@@ -122,13 +122,26 @@ def play_game(player1_name, player2_name, engine, model1, model2, temperature=0.
     pgn_game.headers["Result"] = result
     return result, pgn_game
 
+def save_pgn_game(pgn_game, pgn_filename):
+    """Append a single PGN game to the file."""
+    with open(pgn_filename, "a", encoding="utf-8") as f:
+        exporter = chess.pgn.FileExporter(f)
+        pgn_game.accept(exporter)
+        f.write("\n\n")  # Add some space between games for readability
+
+
 def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperature = 0.1,elo = 1400, pgn_dir = "pgns"):
     assert num_games > 0
     assert isinstance(elo, int) and elo >= 1400
     wins, draws = 0, 0
-    all_pgn_games = [] # List to store PGN game objects
+    games_played = 0
 
     pgn_filename = os.path.join(pgn_dir,datetime.now().strftime("games_model_vs_stockfish_%Y%m%d_%H%M%S.pgn"))
+    
+    # Create/clear the PGN file at the start
+    os.makedirs(pgn_dir, exist_ok=True)
+    open(pgn_filename, "w", encoding="utf-8").close()
+    print(f"Saving games to {pgn_filename}")
 
     try:
         with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
@@ -154,7 +167,9 @@ def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperatur
                     elif result == "1/2-1/2":
                         draws += 1
                 
-                all_pgn_games.append(pgn_game)
+                # Save game immediately after it's played
+                save_pgn_game(pgn_game, pgn_filename)
+                games_played += 1
                 
                 # Update progress bar description with current win rate
                 current_win_rate = (wins + 0.5 * draws) / (i + 1)
@@ -162,14 +177,7 @@ def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperatur
 
     except Exception as e:
         print(f"An error occurred during game play: {e}")
-        # Optionally save any games played so far
-        if all_pgn_games:
-            print(f"Saving {len(all_pgn_games)} games played so far to {pgn_filename}")
-            with open(pgn_filename, "w", encoding="utf-8") as f:
-                for pgn_game in all_pgn_games:
-                    exporter = pgn.FileExporter(f)
-                    pgn_game.accept(exporter)
-                    f.write("\n\n") # Add some space between games
+        print(f"{games_played} games were saved to {pgn_filename} before the error.")
 
 
     print(f"Model wins: {wins}, Draws: {draws}, Losses: {num_games - wins - draws} out of {num_games} games.")
@@ -181,11 +189,5 @@ def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperatur
     else:
         print("No games played.")
 
-    # Save all games to a single PGN file
-    with open(pgn_filename, "w", encoding="utf-8") as f:
-        for pgn_game in all_pgn_games:
-            exporter = chess.pgn.FileExporter(f)
-            pgn_game.accept(exporter)
-            f.write("\n\n") # Add some space between games for readability
-    print(f"All games saved to {pgn_filename}")
+    print(f"All {games_played} games saved to {pgn_filename}")
     return win_rate, estimated_elo

@@ -171,3 +171,71 @@ class ChessDecoder(nn.Module):
             move_str = replacements[move_str]
             
         return move_str
+
+    @torch.no_grad()
+    def predict_move_and_value(self, fen: str, temperature: float = 1.0, force_legal: bool = True) -> str:
+        """
+        Predicts the next move given a FEN string.
+        """
+        self.eval()
+        device = next(self.parameters()).device
+
+        # Convert FEN to tokens
+        tokens = fen_to_position_tokens(fen)
+        input_ids = torch.tensor([token_to_idx[t] for t in tokens], dtype=torch.long).unsqueeze(0).to(device)
+
+        # Create block_id: all tokens belong to the same block (block 0)
+        # since we have a single board position
+        seq_len = input_ids.shape[1]
+        block_id = torch.zeros(1, seq_len, dtype=torch.long, device=device)
+
+        # Forward pass using "prefix" mask to get full bidirectional board context
+        policy_logits, value_logits = self(input_ids, mask_type="prefix", block_id=block_id)
+        
+        # Get logits for the last token
+        last_logits = policy_logits[0, -1, :]
+        last_value_logits = value_logits[0, -1, :]
+        value = torch.softmax(last_value_logits, dim=-1)
+        if force_legal:
+            board = chess.Board(fen)
+            legal_moves = list(board.legal_moves)
+            vocab_legal_moves = []
+            
+            for move in legal_moves:
+                uci = move.uci()
+                # Handle castling conversion for the mask
+                if board.is_castling(move):
+                    # e1g1 -> e1h1
+                    if uci == 'e1g1': uci = 'e1h1'
+                    elif uci == 'e1c1': uci = 'e1a1'
+                    elif uci == 'e8g8': uci = 'e8h8'
+                    elif uci == 'e8c8': uci = 'e8a8'
+                
+                if uci in token_to_idx:
+                    vocab_legal_moves.append(token_to_idx[uci])
+            
+            if vocab_legal_moves:
+                mask = torch.full_like(last_logits, float('-inf'))
+                mask[vocab_legal_moves] = 0
+                last_logits = last_logits + mask
+        
+        # Apply temperature
+        if temperature == 0.0:
+            idx = torch.argmax(last_logits).item()
+        else:
+            probs = torch.softmax(last_logits / temperature, dim=-1)
+            idx = torch.multinomial(probs, 1).item()
+            
+        move_str = idx_to_token[idx]
+        
+        # Post-processing: Convert model's castling (e1h1) to standard UCI (e1g1)
+        replacements = {
+            'e1h1': 'e1g1',
+            'e1a1': 'e1c1',
+            'e8h8': 'e8g8',
+            'e8a8': 'e8c8'
+        }
+        if move_str in replacements:
+            move_str = replacements[move_str]
+            
+        return move_str,value
