@@ -8,6 +8,10 @@ def test_inference():
     model.load_state_dict(torch.load("checkpoints/checkpoint_epoch_6.pt"))
     model.eval()
     
+    # show number of parameters
+    print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+
+
     # Test FEN (starting position)
     fen = "5rk1/6p1/7p/p3Np2/8/8/5PPP/2r1R1K1 b - - 1 26"
     

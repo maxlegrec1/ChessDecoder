@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import wandb
+from datetime import datetime
 from tqdm import tqdm
 from src.models.model import ChessDecoder
 from src.models.vocab import vocab_size, token_to_idx
@@ -18,6 +19,15 @@ def train():
     
     # Initialize wandb
     wandb.init(project=config["project_name"], name=config["run_name"], config=config)
+    
+    # Create run-specific checkpoint directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_checkpoint_dir = os.path.join(
+        config["training"]["checkpoint_dir"],
+        f"{config['run_name']}_{timestamp}"
+    )
+    os.makedirs(run_checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {run_checkpoint_dir}")
     
     device = torch.device(config["training"]["device"] if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -233,9 +243,19 @@ def train():
                 
             step += 1
             
-        # Save checkpoint
-        if (epoch + 1) % 1 == 0: # Save every epoch for now
-             torch.save(model.state_dict(), f"{config['training']['checkpoint_dir']}/checkpoint_epoch_{epoch+1}.pt")
+        # Save checkpoint with optimizer state for resuming training
+        if (epoch + 1) % 1 == 0:  # Save every epoch for now
+            checkpoint = {
+                "epoch": epoch + 1,
+                "step": step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "config": config,
+            }
+            checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
+            torch.save(checkpoint, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
 
 if __name__ == "__main__":
     train()
