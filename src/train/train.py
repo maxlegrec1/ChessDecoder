@@ -168,14 +168,48 @@ def train():
                 # Overall Policy Acc (mixed)
                 policy_acc = (move_correct.sum() + board_correct.sum()) / (move_mask.sum() + board_mask.sum() + 1e-8)
                 
-                # WDL Accuracy (just for monitoring, maybe sign match or max prob?)
-                # Let's use max prob match for now if we treat it as classification, 
-                # but it's regression. MSE is the main metric.
-                # Let's just log MSE.
+                # Value Accuracy: argmax of predicted value matches argmax of true value (at move positions)
+                value_preds_argmax = torch.argmax(value_logits_prefix, dim=-1)  # [B, T]
+                value_targets_argmax = torch.argmax(wdl_targets, dim=-1)  # [B, T]
+                value_correct = (value_preds_argmax == value_targets_argmax) & wdl_mask
+                value_acc = value_correct.sum() / (wdl_mask.sum() + 1e-8)
+                
+                # Move/Value accuracy by nth move in sequence
+                # Compute move indices: 0 for 1st move, 1 for 2nd, etc.
+                max_track_moves = config["training"].get("max_track_nth_moves", 20)
+                move_cumsum = wdl_mask.cumsum(dim=1)  # [B, T], at move positions: 1, 2, 3, ...
+                move_indices = (move_cumsum - 1).long()  # [B, T], at move positions: 0, 1, 2, ...
+                
+                # Only track moves with index < max_track_moves
+                valid_nth_mask = wdl_mask & (move_indices < max_track_moves)
+                
+                if valid_nth_mask.any():
+                    flat_move_indices = move_indices[valid_nth_mask]
+                    flat_move_correct = move_correct[valid_nth_mask].float()
+                    flat_value_correct = value_correct[valid_nth_mask].float()
+                    
+                    # Scatter-add for efficient aggregation
+                    move_correct_by_nth = torch.zeros(max_track_moves, device=device)
+                    value_correct_by_nth = torch.zeros(max_track_moves, device=device)
+                    count_by_nth = torch.zeros(max_track_moves, device=device)
+                    
+                    move_correct_by_nth.scatter_add_(0, flat_move_indices, flat_move_correct)
+                    value_correct_by_nth.scatter_add_(0, flat_move_indices, flat_value_correct)
+                    count_by_nth.scatter_add_(0, flat_move_indices, torch.ones_like(flat_move_correct))
+                    
+                    # Compute accuracies per nth move
+                    move_acc_by_nth = move_correct_by_nth / (count_by_nth + 1e-8)
+                    value_acc_by_nth = value_correct_by_nth / (count_by_nth + 1e-8)
+                else:
+                    move_acc_by_nth = torch.zeros(max_track_moves, device=device)
+                    value_acc_by_nth = torch.zeros(max_track_moves, device=device)
+                    count_by_nth = torch.zeros(max_track_moves, device=device)
             
             if step % config["training"]["log_every_n_steps"] == 0:
                 print(f"Step {step}: Loss {total_loss.item():.4f} (Move: {move_loss.item():.4f}, Board: {board_loss.item():.4f}, WDL: {wdl_loss.item():.4f})")
-                wandb.log({
+                
+                # Base metrics
+                log_dict = {
                     "train/total_loss": total_loss.item(),
                     "train/move_loss": move_loss.item(),
                     "train/board_loss": board_loss.item(),
@@ -183,10 +217,19 @@ def train():
                     "train/policy_acc": policy_acc.item(),
                     "train/move_acc": move_acc.item(),
                     "train/board_acc": board_acc.item(),
+                    "train/value_acc": value_acc.item(),
                     "train/epoch": epoch,
                     "train/step": step,
                     "train/grad_step": step / config["training"].get("gradient_accumulation_steps", 1)
-                })
+                }
+                
+                # Add nth-move metrics (only for positions with sufficient samples)
+                for i in range(max_track_moves):
+                    if count_by_nth[i] > 0:
+                        log_dict[f"train/move_acc_nth/{i}"] = move_acc_by_nth[i].item()
+                        log_dict[f"train/value_acc_nth/{i}"] = value_acc_by_nth[i].item()
+                
+                wandb.log(log_dict)
                 
             step += 1
             
