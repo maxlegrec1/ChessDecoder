@@ -17,20 +17,13 @@ def load_config(config_path):
 def train():
     config = load_config("src/train/config.yaml")
     
-    # Initialize wandb
-    wandb.init(project=config["project_name"], name=config["run_name"], config=config)
-    
-    # Create run-specific checkpoint directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_checkpoint_dir = os.path.join(
-        config["training"]["checkpoint_dir"],
-        f"{config['run_name']}_{timestamp}"
-    )
-    os.makedirs(run_checkpoint_dir, exist_ok=True)
-    print(f"Checkpoints will be saved to: {run_checkpoint_dir}")
-    
     device = torch.device(config["training"]["device"] if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    
+    # Check if resuming from checkpoint
+    resume_from = config["training"].get("resume_from")
+    start_epoch = 0
+    step = 0
     
     # Model
     model = ChessDecoder(
@@ -67,13 +60,55 @@ def train():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     print(f"Mixed precision training: {'enabled' if use_amp else 'disabled'}")
 
-    step = 0
+    # Resume from checkpoint if specified
+    if resume_from:
+        # Find the latest checkpoint in the resume directory
+        checkpoint_files = [f for f in os.listdir(resume_from) if f.startswith("checkpoint_") and f.endswith(".pt")]
+        if not checkpoint_files:
+            raise ValueError(f"No checkpoint files found in {resume_from}")
+        
+        # Sort by epoch number and get the latest
+        checkpoint_files.sort(key=lambda x: int(x.split("_")[-1].replace(".pt", "")))
+        latest_checkpoint = os.path.join(resume_from, checkpoint_files[-1])
+        
+        print(f"Resuming from checkpoint: {latest_checkpoint}")
+        checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
+        
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        start_epoch = checkpoint["epoch"]
+        step = checkpoint["step"]
+        
+        print(f"Resumed from epoch {start_epoch}, step {step}")
+        
+        # Use the same checkpoint directory for continued training
+        run_checkpoint_dir = resume_from
+    else:
+        # Create new run-specific checkpoint directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_checkpoint_dir = os.path.join(
+            config["training"]["checkpoint_dir"],
+            f"{config['run_name']}_{timestamp}"
+        )
+        os.makedirs(run_checkpoint_dir, exist_ok=True)
+    
+    print(f"Checkpoints will be saved to: {run_checkpoint_dir}")
+    
+    # Initialize wandb
+    wandb.init(
+        project=config["project_name"],
+        name=config["run_name"],
+        config=config,
+        resume="allow" if resume_from else None,
+    )
+
     model.train()
     
     # Enable anomaly detection
     # torch.autograd.set_detect_anomaly(True)
     
-    for epoch in range(config["training"]["num_epochs"]):
+    for epoch in range(start_epoch, config["training"]["num_epochs"]):
         print(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
         
         for batch in tqdm(dataloader):

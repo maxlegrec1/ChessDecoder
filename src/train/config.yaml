@@ -26,6 +26,7 @@ training:
   use_amp: true  # Mixed precision training (float16)
   checkpoint_dir: "checkpoints/"
   max_track_nth_moves: 20
+  resume_from: "checkpoints/run-1_20260125_133517"  # Set to checkpoint dir path to resume, or null/remove to start fresh
 
 loss:
   move_weight: 5.0
