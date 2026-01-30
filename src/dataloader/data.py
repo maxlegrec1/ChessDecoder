@@ -7,7 +7,7 @@ from src.models.vocab import token_to_idx
 def fen_to_position_tokens(fen: str):
     """
     Convert FEN to fixed-length position tokens.
-    
+
     Output format (68 tokens total):
         - start_pos (1 token)
         - 64 board tokens in order a1, b1, c1, ..., h8 (each is either 'empty' or 'color_piece')
@@ -17,7 +17,7 @@ def fen_to_position_tokens(fen: str):
     """
     board = chess.Board(fen)
     tokens = ["start_pos"]
-    
+
     # Fixed 64 board tokens: a1, b1, c1, ..., h8
     for square in chess.SQUARES:
         piece = board.piece_at(square)
@@ -27,55 +27,49 @@ def fen_to_position_tokens(fen: str):
             tokens.append(f"{color}_{piece_type}")
         else:
             tokens.append("empty")
-    
+
     tokens.append("end_pos")
-    
+
     # Castling rights
     rights = ""
     if board.has_kingside_castling_rights(chess.WHITE): rights += "K"
     if board.has_queenside_castling_rights(chess.WHITE): rights += "Q"
     if board.has_kingside_castling_rights(chess.BLACK): rights += "k"
     if board.has_queenside_castling_rights(chess.BLACK): rights += "q"
-    
+
     if not rights:
         tokens.append("no_castling_rights")
     else:
         tokens.append(rights)
-    
+
     # Side to move
     tokens.append("white_to_move" if board.turn == chess.WHITE else "black_to_move")
-    
+
     return tokens
 
 
 def game_to_token_ids(game_df, skip_board_prob=0.0):
     sequence = []
-    wdl_data = []  # (index, best_move, wdl, is_valid_wdl)
+    wdl_data = []  # (move_idx, best_move, wdl, is_valid_wdl) - legacy, kept for move targets
     block_boundaries = []  # [(start_idx, end_idx), ...] for each board block
+    value_data = []  # (wl_pos, d_pos, wl, d, is_valid_wdl)
 
-    # Use itertuples() instead of iterrows() for ~10-100x faster iteration
     for i, row in enumerate(game_df.itertuples(index=False)):
-        # Always include the first board, or include board with (1 - skip_board_prob)
         include_board = (i == 0) or (random.random() > skip_board_prob)
 
         if include_board:
-            block_start_idx = len(sequence)  # Track block start
+            block_start_idx = len(sequence)
             pos_tokens = fen_to_position_tokens(row.fen)
             sequence.extend(pos_tokens)
 
-        # The move token is where we want to predict the move AND the WDL
         played_move = getattr(row, 'played_move', None)
         if played_move:
-            # Record the index of the move token in the sequence
             move_idx = len(sequence)
             sequence.append(played_move)
 
             if include_board:
-                # Block includes start_pos through side_to_move (exclusive of move token)
-                # This matches legacy behavior where mask[s_idx:m_idx, s_idx:m_idx] = True
                 block_boundaries.append((block_start_idx, move_idx))
 
-            # Target for this index should be the best_move
             best_move = row.best_move
 
             # Handle WDL NaNs
@@ -88,5 +82,17 @@ def game_to_token_ids(game_df, skip_board_prob=0.0):
             wdl = [win, draw, loss]
             wdl_data.append((move_idx, best_move, wdl, is_valid_wdl))
 
+            # Append WL and D placeholder tokens
+            wl_pos = len(sequence)
+            sequence.append("wl_value")
+            d_pos = len(sequence)
+            sequence.append("d_value")
+
+            # Compute WL and D targets
+            wl = win - loss   # WL in [-1, 1]
+            d = draw          # D in [0, 1]
+
+            value_data.append((wl_pos, d_pos, wl, d, is_valid_wdl))
+
     ids = [token_to_idx[t] for t in sequence]
-    return ids, wdl_data, block_boundaries
+    return ids, wdl_data, block_boundaries, value_data

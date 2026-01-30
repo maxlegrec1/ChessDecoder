@@ -232,7 +232,8 @@ piece_tokens = [f"{c}_{p}" for c in colors for p in pieces]
 
 # Special tokens
 castling_tokens = ["".join(c) for r in range(1, 5) for c in itertools.combinations("KQkq", r)] + ["no_castling_rights"]
-special_tokens = ["start_pos", "end_pos", "white_to_move", "black_to_move", "empty", "pad", "bos", "eos"]
+special_tokens = ["start_pos", "end_pos", "white_to_move", "black_to_move", "empty", "pad", "bos", "eos",
+                  "wl_value", "d_value", "start_think", "end_think"]
 
 # Build vocabulary: policy moves + piece tokens + special tokens + castling
 vocab = policy_index + piece_tokens + special_tokens + castling_tokens

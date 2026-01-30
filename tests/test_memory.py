@@ -20,11 +20,11 @@ def test_memory():
         
     start_time = time.time()
     with torch.no_grad():
-        policy_logits, value_logits = model(x)
+        h = model(x)
     end_time = time.time()
-    
+
     print(f"Forward pass took: {end_time - start_time:.4f}s")
-    print(f"Output shapes: Policy {policy_logits.shape}, Value {value_logits.shape}")
+    print(f"Output shape: Hidden {h.shape}")
     
     if device.type == "cuda":
         peak_mem = torch.cuda.max_memory_allocated() / 1024**2

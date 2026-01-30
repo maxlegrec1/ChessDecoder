@@ -2,9 +2,9 @@ project_name: "chess-decoder"
 run_name: "run-1"
 
 data:
-  parquet_dir: "parquets/"
-  batch_size: 256
-  num_workers: 16
+  parquet_dir: "/home/maxime/parquet_files_decoder/"
+  batch_size: 64
+  num_workers: 8
   max_seq_len: 256
   skip_board_prob: 0.2
 
@@ -14,21 +14,25 @@ model:
   num_layers: 12
   max_seq_len: 256
   d_ff: 1536
+  n_buckets: 100
+  wl_sigma: 0.4
+  value_hidden_size: 256
+  num_fourier_freq: 128
 
 training:
   learning_rate: 1.0e-4
   weight_decay: 0.1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   num_epochs: 10
-  log_every_n_steps: 1
+  log_every_n_steps: 4
   save_every_n_steps: 1000
   device: "cuda"
   use_amp: true  # Mixed precision training (float16)
   checkpoint_dir: "checkpoints/"
   max_track_nth_moves: 20
-  resume_from: "checkpoints/run-1_20260125_133517"  # Set to checkpoint dir path to resume, or null/remove to start fresh
 
 loss:
   move_weight: 5.0
-  board_weight: 1
-  wdl_weight: 1.0
+  board_weight: 1.0
+  wl_weight: 1.0
+  d_weight: 1.0

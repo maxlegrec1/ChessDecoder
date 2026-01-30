@@ -50,14 +50,14 @@ def iter_sequences(
                 return
 
             game_df = df[df["game_id"] == game_id].sort_values("ply")
-            ids, wdl_data = game_to_token_ids(game_df)
+            ids, wdl_data, _block_boundaries, value_data = game_to_token_ids(game_df)
 
             if not ids:
                 produced += 1
                 yield 0
                 continue
 
-            valid_starts = [0] + [d[0] + 1 for d in wdl_data[:-1]]
+            valid_starts = [0] + [vd[1] + 1 for vd in value_data[:-1]]
             start_idx = random.choice(valid_starts)
 
             sliced_ids = ids[start_idx:]

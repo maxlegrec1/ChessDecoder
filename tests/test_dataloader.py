@@ -8,37 +8,36 @@ def test_dataloader():
     parquet_dir = 'parquets/'
     batch_size = 1
     loader = get_dataloader(parquet_dir, batch_size=batch_size)
-    
+
     print(f"Testing dataloader with batch size {batch_size}...")
-    
+
     # Check multiple samples to see random starts
     print("\nChecking first 5 samples for random starts:")
     for i, batch in enumerate(loader):
         if i >= 5:
             break
-        
+
         input_ids = batch["input_ids"]
         first_tokens = [idx_to_token[id.item()] for id in input_ids[0, :100]]
         print(f"Sample {i+1} start: {first_tokens}")
-        
+
         # Check if it starts with start_pos
         if first_tokens[0] == "start_pos":
             print("  -> Starts at beginning of game")
         else:
             print("  -> Starts in middle of game")
-            
-        # Check WDL mask
-        wdl_mask = batch["wdl_mask"]
+
+        # Check move_mask
+        move_mask = batch["move_mask"]
         target_ids = batch["target_ids"]
-        
+
         # Get indices where mask is True
-        masked_indices = torch.nonzero(wdl_mask[0]).squeeze()
-        
+        masked_indices = torch.nonzero(move_mask[0]).squeeze()
+
         if masked_indices.numel() > 0:
-            # Check a few random masked indices
             indices_to_check = masked_indices[:5] if masked_indices.numel() > 5 else masked_indices
-            
-            print("  Checking WDL mask targets:")
+
+            print("  Checking move_mask targets:")
             for idx in indices_to_check:
                 token_id = target_ids[0, idx].item()
                 token = idx_to_token[token_id]
@@ -46,6 +45,11 @@ def test_dataloader():
                 print(f"    Index {idx}: {token} (Is move? {is_move})")
                 if not is_move:
                     print(f"    WARNING: Token at masked index {idx} is NOT a move: {token}")
+
+        # Check WL/D positions
+        wl_positions = batch["wl_positions"]
+        d_positions = batch["d_positions"]
+        print(f"  WL positions: {wl_positions[0].sum().item()}, D positions: {d_positions[0].sum().item()}")
 
     # Speed test
     print("\nRunning speed test (loading 100 batches)...")

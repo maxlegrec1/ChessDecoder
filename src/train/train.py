@@ -2,6 +2,7 @@ import os
 import yaml
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 from datetime import datetime
@@ -10,21 +11,51 @@ from src.models.model import ChessDecoder
 from src.models.vocab import vocab_size, token_to_idx
 from src.dataloader.loader import get_dataloader
 
+
 def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
+
+def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
+    """Soft CE loss: distribute target probability across two nearest buckets via linear interpolation."""
+    N = target_values.shape[0]
+    n_buckets = bucket_centers.shape[0]
+
+    if N == 0 or valid_mask.sum() == 0:
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+    # Find lower bucket: last bucket where center <= target
+    diffs = target_values.unsqueeze(-1) - bucket_centers  # (N, B)
+    lower_idx = (diffs >= 0).long().sum(dim=-1) - 1        # (N,)
+    lower_idx = lower_idx.clamp(0, n_buckets - 2)
+    upper_idx = lower_idx + 1
+
+    lower_centers = bucket_centers[lower_idx]
+    upper_centers = bucket_centers[upper_idx]
+    span = (upper_centers - lower_centers).clamp(min=1e-8)
+    upper_weight = (target_values - lower_centers) / span
+    upper_weight = upper_weight.clamp(0.0, 1.0)
+
+    soft_labels = torch.zeros(N, n_buckets, device=logits.device)
+    soft_labels.scatter_(1, lower_idx.unsqueeze(1), (1 - upper_weight).unsqueeze(1))
+    soft_labels.scatter_(1, upper_idx.unsqueeze(1), upper_weight.unsqueeze(1))
+
+    loss = -(soft_labels * F.log_softmax(logits, dim=-1)).sum(dim=-1)  # (N,)
+    return (loss * valid_mask.float()).sum() / (valid_mask.sum() + 1e-8)
+
+
 def train():
     config = load_config("src/train/config.yaml")
-    
+
     device = torch.device(config["training"]["device"] if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
+
     # Check if resuming from checkpoint
     resume_from = config["training"].get("resume_from")
     start_epoch = 0
     step = 0
-    
+
     # Model
     model = ChessDecoder(
         vocab_size=vocab_size,
@@ -32,7 +63,11 @@ def train():
         num_heads=config["model"]["num_heads"],
         num_layers=config["model"]["num_layers"],
         max_seq_len=config["model"]["max_seq_len"],
-        d_ff=config["model"].get("d_ff")
+        d_ff=config["model"].get("d_ff"),
+        n_buckets=config["model"].get("n_buckets", 100),
+        value_hidden_size=config["model"].get("value_hidden_size", 256),
+        num_fourier_freq=config["model"].get("num_fourier_freq", 128),
+        wl_sigma=config["model"].get("wl_sigma", 0.4),
     ).to(device)
 
     # Dataloader
@@ -43,17 +78,16 @@ def train():
         max_seq_len=config["data"]["max_seq_len"],
         skip_board_prob=config["data"].get("skip_board_prob", 0.0)
     )
-    
+
     # Optimizer
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config["training"]["learning_rate"],
         weight_decay=config["training"]["weight_decay"]
     )
-    
-    # Loss functions
+
+    # Loss function for board generation
     ce_loss_fn = nn.CrossEntropyLoss(ignore_index=token_to_idx["pad"], reduction='none')
-    mse_loss_fn = nn.MSELoss(reduction='none')
 
     # Mixed precision training
     use_amp = config["training"].get("use_amp", False)
@@ -62,39 +96,45 @@ def train():
 
     # Resume from checkpoint if specified
     if resume_from:
-        # Find the latest checkpoint in the resume directory
         checkpoint_files = [f for f in os.listdir(resume_from) if f.startswith("checkpoint_") and f.endswith(".pt")]
         if not checkpoint_files:
             raise ValueError(f"No checkpoint files found in {resume_from}")
-        
-        # Sort by epoch number and get the latest
+
         checkpoint_files.sort(key=lambda x: int(x.split("_")[-1].replace(".pt", "")))
         latest_checkpoint = os.path.join(resume_from, checkpoint_files[-1])
-        
+
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
-        
-        model.load_state_dict(checkpoint["model_state_dict"])
+
+        state_dict = checkpoint["model_state_dict"]
+
+        # Checkpoint compatibility: rename old policy_head -> board_head
+        if "policy_head.weight" in state_dict and "board_head.weight" not in state_dict:
+            state_dict["board_head.weight"] = state_dict.pop("policy_head.weight")
+            state_dict["board_head.bias"] = state_dict.pop("policy_head.bias")
+        # Remove old 3-class value head (incompatible shape)
+        state_dict.pop("value_head.weight", None)
+        state_dict.pop("value_head.bias", None)
+
+        model.load_state_dict(state_dict, strict=False)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_epoch = checkpoint["epoch"]
         step = checkpoint["step"]
-        
+
         print(f"Resumed from epoch {start_epoch}, step {step}")
-        
-        # Use the same checkpoint directory for continued training
+
         run_checkpoint_dir = resume_from
     else:
-        # Create new run-specific checkpoint directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_checkpoint_dir = os.path.join(
             config["training"]["checkpoint_dir"],
             f"{config['run_name']}_{timestamp}"
         )
         os.makedirs(run_checkpoint_dir, exist_ok=True)
-    
+
     print(f"Checkpoints will be saved to: {run_checkpoint_dir}")
-    
+
     # Initialize wandb
     wandb.init(
         project=config["project_name"],
@@ -104,88 +144,111 @@ def train():
     )
 
     model.train()
-    
-    # Enable anomaly detection
-    # torch.autograd.set_detect_anomaly(True)
-    
+
+    # Loss weights
+    move_weight = config["loss"]["move_weight"]
+    board_weight = config["loss"]["board_weight"]
+    wl_weight = config["loss"].get("wl_weight", 1.0)
+    d_weight = config["loss"].get("d_weight", 1.0)
+
     for epoch in range(start_epoch, config["training"]["num_epochs"]):
         print(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
-        
+
         for batch in tqdm(dataloader):
             input_ids = batch["input_ids"].to(device)
             target_ids = batch["target_ids"].to(device)
-            wdl_targets = batch["wdl_targets"].to(device)
-            wdl_mask = batch["wdl_mask"].to(device)
+            move_mask = batch["move_mask"].to(device)
+            wl_positions = batch["wl_positions"].to(device)
+            d_positions = batch["d_positions"].to(device)
+            wl_targets = batch["wl_targets"].to(device)
+            d_targets = batch["d_targets"].to(device)
+            wdl_valid = batch["wdl_valid"].to(device)
             block_id = batch["block_id"].to(device)
 
-            # Mixed precision forward passes and loss computation
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                # Pass 1: Causal masking for board prediction training
-                # This ensures the model can generate boards autoregressively.
-                policy_logits_causal, _ = model(input_ids, mask_type="causal")
+                # === Pass 1: Causal masking for board generation ===
+                h_causal = model(input_ids, mask_type="causal")
+                board_logits = model.board_head(h_causal)
 
-                # Pass 2: Prefix masking for move and value prediction
-                # This allows full bidirectional board context for better move selection.
-                policy_logits_prefix, value_logits_prefix = model(
-                    input_ids, mask_type="prefix", block_id=block_id
-                )
+                # Board mask: valid positions, excluding move/wl/d positions
+                valid_mask = target_ids != token_to_idx["pad"]
+                board_mask = valid_mask & (~move_mask) & (~wl_positions) & (~d_positions)
 
-                # Compute cross-entropy loss per position for both passes
-                ce_loss_causal = ce_loss_fn(policy_logits_causal.view(-1, vocab_size), target_ids.view(-1))
-                ce_loss_causal = ce_loss_causal.view(target_ids.shape)
-
-                ce_loss_prefix = ce_loss_fn(policy_logits_prefix.view(-1, vocab_size), target_ids.view(-1))
-                ce_loss_prefix = ce_loss_prefix.view(target_ids.shape)
-
-                # Create masks
-                mask = target_ids != token_to_idx["pad"]  # (B, T) - exclude padding
-
-                # Find first move index for board mask (exclude pre-first-move tokens)
-                first_move_idx = wdl_mask.int().argmax(dim=1)  # (B,)
-                has_moves = wdl_mask.any(dim=1)  # (B,)
-                first_move_idx[~has_moves] = wdl_mask.size(1)
-                indices = torch.arange(wdl_mask.size(1), device=device).unsqueeze(0)
+                # Exclude positions before the first move (pre-first-move tokens have no causal context)
+                first_move_idx = move_mask.int().argmax(dim=1)  # (B,)
+                has_moves = move_mask.any(dim=1)
+                first_move_idx[~has_moves] = move_mask.size(1)
+                indices = torch.arange(move_mask.size(1), device=device).unsqueeze(0)
                 pre_first_move_mask = indices < first_move_idx.unsqueeze(1)
+                board_mask = board_mask & (~pre_first_move_mask)
 
-                # Move Loss: only at move positions, using the Prefix (bidirectional) logits
-                move_mask = wdl_mask & mask
-                move_loss = (ce_loss_prefix * move_mask.float()).sum() / (move_mask.sum() + 1e-8)
+                ce_board = ce_loss_fn(board_logits.view(-1, vocab_size), target_ids.view(-1))
+                ce_board = ce_board.view(target_ids.shape)
+                board_loss = (ce_board * board_mask.float()).sum() / (board_mask.sum() + 1e-8)
 
-                # Board Loss: at board positions, using the Causal logits (to prevent cheating)
-                board_mask = (~wdl_mask) & mask & (~pre_first_move_mask)
-                board_loss = (ce_loss_causal * board_mask.float()).sum() / (board_mask.sum() + 1e-8)
+                # === Pass 2: Prefix masking for move + value prediction ===
+                # Discretize ground truth to nearest bucket centers for fourier injection
+                wl_fourier_input = torch.zeros_like(wl_targets)
+                d_fourier_input = torch.zeros_like(d_targets)
 
-                # WDL Loss: at move positions, using the Prefix (bidirectional) logits
-                wdl_loss_raw = mse_loss_fn(value_logits_prefix, wdl_targets)
-                wdl_mask_expanded = wdl_mask.unsqueeze(-1).expand_as(wdl_loss_raw)
-                wdl_loss = (wdl_loss_raw * wdl_mask_expanded).sum() / (wdl_mask_expanded.sum() + 1e-8)
+                if wl_positions.any():
+                    wl_vals_at_pos = wl_targets[wl_positions]
+                    wl_disc = model.discretize_to_bucket(wl_vals_at_pos, model.wl_bucket_centers)
+                    wl_fourier_input[wl_positions] = wl_disc
 
-                # Total Loss
-                total_loss = (
-                    config["loss"]["move_weight"] * move_loss +
-                    config["loss"]["board_weight"] * board_loss +
-                    config["loss"]["wdl_weight"] * wdl_loss
+                if d_positions.any():
+                    d_vals_at_pos = d_targets[d_positions]
+                    d_disc = model.discretize_to_bucket(d_vals_at_pos, model.d_bucket_centers)
+                    d_fourier_input[d_positions] = d_disc
+
+                h_prefix = model(
+                    input_ids, mask_type="prefix", block_id=block_id,
+                    wl_values=wl_fourier_input, d_values=d_fourier_input,
+                    wl_positions=wl_positions, d_positions=d_positions
                 )
-            
-            # if torch.isnan(total_loss):
-            #     print(f"NaN loss detected at step {step}!")
-            #     print(f"Policy Loss: {policy_loss.item()}")
-            #     print(f"WDL Loss: {wdl_loss.item()}")
-                
-            #     if torch.isnan(wdl_loss):
-            #         print("Investigating WDL NaN...")
-            #         print(f"WDL Targets has NaNs: {torch.isnan(wdl_targets).any().item()}")
-            #         print(f"Value Logits has NaNs: {torch.isnan(value_logits).any().item()}")
-            #         print(f"WDL Mask sum: {wdl_mask.sum().item()}")
-                    
-            #         if torch.isnan(wdl_targets).any():
-            #             print("Found NaNs in WDL targets!")
-            #             # Print the specific row/indices
-            #             nan_indices = torch.nonzero(torch.isnan(wdl_targets))
-            #             print(f"NaN indices in targets: {nan_indices}")
-                
-            #     break
-            
+
+                # --- 1. Move prediction at stm positions ---
+                move_logits = model.policy_head(h_prefix)
+                ce_move = ce_loss_fn(move_logits.view(-1, vocab_size), target_ids.view(-1))
+                ce_move = ce_move.view(target_ids.shape)
+                move_loss = (ce_move * move_mask.float()).sum() / (move_mask.sum() + 1e-8)
+
+                # --- 2. WL prediction at move token positions (stm + 1) ---
+                stm_nonzero = move_mask.nonzero(as_tuple=False)  # (N, 2)
+                if stm_nonzero.shape[0] > 0:
+                    wl_pred_batch = stm_nonzero[:, 0]
+                    wl_pred_seq = stm_nonzero[:, 1] + 1  # move token = stm + 1
+                    # Clamp to valid range
+                    wl_pred_seq = wl_pred_seq.clamp(max=h_prefix.shape[1] - 1)
+                    h_at_move = h_prefix[wl_pred_batch, wl_pred_seq]  # (N, E)
+                    wl_logits = model.wl_head(h_at_move)  # (N, 100)
+                    wl_valid_flat = wdl_valid[move_mask]  # (N,)
+                    wl_gt_flat = wl_targets[move_mask]    # (N,)
+                    wl_loss = soft_bucket_loss(wl_logits, wl_gt_flat, model.wl_bucket_centers, wl_valid_flat)
+                else:
+                    wl_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    wl_logits = None
+
+                # --- 3. D prediction at WL placeholder positions (stm + 2) ---
+                # Hidden states come from wl_positions, but ground truth D values are stored at d_positions
+                if wl_positions.any():
+                    h_at_wl = h_prefix[wl_positions]  # (M, E)
+                    d_logits = model.d_head(h_at_wl)   # (M, 100)
+                    d_valid_flat = wdl_valid[d_positions]
+                    d_gt_flat = d_targets[d_positions]
+                    d_loss = soft_bucket_loss(d_logits, d_gt_flat, model.d_bucket_centers, d_valid_flat)
+                else:
+                    d_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    d_logits = None
+
+                # === Total loss ===
+                total_loss = (
+                    move_weight * move_loss +
+                    board_weight * board_loss +
+                    wl_weight * wl_loss +
+                    d_weight * d_loss
+                )
+
             # Scale loss for gradient accumulation
             loss = total_loss / config["training"].get("gradient_accumulation_steps", 1)
             scaler.scale(loss).backward()
@@ -196,91 +259,96 @@ def train():
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-            
+
             # Metrics
             with torch.no_grad():
-                # Accuracy
-                preds_causal = torch.argmax(policy_logits_causal, dim=-1)
-                preds_prefix = torch.argmax(policy_logits_prefix, dim=-1)
-                
-                # Move Accuracy (prefix)
-                move_correct = (preds_prefix == target_ids) & wdl_mask
-                move_acc = move_correct.sum() / (wdl_mask.sum() + 1e-8)
-                
-                # Board Accuracy (causal)
+                # Move accuracy
+                preds_prefix = torch.argmax(move_logits, dim=-1)
+                move_correct = (preds_prefix == target_ids) & move_mask
+                move_acc = move_correct.sum() / (move_mask.sum() + 1e-8)
+
+                # Board accuracy
+                preds_causal = torch.argmax(board_logits, dim=-1)
                 board_correct = (preds_causal == target_ids) & board_mask
                 board_acc = board_correct.sum() / (board_mask.sum() + 1e-8)
-                
-                # Overall Policy Acc (mixed)
-                policy_acc = (move_correct.sum() + board_correct.sum()) / (move_mask.sum() + board_mask.sum() + 1e-8)
-                
-                # Value Accuracy: argmax of predicted value matches argmax of true value (at move positions)
-                value_preds_argmax = torch.argmax(value_logits_prefix, dim=-1)  # [B, T]
-                value_targets_argmax = torch.argmax(wdl_targets, dim=-1)  # [B, T]
-                value_correct = (value_preds_argmax == value_targets_argmax) & wdl_mask
-                value_acc = value_correct.sum() / (wdl_mask.sum() + 1e-8)
-                
-                # Move/Value accuracy by nth move in sequence
-                # Compute move indices: 0 for 1st move, 1 for 2nd, etc.
+
+                # WL MAE (expected value) and MSE (argmax bucket center)
+                if wl_logits is not None and stm_nonzero.shape[0] > 0:
+                    wl_probs = F.softmax(wl_logits.float(), dim=-1)
+                    expected_wl = (wl_probs * model.wl_bucket_centers.unsqueeze(0)).sum(dim=-1)
+                    wl_valid_f = wl_valid_flat.float()
+                    wl_mae = ((expected_wl - wl_gt_flat).abs() * wl_valid_f).sum() / (wl_valid_f.sum() + 1e-8)
+                    argmax_wl = model.wl_bucket_centers[wl_logits.argmax(dim=-1)]
+                    wl_mse = (((argmax_wl - wl_gt_flat) ** 2) * wl_valid_f).sum() / (wl_valid_f.sum() + 1e-8)
+                else:
+                    wl_mae = torch.tensor(0.0, device=device)
+                    wl_mse = torch.tensor(0.0, device=device)
+
+                # D MAE (expected value) and MSE (argmax bucket center)
+                if d_logits is not None and wl_positions.any():
+                    d_probs = F.softmax(d_logits.float(), dim=-1)
+                    expected_d = (d_probs * model.d_bucket_centers.unsqueeze(0)).sum(dim=-1)
+                    d_valid_f = d_valid_flat.float()
+                    d_mae = ((expected_d - d_gt_flat).abs() * d_valid_f).sum() / (d_valid_f.sum() + 1e-8)
+                    argmax_d = model.d_bucket_centers[d_logits.argmax(dim=-1)]
+                    d_mse = (((argmax_d - d_gt_flat) ** 2) * d_valid_f).sum() / (d_valid_f.sum() + 1e-8)
+                else:
+                    d_mae = torch.tensor(0.0, device=device)
+                    d_mse = torch.tensor(0.0, device=device)
+
+                # nth-move metrics
                 max_track_moves = config["training"].get("max_track_nth_moves", 20)
-                move_cumsum = wdl_mask.cumsum(dim=1)  # [B, T], at move positions: 1, 2, 3, ...
-                move_indices = (move_cumsum - 1).long()  # [B, T], at move positions: 0, 1, 2, ...
-                
-                # Only track moves with index < max_track_moves
-                valid_nth_mask = wdl_mask & (move_indices < max_track_moves)
-                
+                move_cumsum = move_mask.cumsum(dim=1)
+                move_indices = (move_cumsum - 1).long()
+                valid_nth_mask = move_mask & (move_indices < max_track_moves)
+
                 if valid_nth_mask.any():
                     flat_move_indices = move_indices[valid_nth_mask]
                     flat_move_correct = move_correct[valid_nth_mask].float()
-                    flat_value_correct = value_correct[valid_nth_mask].float()
-                    
-                    # Scatter-add for efficient aggregation
+
                     move_correct_by_nth = torch.zeros(max_track_moves, device=device)
-                    value_correct_by_nth = torch.zeros(max_track_moves, device=device)
                     count_by_nth = torch.zeros(max_track_moves, device=device)
-                    
+
                     move_correct_by_nth.scatter_add_(0, flat_move_indices, flat_move_correct)
-                    value_correct_by_nth.scatter_add_(0, flat_move_indices, flat_value_correct)
                     count_by_nth.scatter_add_(0, flat_move_indices, torch.ones_like(flat_move_correct))
-                    
-                    # Compute accuracies per nth move
+
                     move_acc_by_nth = move_correct_by_nth / (count_by_nth + 1e-8)
-                    value_acc_by_nth = value_correct_by_nth / (count_by_nth + 1e-8)
                 else:
                     move_acc_by_nth = torch.zeros(max_track_moves, device=device)
-                    value_acc_by_nth = torch.zeros(max_track_moves, device=device)
                     count_by_nth = torch.zeros(max_track_moves, device=device)
-            
+
             if step % config["training"]["log_every_n_steps"] == 0:
-                print(f"Step {step}: Loss {total_loss.item():.4f} (Move: {move_loss.item():.4f}, Board: {board_loss.item():.4f}, WDL: {wdl_loss.item():.4f})")
-                
-                # Base metrics
+                print(f"Step {step}: Loss {total_loss.item():.4f} "
+                      f"(Move: {move_loss.item():.4f}, Board: {board_loss.item():.4f}, "
+                      f"WL: {wl_loss.item():.4f}, D: {d_loss.item():.4f})")
+
                 log_dict = {
                     "train/total_loss": total_loss.item(),
                     "train/move_loss": move_loss.item(),
                     "train/board_loss": board_loss.item(),
-                    "train/wdl_loss": wdl_loss.item(),
-                    "train/policy_acc": policy_acc.item(),
+                    "train/wl_loss": wl_loss.item(),
+                    "train/d_loss": d_loss.item(),
                     "train/move_acc": move_acc.item(),
                     "train/board_acc": board_acc.item(),
-                    "train/value_acc": value_acc.item(),
+                    "train/wl_mae": wl_mae.item(),
+                    "train/wl_mse": wl_mse.item(),
+                    "train/d_mae": d_mae.item(),
+                    "train/d_mse": d_mse.item(),
                     "train/epoch": epoch,
                     "train/step": step,
                     "train/grad_step": step / config["training"].get("gradient_accumulation_steps", 1)
                 }
-                
-                # Add nth-move metrics (only for positions with sufficient samples)
+
                 for i in range(max_track_moves):
                     if count_by_nth[i] > 0:
                         log_dict[f"train/move_acc_nth/{i}"] = move_acc_by_nth[i].item()
-                        log_dict[f"train/value_acc_nth/{i}"] = value_acc_by_nth[i].item()
-                
+
                 wandb.log(log_dict)
-                
+
             step += 1
-            
-        # Save checkpoint with optimizer state for resuming training
-        if (epoch + 1) % 1 == 0:  # Save every epoch for now
+
+        # Save checkpoint
+        if (epoch + 1) % 1 == 0:
             checkpoint = {
                 "epoch": epoch + 1,
                 "step": step,
