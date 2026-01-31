@@ -235,8 +235,8 @@ castling_tokens = ["".join(c) for r in range(1, 5) for c in itertools.combinatio
 special_tokens = ["start_pos", "end_pos", "white_to_move", "black_to_move", "empty", "pad", "bos", "eos",
                   "wl_value", "d_value", "start_think", "end_think"]
 
-# Build vocabulary: policy moves + piece tokens + special tokens + castling
-vocab = policy_index + piece_tokens + special_tokens + castling_tokens
+# Build vocabulary: policy moves + piece tokens + special tokens + castling + end_var
+vocab = policy_index + piece_tokens + special_tokens + castling_tokens + ["end_var"]
 token_to_idx = {t: i for i, t in enumerate(vocab)}
 idx_to_token = {i: t for i, t in enumerate(vocab)}
 vocab_size = len(vocab)

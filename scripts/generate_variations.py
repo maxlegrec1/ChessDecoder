@@ -33,21 +33,36 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import chess
+
 from src.mcts import LeelaMCTS
 
-# Leela stores castling as "king captures rook" (e1h1, e8a8, etc.)
-# but the C++ chess library expects standard UCI (e1g1, e8c8, etc.)
-_PSEUDO_TO_STANDARD_CASTLING = {
-    "e1h1": "e1g1",
-    "e1a1": "e1c1",
-    "e8h8": "e8g8",
-    "e8a8": "e8c8",
-}
+
+_STANDARD_CASTLING = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
+
+
+def _is_standard_game(origin_fen: str, moves: list[str]) -> bool:
+    """Check that every move in the game is replayable with standard UCI.
+
+    Returns False for Chess960 games (non-standard castling notation)
+    or games with broken move chains.
+    """
+    board = chess.Board(origin_fen)
+    for move_str in moves:
+        uci = _STANDARD_CASTLING.get(move_str, move_str)
+        try:
+            move = board.parse_uci(uci)
+        except (chess.InvalidMoveError, chess.IllegalMoveError):
+            return False
+        if move not in board.legal_moves:
+            return False
+        board.push(move)
+    return True
 
 
 def _normalize_history(moves: list[str]) -> list[str]:
-    """Convert pseudo-castling notation from parquet to standard UCI."""
-    return [_PSEUDO_TO_STANDARD_CASTLING.get(m, m) for m in moves]
+    """Map the 4 standard-chess pseudo-castling notations to standard UCI."""
+    return [_STANDARD_CASTLING.get(m, m) for m in moves]
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,10 +145,17 @@ def process_game(
     max_variations: int,
     max_variation_depth: int,
     positions_per_game: int,
-) -> list[dict]:
-    """Process sampled positions in a single game, returning enriched rows."""
+) -> list[dict] | None:
+    """Process sampled positions in a single game, returning enriched rows.
+
+    Returns None for games that can't be replayed (Chess960, broken chains).
+    """
     game_df = game_df.sort_values("ply").reset_index(drop=True)
     all_moves = list(game_df["played_move"])
+    origin_fen = game_df.iloc[0]["fen"]
+
+    if not _is_standard_game(origin_fen, all_moves):
+        return None
 
     # Choose which positions to run MCTS on
     n = len(game_df)
@@ -142,7 +164,6 @@ def process_game(
     else:
         sampled_indices = list(range(n))
 
-    origin_fen = game_df.iloc[0]["fen"]
     rows = []
 
     for idx in sampled_indices:
@@ -185,40 +206,52 @@ def process_file(
     mcts: LeelaMCTS,
     args: argparse.Namespace,
 ) -> None:
-    """Process a single parquet file."""
+    """Process a single parquet file, appending to output after each game."""
     df = pd.read_parquet(parquet_path)
 
     game_ids = df["game_id"].unique()
     if args.games_limit is not None:
         game_ids = game_ids[: args.games_limit]
 
-    all_rows: list[dict] = []
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer: pq.ParquetWriter | None = None
+    n_positions = 0
+    n_skipped = 0
     t0 = time.perf_counter()
 
-    for game_id in tqdm(game_ids, desc=f"  {parquet_path.name}", unit="game"):
-        game_df = df[df["game_id"] == game_id]
-        enriched = process_game(
-            game_df,
-            mcts,
-            args.simulations,
-            args.max_variations,
-            args.max_variation_depth,
-            args.positions_per_game,
-        )
-        all_rows.extend(enriched)
+    try:
+        for game_id in tqdm(game_ids, desc=f"  {parquet_path.name}", unit="game"):
+            game_df = df[df["game_id"] == game_id]
+            enriched = process_game(
+                game_df,
+                mcts,
+                args.simulations,
+                args.max_variations,
+                args.max_variation_depth,
+                args.positions_per_game,
+            )
+            if enriched is None:
+                n_skipped += 1
+                continue
+            if not enriched:
+                continue
+
+            batch = pa.Table.from_pylist(enriched)
+            if writer is None:
+                writer = pq.ParquetWriter(output_path, batch.schema)
+            writer.write_table(batch)
+            n_positions += len(enriched)
+    finally:
+        if writer is not None:
+            writer.close()
 
     elapsed = time.perf_counter() - t0
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pylist(all_rows)
-    pq.write_table(table, output_path)
-
-    n_games = len(game_ids)
-    n_positions = len(all_rows)
+    n_games = len(game_ids) - n_skipped
     print(
         f"  Wrote {output_path.name}: {n_games} games, "
         f"{n_positions} positions in {elapsed:.1f}s "
         f"({n_positions / elapsed:.1f} pos/s)"
+        f"{f' (skipped {n_skipped} non-standard games)' if n_skipped else ''}"
     )
 
 

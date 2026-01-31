@@ -119,6 +119,9 @@ class ChessDecoder(nn.Module):
         # Move prediction head (prefix pass) — new, separate
         self.policy_head = nn.Linear(embed_dim, vocab_size)
 
+        # Thinking move prediction head (prefix pass, variation moves)
+        self.thinking_policy_head = nn.Linear(embed_dim, vocab_size)
+
         # Value heads
         self.wl_head = ValueHead(embed_dim, n_buckets, value_hidden_size)
         self.d_head = ValueHead(embed_dim, n_buckets, value_hidden_size)
