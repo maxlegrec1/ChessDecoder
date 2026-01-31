@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "chess-library/include/chess.hpp"
+#include "mcts/summary.hpp"
 
 namespace chessrl::mcts
 {
@@ -32,6 +33,9 @@ struct MctsOptions
     float temperature{1.0F};
     std::string small_engine_path{"model_minibatch.trt"};
     std::string leela_engine_path{"leela_minibatch.trt"};
+    bool extract_variations{false};
+    int max_variations{5};
+    int max_variation_depth{20};
 };
 
 MctsOptions parse_cli(int argc, char** argv);
@@ -74,6 +78,7 @@ struct SearchTree
 
 std::array<float, 3> orient_small_wdl(const chess::Board& board, const std::array<float, 3>& raw_wdl);
 std::vector<std::string> principal_variation(const SearchTree& tree, int node_index);
+std::vector<PVNodeDetail> principal_variation_detailed(const SearchTree& tree, int node_index, int max_depth = 20);
 std::vector<std::string> history_to_vector(const HistoryHandle& tail);
 
 } // namespace chessrl::mcts

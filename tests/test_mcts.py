@@ -8,5 +8,9 @@ leela = LeelaMCTS(engine_path="leela_minibatch.trt", temperature=600, cpuct=1.0)
 fen = ""
 history = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5","g8f6","e1g1"]
 
-res = leela.run(fen,history, temperature=1, simulations=1000, cpuct=1.0)
-print(res)
+# res = leela.run(fen,history, temperature=1, simulations=600, cpuct=1.0)
+# print(res)
+
+res = leela.run_with_variations(fen,history, temperature=1, simulations=600, cpuct=1.0, max_variations=5, max_variation_depth=5)
+for variation in res['variations']:
+    print(variation)

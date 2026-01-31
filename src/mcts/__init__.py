@@ -124,6 +124,38 @@ class LeelaMCTS(_BaseMCTS):
 
     __call__ = run
 
+    def run_with_variations(
+        self,
+        fen: str,
+        history: Sequence[str] = (),
+        *,
+        simulations: int | None = None,
+        cpuct: float | None = None,
+        temperature: float | None = None,
+        engine_path: str | None = None,
+        max_variations: int = 5,
+        max_variation_depth: int = 20,
+    ) -> dict[str, object]:
+        cfg = self._prepare_call(
+            simulations=simulations,
+            cpuct=cpuct,
+            temperature=temperature,
+            engine_path=engine_path,
+        )
+        payload = _cpp.leela_mcts_search_with_variations(
+            fen,
+            _coerce_history(history),
+            cfg.simulations,
+            cfg.cpuct,
+            cfg.temperature,
+            cfg.engine_path,
+            max_variations,
+            max_variation_depth,
+        )
+        result = self._format_result(payload)
+        result["variations"] = payload.get("variations", [])
+        return result
+
 
 __all__ = [
     "LeelaMCTS",

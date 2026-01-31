@@ -161,6 +161,82 @@ std::vector<std::string> principal_variation(const SearchTree& tree, int node_in
     return line;
 }
 
+std::vector<PVNodeDetail> principal_variation_detailed(const SearchTree& tree, int node_index, int max_depth)
+{
+    std::vector<PVNodeDetail> line;
+    if (node_index < 0 || node_index >= static_cast<int>(tree.nodes.size()))
+    {
+        return line;
+    }
+
+    int current = node_index;
+    int depth = 0;
+    while (current >= 0 && current < static_cast<int>(tree.nodes.size()) && depth < max_depth)
+    {
+        const TreeNode& node = tree.nodes[current];
+        if (node.children.empty())
+        {
+            break;
+        }
+
+        size_t best_index = 0;
+        bool has_visits = false;
+        float best_visits = -1.0F;
+
+        for (size_t i = 0; i < node.children.size(); ++i)
+        {
+            const int child_index = node.children[i];
+            if (child_index < 0 || child_index >= static_cast<int>(tree.nodes.size()))
+            {
+                continue;
+            }
+            const TreeNode& child = tree.nodes[child_index];
+            const float visits = static_cast<float>(child.visit_count);
+            if (visits > best_visits)
+            {
+                best_visits = visits;
+                best_index = i;
+                has_visits = visits > 0.0F;
+            }
+        }
+
+        if (!has_visits)
+        {
+            float best_prior = -1.0F;
+            bool found_prior = false;
+            for (size_t i = 0; i < node.children.size(); ++i)
+            {
+                const float prior = node.child_priors[i];
+                if (prior > best_prior)
+                {
+                    best_prior = prior;
+                    best_index = i;
+                    found_prior = true;
+                }
+            }
+            if (!found_prior)
+            {
+                break;
+            }
+        }
+
+        const chess::Move move = node.child_moves[best_index];
+        const std::string move_uci = chess::uci::moveToUci(move, node.board.chess960());
+
+        PVNodeDetail detail;
+        detail.fen = node.board.getFen();
+        detail.move = move_uci;
+        detail.wdl = node.wdl;
+        detail.visit_count = node.visit_count;
+        line.push_back(std::move(detail));
+
+        current = node.children[best_index];
+        ++depth;
+    }
+
+    return line;
+}
+
 std::vector<std::string> history_to_vector(const HistoryHandle& tail)
 {
     if (!tail)

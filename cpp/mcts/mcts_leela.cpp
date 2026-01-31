@@ -695,6 +695,32 @@ private:
             }
             summary.rollouts.push_back(std::move(detail));
         }
+
+        if (options_.extract_variations)
+        {
+            std::vector<Aggregated> sorted_agg = aggregated;
+            std::sort(sorted_agg.begin(), sorted_agg.end(), [](const Aggregated& a, const Aggregated& b) {
+                return a.visit_sum > b.visit_sum;
+            });
+
+            const int k = std::min(options_.max_variations, static_cast<int>(sorted_agg.size()));
+            summary.variations.reserve(static_cast<size_t>(k));
+            for (int i = 0; i < k; ++i)
+            {
+                const Aggregated& agg = sorted_agg[static_cast<size_t>(i)];
+                VariationLine var;
+                var.root_move = agg.uci;
+                var.visit_count = agg.visit_sum;
+                var.visit_fraction = visit_sum > 0.0F ? static_cast<float>(agg.visit_sum) / visit_sum : 0.0F;
+                var.prior = agg.prior_sum;
+                if (agg.representative_child >= 0)
+                {
+                    var.nodes = principal_variation_detailed(tree_, agg.representative_child, options_.max_variation_depth);
+                }
+                summary.variations.push_back(std::move(var));
+            }
+        }
+
         return summary;
     }
 
