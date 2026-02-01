@@ -59,15 +59,6 @@ def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
 
 def migrate_state_dict(state_dict, new_vocab_size):
     """Migrate old checkpoint: expand vocab dim to new size, clone policy_head to thinking_policy_head."""
-    # Checkpoint compatibility: rename old policy_head -> board_head if needed
-    if "policy_head.weight" in state_dict and "board_head.weight" not in state_dict:
-        state_dict["board_head.weight"] = state_dict.pop("policy_head.weight")
-        state_dict["board_head.bias"] = state_dict.pop("policy_head.bias")
-
-    # Remove old value head if present
-    state_dict.pop("value_head.weight", None)
-    state_dict.pop("value_head.bias", None)
-
     # Expand vocab-sized tensors if needed
     for key in ["tok_embedding.weight", "board_head.weight", "board_head.bias",
                 "policy_head.weight", "policy_head.bias"]:
