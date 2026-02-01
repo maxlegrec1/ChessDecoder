@@ -222,9 +222,6 @@ policy_index = [
 # Precomputed mapping for O(1) lookup of policy token -> index
 policy_to_idx = {u: i for i, u in enumerate(policy_index)}
 
-# Board squares in order (a1, b1, ..., h8)
-squares = [f"{f}{r}" for r in "12345678" for f in "abcdefgh"]
-
 # Piece tokens: color_piece (no square info - position is implicit)
 pieces = ["king", "queen", "rook", "bishop", "knight", "pawn"]
 colors = ["white", "black"]
