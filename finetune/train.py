@@ -57,17 +57,8 @@ def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
     return (loss * valid_mask.float()).sum() / (valid_mask.sum() + 1e-8)
 
 
-def load_pretrained_checkpoint(model, checkpoint_path, device, old_vocab_size=None):
-    """
-    Load pretrained checkpoint into the finetuning model.
-
-    1. Clone policy_head weights -> thinking_policy_head
-    2. Expand embedding and output heads for new end_var token (vocab_size += 1)
-    3. Load with strict=False
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint["model_state_dict"]
-
+def migrate_state_dict(state_dict, new_vocab_size):
+    """Migrate old checkpoint: expand vocab dim to new size, clone policy_head to thinking_policy_head."""
     # Checkpoint compatibility: rename old policy_head -> board_head if needed
     if "policy_head.weight" in state_dict and "board_head.weight" not in state_dict:
         state_dict["board_head.weight"] = state_dict.pop("policy_head.weight")
@@ -77,42 +68,28 @@ def load_pretrained_checkpoint(model, checkpoint_path, device, old_vocab_size=No
     state_dict.pop("value_head.weight", None)
     state_dict.pop("value_head.bias", None)
 
+    # Expand vocab-sized tensors if needed
+    for key in ["tok_embedding.weight", "board_head.weight", "board_head.bias",
+                "policy_head.weight", "policy_head.bias"]:
+        if key not in state_dict:
+            continue
+        t = state_dict[key]
+        if t.shape[0] < new_vocab_size:
+            pad = torch.zeros(new_vocab_size - t.shape[0], *t.shape[1:], dtype=t.dtype, device=t.device)
+            state_dict[key] = torch.cat([t, pad], dim=0)
+
     # Clone policy_head -> thinking_policy_head
     if "policy_head.weight" in state_dict:
         state_dict["thinking_policy_head.weight"] = state_dict["policy_head.weight"].clone()
         state_dict["thinking_policy_head.bias"] = state_dict["policy_head.bias"].clone()
 
-    # Expand embedding and heads for new vocab token(s)
-    if old_vocab_size is not None:
-        new_vocab_size = vocab_size
-        diff = new_vocab_size - old_vocab_size
+    return state_dict
 
-        if diff > 0:
-            # Expand tok_embedding
-            if "tok_embedding.weight" in state_dict:
-                old_emb = state_dict["tok_embedding.weight"]  # (old_V, E)
-                embed_dim = old_emb.shape[1]
-                new_rows = torch.randn(diff, embed_dim, device=old_emb.device) * 0.02
-                state_dict["tok_embedding.weight"] = torch.cat([old_emb, new_rows], dim=0)
 
-            # Expand all output heads that have vocab_size as first dim
-            heads_to_expand = [
-                "board_head.weight", "board_head.bias",
-                "policy_head.weight", "policy_head.bias",
-                "thinking_policy_head.weight", "thinking_policy_head.bias",
-            ]
-            for key in heads_to_expand:
-                if key in state_dict:
-                    old_param = state_dict[key]
-                    if old_param.dim() == 2 and old_param.shape[0] == old_vocab_size:
-                        # Weight matrix (V, E)
-                        new_rows = torch.randn(diff, old_param.shape[1], device=old_param.device) * 0.02
-                        state_dict[key] = torch.cat([old_param, new_rows], dim=0)
-                    elif old_param.dim() == 1 and old_param.shape[0] == old_vocab_size:
-                        # Bias vector (V,)
-                        new_rows = torch.zeros(diff, device=old_param.device)
-                        state_dict[key] = torch.cat([old_param, new_rows], dim=0)
-
+def load_pretrained_checkpoint(model, checkpoint_path, device):
+    """Load pretrained checkpoint, migrating vocab size and cloning thinking_policy_head."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = migrate_state_dict(checkpoint["model_state_dict"], vocab_size)
     model.load_state_dict(state_dict, strict=False)
     return checkpoint
 
@@ -139,9 +116,7 @@ def train():
 
     # Load pretrained checkpoint
     pretrain_checkpoint = config["training"]["pretrain_checkpoint"]
-    # The pretrained model had vocab_size - 1 (before adding end_var)
-    old_vocab_size = vocab_size - 1
-    checkpoint = load_pretrained_checkpoint(model, pretrain_checkpoint, device, old_vocab_size=old_vocab_size)
+    checkpoint = load_pretrained_checkpoint(model, pretrain_checkpoint, device)
     print(f"Loaded pretrained checkpoint from {pretrain_checkpoint}")
 
     # Check if resuming from a finetune checkpoint
