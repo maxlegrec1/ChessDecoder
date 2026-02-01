@@ -21,12 +21,6 @@ from datetime import datetime
 from math import log10
 from pathlib import Path
 
-faulthandler.enable()
-
-_ROOT = Path(__file__).resolve().parents[1]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
 import chess
 import chess.engine
 import chess.pgn
