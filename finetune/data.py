@@ -27,7 +27,9 @@ Move prediction positions:
 """
 
 import json
+import random
 import chess
+import numpy as np
 import pandas as pd
 from src.dataloader.data import fen_to_position_tokens
 from src.models.vocab import token_to_idx
@@ -41,12 +43,26 @@ _STANDARD_TO_PSEUDO_CASTLING = {
 }
 
 
+def _gumbel_reorder(variations, tau_base, tau_alpha, root_wdl):
+    """Reorder variations via Plackett-Luce (Gumbel-max trick)."""
+    if len(variations) <= 1:
+        return variations, tuple(range(1, len(variations) + 1))
+    W, D, L = root_wdl
+    wdl_var = (W + L) - (W - L) ** 2
+    tau = tau_base * (1.0 + tau_alpha * wdl_var)
+    scores = np.array([v.get("visit_fraction", 0.0) for v in variations])
+    perceived = scores / tau + np.random.gumbel(size=len(scores))
+    order = np.argsort(-perceived)
+    ranking = tuple(int(i) + 1 for i in order)
+    return [variations[i] for i in order], ranking
+
+
 def _to_model_uci(move_uci: str) -> str:
     """Convert standard UCI castling to pseudo-castling used by model vocab."""
     return _STANDARD_TO_PSEUDO_CASTLING.get(move_uci, move_uci)
 
 
-def variation_to_token_ids(row, max_variations=3, max_depth=5):
+def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau_alpha=1.0):
     """
     Convert a parquet row with variation data into a finetuning token sequence.
 
@@ -54,6 +70,8 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5):
         row: parquet row (dict-like) with fen, variations, mcts_action, win, draw, loss
         max_variations: max number of variations to include
         max_depth: max PV depth per variation (number of nodes)
+        tau_base: base temperature for Plackett-Luce reordering
+        tau_alpha: scaling factor for WDL variance in adaptive temperature
 
     Returns:
         ids: list[int] - token IDs
@@ -61,6 +79,8 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5):
         final_move_data: (pos, move_token_str) - position where policy_head predicts
         value_data: list[(wl_pos, d_pos, wl, d, is_valid)] - WL/D value target positions
         block_boundaries: list[(start, end)] - board block boundaries for prefix masking
+        ranking: tuple[int] - original rank of each variation after reordering
+        first_is_not_best: bool - whether the first variation's root move differs from the final move
     """
     fen = row["fen"]
     variations_json = row["variations"]
@@ -75,6 +95,14 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5):
     # Sort by visit_count descending, cap at max_variations
     variations = sorted(variations, key=lambda v: v.get("visit_count", 0), reverse=True)
     variations = variations[:max_variations]
+
+    # Gumbel-noise reordering (Plackett-Luce)
+    root_wdl = (
+        row["win"] if pd.notna(row["win"]) else 0.0,
+        row["draw"] if pd.notna(row["draw"]) else 0.0,
+        row["loss"] if pd.notna(row["loss"]) else 0.0,
+    )
+    variations, ranking = _gumbel_reorder(variations, tau_base, tau_alpha, root_wdl)
 
     # Final move WDL
     win = row["win"] if pd.notna(row["win"]) else 0.0
@@ -101,10 +129,12 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5):
     # 3. For each variation
     for var_idx, var in enumerate(variations):
         root_move = var["root_move"]
-        nodes = var.get("nodes", [])[:max_depth]
-
-        if not nodes:
+        all_nodes = var.get("nodes", [])
+        available_depth = min(max_depth, len(all_nodes))
+        if available_depth == 0:
             continue
+        sampled_depth = random.randint(1, available_depth)
+        nodes = all_nodes[:sampled_depth]
 
         # Root move token - predicted from previous token (start_think or end_var)
         root_move_model = _to_model_uci(root_move)
@@ -176,7 +206,15 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5):
     sequence.append("d_value")
     value_data.append((wl_pos, d_pos, final_wl, final_d, is_valid_wdl))
 
+    # Compute first_is_not_best
+    first_var_root_move = _to_model_uci(variations[0]["root_move"]) if variations else None
+    first_is_not_best = (
+        first_var_root_move is not None
+        and final_move_model is not None
+        and first_var_root_move != final_move_model
+    )
+
     # Convert to token IDs
     ids = [token_to_idx[t] for t in sequence]
 
-    return ids, thinking_move_data, final_move_data, value_data, block_boundaries
+    return ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best

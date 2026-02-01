@@ -174,6 +174,8 @@ def train():
         variation_ratio=config["data"].get("variation_ratio", 0.2),
         max_variations=config["data"].get("max_variations", 3),
         max_depth=config["data"].get("max_depth", 5),
+        tau_base=config["data"].get("tau_base", 0.3),
+        tau_alpha=config["data"].get("tau_alpha", 1.0),
     )
 
     # Optimizer
@@ -257,6 +259,8 @@ def train():
             d_targets = batch["d_targets"].to(device)
             wdl_valid = batch["wdl_valid"].to(device)
             block_id = batch["block_id"].to(device)
+            first_is_not_best = batch["first_is_not_best"].to(device)
+            variation_epoch = batch["variation_epoch"].to(device)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 # === Pass 1: Causal masking for board generation ===
@@ -394,6 +398,15 @@ def train():
                 else:
                     d_mae = torch.tensor(0.0, device=device)
 
+                # Reordered final move accuracy (first_is_not_best samples only)
+                reorder_mask = move_mask & first_is_not_best.unsqueeze(1)
+                if reorder_mask.sum() > 0:
+                    reorder_correct = (preds_final == target_ids) & reorder_mask
+                    final_move_acc_reordered = reorder_correct.sum().float() / reorder_mask.sum().float()
+                else:
+                    final_move_acc_reordered = torch.tensor(0.0, device=device)
+                n_reordered = first_is_not_best.sum().item()
+
                 # Track ratio of thinking vs normal samples
                 batch_has_thinking = thinking_move_mask.any(dim=1).sum().item()
                 batch_has_normal = (move_mask.any(dim=1) & ~thinking_move_mask.any(dim=1)).sum().item()
@@ -420,6 +433,9 @@ def train():
                     "train/lr": scheduler.get_last_lr()[0],
                     "train/batch_thinking_samples": batch_has_thinking,
                     "train/batch_normal_samples": batch_has_normal,
+                    "train/final_move_acc_reordered": final_move_acc_reordered.item(),
+                    "train/n_reordered_samples": n_reordered,
+                    "train/variation_epoch": variation_epoch.max().item(),
                 })
 
             step += 1

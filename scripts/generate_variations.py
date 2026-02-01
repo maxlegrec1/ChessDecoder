@@ -11,7 +11,8 @@ Usage:
         --parquet-dir parquets \
         --output-dir parquets_variations \
         --simulations 600 \
-        --engine-path leela_minibatch.trt
+        --engine-path model_dynamic_leela.trt \
+        --parallel-trees 128
 """
 
 from __future__ import annotations
@@ -103,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engine-path",
         type=str,
-        default="leela_minibatch.trt",
+        default="model_dynamic_leela.trt",
         help="TRT engine file path.",
     )
     parser.add_argument(
@@ -135,69 +136,19 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Policy temperature.",
     )
+    parser.add_argument(
+        "--parallel-trees",
+        type=int,
+        default=128,
+        help="Number of parallel MCTS trees per batch.",
+    )
+    parser.add_argument(
+        "--max-gpu-batch",
+        type=int,
+        default=256,
+        help="Max GPU batch size for dynamic engine.",
+    )
     return parser.parse_args()
-
-
-def process_game(
-    game_df: pd.DataFrame,
-    mcts: LeelaMCTS,
-    simulations: int,
-    max_variations: int,
-    max_variation_depth: int,
-    positions_per_game: int,
-) -> list[dict] | None:
-    """Process sampled positions in a single game, returning enriched rows.
-
-    Returns None for games that can't be replayed (Chess960, broken chains).
-    """
-    game_df = game_df.sort_values("ply").reset_index(drop=True)
-    all_moves = list(game_df["played_move"])
-    origin_fen = game_df.iloc[0]["fen"]
-
-    if not _is_standard_game(origin_fen, all_moves):
-        return None
-
-    # Choose which positions to run MCTS on
-    n = len(game_df)
-    if positions_per_game > 0 and positions_per_game < n:
-        sampled_indices = sorted(random.sample(range(n), positions_per_game))
-    else:
-        sampled_indices = list(range(n))
-
-    rows = []
-
-    for idx in sampled_indices:
-        row = game_df.iloc[idx]
-        history = _normalize_history(all_moves[:idx])
-
-        try:
-            result = mcts.run_with_variations(
-                origin_fen,
-                history,
-                simulations=simulations,
-                max_variations=max_variations,
-                max_variation_depth=max_variation_depth,
-            )
-        except Exception as e:
-            print(
-                f"  Warning: MCTS failed for game={row['game_id']} "
-                f"ply={row['ply']}: {e}",
-                file=sys.stderr,
-            )
-            result = {"action": None, "value": None, "variations": []}
-
-        enriched = row.to_dict()
-        enriched["variations"] = json.dumps(
-            result.get("variations", []), ensure_ascii=False
-        )
-        enriched["mcts_action"] = result.get("action")
-        value = result.get("value")
-        enriched["mcts_value"] = (
-            json.dumps(list(value), ensure_ascii=False) if value else None
-        )
-        rows.append(enriched)
-
-    return rows
 
 
 def process_file(
@@ -206,7 +157,7 @@ def process_file(
     mcts: LeelaMCTS,
     args: argparse.Namespace,
 ) -> None:
-    """Process a single parquet file, appending to output after each game."""
+    """Process a single parquet file using batched parallel MCTS."""
     df = pd.read_parquet(parquet_path)
 
     game_ids = df["game_id"].unique()
@@ -218,29 +169,69 @@ def process_file(
     n_positions = 0
     n_skipped = 0
     t0 = time.perf_counter()
+    pending: list[tuple[dict, str, list[str]]] = []  # (row_dict, origin_fen, history)
+
+    def flush_batch(batch: list[tuple[dict, str, list[str]]]) -> None:
+        nonlocal writer, n_positions
+        positions = [(fen, hist) for _, fen, hist in batch]
+        try:
+            results = mcts.run_parallel(
+                positions,
+                simulations=args.simulations,
+                max_variations=args.max_variations,
+                max_variation_depth=args.max_variation_depth,
+                engine_path=args.engine_path,
+                max_batch_size=args.max_gpu_batch,
+            )
+        except Exception as e:
+            print(f"  Batch failed: {e}", file=sys.stderr)
+            results = [{"action": None, "value": None, "variations": []}] * len(batch)
+
+        rows = []
+        for (row, _, _), res in zip(batch, results):
+            enriched = dict(row)
+            enriched["variations"] = json.dumps(
+                res.get("variations", []), ensure_ascii=False
+            )
+            enriched["mcts_action"] = res.get("action")
+            val = res.get("value")
+            enriched["mcts_value"] = (
+                json.dumps(list(val), ensure_ascii=False) if val else None
+            )
+            rows.append(enriched)
+
+        table = pa.Table.from_pylist(rows)
+        if writer is None:
+            writer = pq.ParquetWriter(output_path, table.schema)
+        writer.write_table(table)
+        n_positions += len(rows)
 
     try:
         for game_id in tqdm(game_ids, desc=f"  {parquet_path.name}", unit="game"):
-            game_df = df[df["game_id"] == game_id]
-            enriched = process_game(
-                game_df,
-                mcts,
-                args.simulations,
-                args.max_variations,
-                args.max_variation_depth,
-                args.positions_per_game,
-            )
-            if enriched is None:
+            game_df = df[df["game_id"] == game_id].sort_values("ply").reset_index(drop=True)
+            all_moves = list(game_df["played_move"])
+            origin_fen = game_df.iloc[0]["fen"]
+
+            if not _is_standard_game(origin_fen, all_moves):
                 n_skipped += 1
                 continue
-            if not enriched:
-                continue
 
-            batch = pa.Table.from_pylist(enriched)
-            if writer is None:
-                writer = pq.ParquetWriter(output_path, batch.schema)
-            writer.write_table(batch)
-            n_positions += len(enriched)
+            n = len(game_df)
+            if args.positions_per_game > 0 and args.positions_per_game < n:
+                sampled = sorted(random.sample(range(n), args.positions_per_game))
+            else:
+                sampled = list(range(n))
+
+            for idx in sampled:
+                row = game_df.iloc[idx].to_dict()
+                history = _normalize_history(all_moves[:idx])
+                pending.append((row, origin_fen, history))
+                if len(pending) >= args.parallel_trees:
+                    flush_batch(pending)
+                    pending = []
+
+        if pending:
+            flush_batch(pending)
     finally:
         if writer is not None:
             writer.close()
@@ -270,6 +261,8 @@ def main() -> None:
     print(f"Max variation depth: {args.max_variation_depth}")
     print(f"Positions per game: {args.positions_per_game or 'all'}")
     print(f"Engine: {args.engine_path}")
+    print(f"Parallel trees: {args.parallel_trees}")
+    print(f"Max GPU batch: {args.max_gpu_batch}")
     if args.games_limit:
         print(f"Games limit per file: {args.games_limit}")
     print()

@@ -31,6 +31,8 @@ class FinetuneIterableDataset(IterableDataset):
         shuffle_files=True,
         shuffle_games=True,
         skip_board_prob=0.0,
+        tau_base=0.3,
+        tau_alpha=1.0,
     ):
         self.pretrain_parquet_dir = pretrain_parquet_dir
         self.variation_parquet_dir = variation_parquet_dir
@@ -41,6 +43,8 @@ class FinetuneIterableDataset(IterableDataset):
         self.shuffle_files = shuffle_files
         self.shuffle_games = shuffle_games
         self.skip_board_prob = skip_board_prob
+        self.tau_base = tau_base
+        self.tau_alpha = tau_alpha
         self.pad_id = token_to_idx["pad"]
 
         self.pretrain_files = sorted(glob.glob(os.path.join(pretrain_parquet_dir, "*.parquet")))
@@ -68,12 +72,14 @@ class FinetuneIterableDataset(IterableDataset):
 
         pretrain_iter = self._pretrain_iter(pretrain_files)
         variation_iter = self._variation_iter(variation_files)
+        variation_epoch = 0
 
         while True:
             if random.random() < self.variation_ratio:
                 sample = next(variation_iter, None)
                 if sample is None:
                     # Restart variation iterator
+                    variation_epoch += 1
                     variation_iter = self._variation_iter(variation_files)
                     sample = next(variation_iter, None)
                     if sample is None:
@@ -81,10 +87,12 @@ class FinetuneIterableDataset(IterableDataset):
                         sample = next(pretrain_iter, None)
                         if sample is None:
                             return
+                sample["variation_epoch"] = torch.tensor(variation_epoch, dtype=torch.long)
             else:
                 sample = next(pretrain_iter, None)
                 if sample is None:
                     return
+                sample["variation_epoch"] = torch.tensor(variation_epoch, dtype=torch.long)
 
             yield sample
 
@@ -176,11 +184,13 @@ class FinetuneIterableDataset(IterableDataset):
                         continue
 
                     try:
-                        ids, thinking_move_data, final_move_data, value_data, block_boundaries = \
+                        ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best = \
                             variation_to_token_ids(
                                 row,
                                 max_variations=self.max_variations,
                                 max_depth=self.max_depth,
+                                tau_base=self.tau_base,
+                                tau_alpha=self.tau_alpha,
                             )
                     except Exception as e:
                         print(f"Error converting variation row {idx}: {e}")
@@ -191,8 +201,11 @@ class FinetuneIterableDataset(IterableDataset):
                         # Try with fewer variations/depth
                         for reduced_vars in range(self.max_variations - 1, 0, -1):
                             for reduced_depth in range(self.max_depth, 0, -1):
-                                ids, thinking_move_data, final_move_data, value_data, block_boundaries = \
-                                    variation_to_token_ids(row, max_variations=reduced_vars, max_depth=reduced_depth)
+                                ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best = \
+                                    variation_to_token_ids(
+                                        row, max_variations=reduced_vars, max_depth=reduced_depth,
+                                        tau_base=self.tau_base, tau_alpha=self.tau_alpha,
+                                    )
                                 if len(ids) <= self.max_seq_len:
                                     break
                             if len(ids) <= self.max_seq_len:
@@ -205,7 +218,8 @@ class FinetuneIterableDataset(IterableDataset):
                         continue
 
                     yield self._build_variation_tensors(
-                        ids, thinking_move_data, final_move_data, value_data, block_boundaries
+                        ids, thinking_move_data, final_move_data, value_data, block_boundaries,
+                        first_is_not_best=first_is_not_best,
                     )
 
             except Exception as e:
@@ -271,9 +285,10 @@ class FinetuneIterableDataset(IterableDataset):
             "d_targets": d_targets,
             "wdl_valid": wdl_valid,
             "block_id": block_id,
+            "first_is_not_best": torch.tensor(False, dtype=torch.bool),
         }
 
-    def _build_variation_tensors(self, ids, thinking_move_data, final_move_data, value_data, block_boundaries):
+    def _build_variation_tensors(self, ids, thinking_move_data, final_move_data, value_data, block_boundaries, first_is_not_best=False):
         """Build tensor dict for a thinking variation sample."""
         seq_len = len(ids)
 
@@ -368,6 +383,7 @@ class FinetuneIterableDataset(IterableDataset):
             "d_targets": d_targets,
             "wdl_valid": wdl_valid,
             "block_id": block_id,
+            "first_is_not_best": torch.tensor(first_is_not_best, dtype=torch.bool),
         }
 
 
@@ -381,6 +397,8 @@ def get_finetune_dataloader(
     max_variations=3,
     max_depth=5,
     skip_board_prob=0.0,
+    tau_base=0.3,
+    tau_alpha=1.0,
 ):
     dataset = FinetuneIterableDataset(
         pretrain_parquet_dir=pretrain_parquet_dir,
@@ -392,5 +410,7 @@ def get_finetune_dataloader(
         shuffle_files=True,
         shuffle_games=True,
         skip_board_prob=skip_board_prob,
+        tau_base=tau_base,
+        tau_alpha=tau_alpha,
     )
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
