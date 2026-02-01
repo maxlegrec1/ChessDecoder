@@ -190,6 +190,58 @@ PYBIND11_MODULE(_inference_cpp, m)
         "Execute the Leela-style MCTS search with PV variation extraction and return action, policy, Q-values, and variations.");
 
     m.def(
+        "leela_mcts_search_parallel",
+        [](const std::vector<std::string>& fens,
+           const std::vector<std::vector<std::string>>& histories,
+           int simulations, float cpuct, float temperature,
+           const std::string& engine_path, int max_batch_size,
+           int max_variations, int max_variation_depth) {
+
+            // Build options vector
+            std::vector<chessrl::mcts::MctsOptions> requests;
+            requests.reserve(fens.size());
+            for (size_t i = 0; i < fens.size(); ++i)
+            {
+                chessrl::mcts::MctsOptions opts;
+                opts.request.fen = fens[i];
+                opts.request.history = histories[i];
+                opts.simulations = simulations;
+                opts.cpuct = cpuct;
+                opts.temperature = temperature;
+                opts.leela_engine_path = engine_path;
+                opts.extract_variations = (max_variations > 0);
+                opts.max_variations = max_variations;
+                opts.max_variation_depth = max_variation_depth;
+                requests.push_back(std::move(opts));
+            }
+
+            // Release GIL during C++ parallel computation
+            std::vector<chessrl::mcts::MctsSummary> summaries;
+            {
+                py::gil_scoped_release release;
+                summaries = chessrl::mcts::run_parallel_leela_mcts(
+                    std::move(requests), engine_path, max_batch_size);
+            }
+
+            py::list results;
+            for (auto& s : summaries)
+            {
+                results.append(summary_to_python(s));
+            }
+            return results;
+        },
+        py::arg("fens"),
+        py::arg("histories"),
+        py::arg("simulations") = 600,
+        py::arg("cpuct") = 1.5F,
+        py::arg("temperature") = 1.0F,
+        py::arg("engine_path") = std::string("model_dynamic_leela.trt"),
+        py::arg("max_batch_size") = 256,
+        py::arg("max_variations") = 5,
+        py::arg("max_variation_depth") = 20,
+        "Execute parallel Leela MCTS searches sharing a single batch runner.");
+
+    m.def(
         "adversarial_mcts_search",
         [](const std::string& fen,
            const std::vector<std::string>& history,

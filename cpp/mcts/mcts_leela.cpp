@@ -18,6 +18,7 @@
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -193,6 +194,26 @@ public:
         , leela_batch_config_(make_leela_batch_config(options_))
         , leela_batch_runner_(leela_batch_config_)
         , leela_batch_flush_threshold_(static_cast<size_t>(leela_batch_config_.max_batch_size))
+        , cooperative_mode_(false)
+        , rng_(std::random_device{}())
+    {
+        const chess::Board board = apply_history(options_.request);
+        tree_.add_root(board, options_.request.history);
+        const size_t expected_nodes = 1 + static_cast<size_t>(options_.simulations) * 2;
+        tree_.reserve(expected_nodes);
+        path_buffer_.reserve(64);
+    }
+
+    // Parallel mode: shared external runner
+    LeelaMctsRunner(MctsOptions options, single::LeelaBatchRunner external_runner)
+        : options_(std::move(options))
+        , origin_fen_(options_.request.fen)
+        , vocab_(leela_policy_vocabulary())
+        , vocab_index_(build_vocab_index(vocab_))
+        , leela_batch_config_()
+        , leela_batch_runner_(std::move(external_runner))
+        , leela_batch_flush_threshold_(0)
+        , cooperative_mode_(true)
         , rng_(std::random_device{}())
     {
         const chess::Board board = apply_history(options_.request);
@@ -360,15 +381,26 @@ private:
         const std::vector<std::string> history = history_to_vector(node.history);
         auto encoded = acquire_leela_encoding(node.history, history);
         auto ticket = leela_batch_runner_.enqueue(*encoded);
-        if (leela_batch_runner_.pending() >= leela_batch_flush_threshold_)
+
+        LeelaPolicyValue eval;
+        if (cooperative_mode_)
         {
-            leela_batch_runner_.process_pending();
+            // PARALLEL: block on future. Worker thread handles processing.
+            eval = ticket.get();
         }
-        while (!ticket.ready())
+        else
         {
-            leela_batch_runner_.process_pending();
+            // SINGLE-TREE: caller helps flush (original behavior)
+            if (leela_batch_runner_.pending() >= leela_batch_flush_threshold_)
+            {
+                leela_batch_runner_.process_pending();
+            }
+            while (!ticket.ready())
+            {
+                leela_batch_runner_.process_pending();
+            }
+            eval = ticket.get();
         }
-        LeelaPolicyValue eval = ticket.get();
         if (eval.policy_logits.size() != chessrl::leela_policy_size())
         {
             throw std::runtime_error("Single-batch Leela inference returned unexpected policy size.");
@@ -732,6 +764,7 @@ private:
     single::LeelaBatchConfig leela_batch_config_;
     single::LeelaBatchRunner leela_batch_runner_;
     size_t leela_batch_flush_threshold_{0};
+    bool cooperative_mode_{false};
     mutable std::mutex leela_cache_mutex_;
     std::unordered_map<const HistoryEntry*, std::weak_ptr<const single::LeelaEncodedPosition>> leela_encoding_cache_;
     std::mt19937 rng_;
@@ -749,6 +782,76 @@ MctsSummary run_leela_mcts(MctsOptions options)
 {
     LeelaMctsRunner runner(std::move(options));
     return runner.run();
+}
+
+std::vector<MctsSummary> run_parallel_leela_mcts(
+    std::vector<MctsOptions> requests,
+    const std::string& engine_path,
+    int max_batch_size)
+{
+    if (requests.empty())
+    {
+        return {};
+    }
+
+    // One shared batch runner with dynamic engine
+    single::LeelaBatchConfig cfg;
+    cfg.engine_path = engine_path;
+    cfg.max_batch_size = max_batch_size;
+    cfg.enable_telemetry = telemetry_enabled_env();
+    cfg.flush_threshold = 1;        // wake on first item
+    cfg.collect_timeout_us = 500;   // 500us collect window
+    single::LeelaBatchRunner shared_runner(cfg);
+
+    const size_t n = requests.size();
+    std::vector<MctsSummary> results(n);
+    std::vector<std::exception_ptr> errors(n, nullptr);
+
+    // One thread per MCTS tree
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        threads.emplace_back([i, &requests, &results, &errors, &shared_runner]() {
+            try
+            {
+                LeelaMctsRunner runner(std::move(requests[i]), shared_runner);
+                results[i] = runner.run();
+            }
+            catch (...)
+            {
+                errors[i] = std::current_exception();
+            }
+        });
+    }
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    // Print telemetry once
+    if (cfg.enable_telemetry)
+    {
+        auto stats = shared_runner.statistics();
+        if (stats.batches > 0)
+        {
+            std::clog << "[telemetry][parallel-leela] batches=" << stats.batches
+                      << " positions=" << stats.positions
+                      << " infer_ms=" << stats.total_inference_ms << '\n';
+        }
+    }
+
+    // Re-throw first error
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (errors[i])
+        {
+            std::rethrow_exception(errors[i]);
+        }
+    }
+
+    return results;
 }
 
 #ifndef CHESSRL_MCTS_NO_STANDALONE

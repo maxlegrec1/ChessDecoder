@@ -100,6 +100,8 @@ struct LeelaBatchConfig
     std::string engine_path{"leela_minibatch.trt"};
     int max_batch_size{32};
     bool enable_telemetry{false};
+    int flush_threshold{-1};      // -1 = use max_batch_size
+    int collect_timeout_us{0};    // 0 = no timeout (original behavior)
 };
 
 class LeelaBatchRunner

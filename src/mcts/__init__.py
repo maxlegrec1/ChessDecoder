@@ -3,14 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Mapping, MutableMapping, Sequence
 
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parents[2]
-_CPP_DIR = _ROOT / "cpp"
-if str(_CPP_DIR) not in sys.path:
-    sys.path.insert(0, str(_CPP_DIR))
-
 import _inference_cpp as _cpp  # type: ignore[attr-defined]
 
 
@@ -123,6 +115,42 @@ class LeelaMCTS(_BaseMCTS):
         return self._format_result(payload)
 
     __call__ = run
+
+    def run_parallel(
+        self,
+        positions: list[tuple[str, list[str]]],
+        *,
+        simulations: int | None = None,
+        cpuct: float | None = None,
+        temperature: float | None = None,
+        engine_path: str | None = None,
+        max_batch_size: int = 256,
+        max_variations: int = 5,
+        max_variation_depth: int = 20,
+    ) -> list[dict[str, object]]:
+        cfg = self._prepare_call(
+            simulations=simulations,
+            cpuct=cpuct,
+            temperature=temperature,
+            engine_path=engine_path,
+        )
+        fens = [p[0] for p in positions]
+        histories = [list(p[1]) for p in positions]
+        raw = _cpp.leela_mcts_search_parallel(
+            fens,
+            histories,
+            cfg.simulations,
+            cfg.cpuct,
+            cfg.temperature,
+            cfg.engine_path,
+            max_batch_size,
+            max_variations,
+            max_variation_depth,
+        )
+        return [
+            self._format_result(r) | {"variations": r.get("variations", [])}
+            for r in raw
+        ]
 
     def run_with_variations(
         self,

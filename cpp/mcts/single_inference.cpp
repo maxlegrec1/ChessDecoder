@@ -100,17 +100,35 @@ size_t volume(const nvinfer1::Dims& dims)
 
 size_t normalized_tensor_volume(const nvinfer1::Dims& dims)
 {
-    const size_t total = volume(dims);
-    if (dims.nbDims > 0)
+    if (dims.nbDims <= 0)
     {
-        const int first = dims.d[0];
-        if (first > 0)
+        return 0;
+    }
+
+    const int first = dims.d[0];
+
+    // Dynamic batch dimension (-1): compute per-sample volume from remaining dims
+    if (first == -1)
+    {
+        size_t result = 1;
+        for (int i = 1; i < dims.nbDims; ++i)
         {
-            const size_t batch = static_cast<size_t>(first);
-            if (batch > 0 && total % batch == 0)
+            if (dims.d[i] <= 0)
             {
-                return total / batch;
+                return 0;
             }
+            result *= static_cast<size_t>(dims.d[i]);
+        }
+        return result;
+    }
+
+    const size_t total = volume(dims);
+    if (first > 0)
+    {
+        const size_t batch = static_cast<size_t>(first);
+        if (batch > 0 && total % batch == 0)
+        {
+            return total / batch;
         }
     }
     return total;
@@ -1676,7 +1694,10 @@ struct LeelaBatchRunner::Impl
     explicit Impl(LeelaBatchConfig cfg)
         : config(std::move(cfg))
         , ctx(getLeelaEngineContext(config.engine_path))
-        , flush_threshold_(static_cast<size_t>(config.max_batch_size))
+        , flush_threshold_(config.flush_threshold >= 0
+              ? static_cast<size_t>(config.flush_threshold)
+              : static_cast<size_t>(config.max_batch_size))
+        , collect_timeout_(config.collect_timeout_us)
     {
         if (config.max_batch_size <= 0)
         {
@@ -1992,11 +2013,32 @@ struct LeelaBatchRunner::Impl
         while (true)
         {
             std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [this]() { return stop_worker_ || queue.size() >= flush_threshold_; });
+            cv.wait(lock, [this]() {
+                return stop_worker_ || queue.size() >= flush_threshold_;
+            });
+
             if (stop_worker_)
             {
+                // Drain remaining items before exiting (prevents broken promises)
+                while (!queue.empty())
+                {
+                    lock.unlock();
+                    try { process(); } catch (...) {}
+                    lock.lock();
+                }
                 break;
             }
+
+            // Collect window: wait briefly for more items to accumulate
+            if (collect_timeout_.count() > 0
+                && queue.size() < static_cast<size_t>(config.max_batch_size))
+            {
+                cv.wait_for(lock, collect_timeout_, [this]() {
+                    return stop_worker_
+                        || queue.size() >= static_cast<size_t>(config.max_batch_size);
+                });
+            }
+
             lock.unlock();
             try
             {
@@ -2018,6 +2060,7 @@ struct LeelaBatchRunner::Impl
     LeelaBatchConfig config;
     LeelaEngineContext& ctx;
     size_t flush_threshold_{0};
+    std::chrono::microseconds collect_timeout_{0};
     std::unique_ptr<nvinfer1::IExecutionContext> exec;
     std::unique_ptr<CudaStream> stream;
     ResizableDeviceBuffer inputDevice;
@@ -2049,7 +2092,9 @@ LeelaBatchRunner::LeelaBatchRunner(LeelaBatchConfig config)
         std::ostringstream oss;
         oss << resolveEnginePath(config.engine_path, "leela_minibatch.trt")
             << '|' << config.max_batch_size
-            << '|' << (config.enable_telemetry ? '1' : '0');
+            << '|' << (config.enable_telemetry ? '1' : '0')
+            << '|' << config.flush_threshold
+            << '|' << config.collect_timeout_us;
         return oss.str();
     }();
 
