@@ -26,7 +26,7 @@ def estimate_elo(win_rate, stockfish_elo):
     if win_rate == 0:
         return 0
     elif win_rate == 1:
-        return 2500
+        return stockfish_elo + 400
     if win_rate == 0.5: # Avoid log10(1) which is 0, leading to division by zero if win_rate makes (1-win_rate)/win_rate = 1
         return stockfish_elo
     if win_rate > 0 and win_rate < 1: # ensure win_rate is not 0 or 1 to avoid math errors with log10
