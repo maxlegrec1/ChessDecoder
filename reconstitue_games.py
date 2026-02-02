@@ -4,7 +4,7 @@ import numpy as np
 import chess
 import sys
 import tarfile
-import io
+
 import json
 import pandas as pd
 from policy_index import policy_index
