@@ -318,12 +318,12 @@ def train():
                     else:
                         board_square_acc = 0.0
 
-                    # Castling (intra 66)
-                    castle = intra_idx == 66
+                    # Castling (intra 65: end_pos predicts castling token)
+                    castle = intra_idx == 65
                     board_castling_acc = bp_bc[castle].mean().item() if castle.any() else 0.0
 
-                    # STM (intra 67, only present for some boards)
-                    stm_metric = intra_idx == 67
+                    # STM (intra 66: castling predicts STM token)
+                    stm_metric = intra_idx == 66
                     board_stm_acc = bp_bc[stm_metric].mean().item() if stm_metric.any() else 0.0
                 else:
                     board_total_acc = 0.0
