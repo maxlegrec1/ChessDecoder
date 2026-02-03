@@ -271,6 +271,14 @@ def train():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
+            # Detach tensors used for metrics to prevent memory leak from retained computation graph
+            board_logits = board_logits.detach()
+            move_logits = move_logits.detach()
+            if wl_logits is not None:
+                wl_logits = wl_logits.detach()
+            if d_logits is not None:
+                d_logits = d_logits.detach()
+
             # Metrics
             with torch.no_grad():
                 # Move accuracy
@@ -415,6 +423,11 @@ def train():
                         log_dict[f"train/move_acc_nth/{i}"] = move_acc_by_nth[i].item()
 
                 wandb.log(log_dict)
+
+            # Explicitly delete heavy tensors to prevent memory leak
+            del h_causal, h_prefix, board_logits, move_logits
+            del wl_logits, d_logits
+            del total_loss, loss
 
             step += 1
 
