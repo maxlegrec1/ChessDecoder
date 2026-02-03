@@ -36,7 +36,8 @@ def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
     n_buckets = bucket_centers.shape[0]
 
     if N == 0 or valid_mask.sum() == 0:
-        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        # Return zero without requires_grad to avoid memory leak from retaining computation graph
+        return torch.tensor(0.0, device=logits.device)
 
     diffs = target_values.unsqueeze(-1) - bucket_centers
     lower_idx = (diffs >= 0).long().sum(dim=-1) - 1
@@ -256,7 +257,8 @@ def train():
                 if pre_board_mask.any():
                     start_pos_loss = (ce_board * pre_board_mask.float()).sum() / (pre_board_mask.sum() + 1e-8)
                 else:
-                    start_pos_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
+                    start_pos_loss = torch.tensor(0.0, device=device)
 
                 # === Pass 2: Prefix masking for move + value prediction ===
                 wl_fourier_input = torch.zeros_like(wl_targets)
@@ -302,7 +304,8 @@ def train():
                     wl_gt_flat = wl_targets[move_mask]
                     wl_loss = soft_bucket_loss(wl_logits_final, wl_gt_flat, model.wl_bucket_centers, wl_valid_flat)
                 else:
-                    wl_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
+                    wl_loss = torch.tensor(0.0, device=device)
                     wl_logits_final = None
 
                 # --- 4. D prediction at WL placeholder positions ---
@@ -313,7 +316,8 @@ def train():
                     d_gt_flat = d_targets[d_positions]
                     d_loss = soft_bucket_loss(d_logits_final, d_gt_flat, model.d_bucket_centers, d_valid_flat)
                 else:
-                    d_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
+                    d_loss = torch.tensor(0.0, device=device)
                     d_logits_final = None
 
                 # === Total loss ===
@@ -389,12 +393,12 @@ def train():
                     else:
                         board_square_acc = 0.0
 
-                    # Castling (intra 66)
-                    castle = intra_idx == 66
+                    # Castling (intra 65: end_pos predicts castling token)
+                    castle = intra_idx == 65
                     board_castling_acc = bp_bc[castle].mean().item() if castle.any() else 0.0
 
-                    # STM (intra 67, only present for some boards)
-                    stm_metric = intra_idx == 67
+                    # STM (intra 66: castling predicts STM token)
+                    stm_metric = intra_idx == 66
                     board_stm_acc = bp_bc[stm_metric].mean().item() if stm_metric.any() else 0.0
                 else:
                     board_total_acc = 0.0
