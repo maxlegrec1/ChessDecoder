@@ -23,7 +23,8 @@ def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
     n_buckets = bucket_centers.shape[0]
 
     if N == 0 or valid_mask.sum() == 0:
-        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        # Return zero without requires_grad to avoid memory leak from retaining computation graph
+        return torch.tensor(0.0, device=logits.device)
 
     # Find lower bucket: last bucket where center <= target
     diffs = target_values.unsqueeze(-1) - bucket_centers  # (N, B)
@@ -191,7 +192,8 @@ def train():
                 if pre_board_mask.any():
                     start_pos_loss = (ce_board * pre_board_mask.float()).sum() / (pre_board_mask.sum() + 1e-8)
                 else:
-                    start_pos_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
+                    start_pos_loss = torch.tensor(0.0, device=device)
 
                 # === Pass 2: Prefix masking for move + value prediction ===
                 # Discretize ground truth to nearest bucket centers for fourier injection
@@ -233,7 +235,8 @@ def train():
                     wl_gt_flat = wl_targets[move_mask]    # (N,)
                     wl_loss = soft_bucket_loss(wl_logits, wl_gt_flat, model.wl_bucket_centers, wl_valid_flat)
                 else:
-                    wl_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
+                    wl_loss = torch.tensor(0.0, device=device)
                     wl_logits = None
 
                 # --- 3. D prediction at WL placeholder positions (stm + 2) ---
@@ -245,7 +248,8 @@ def train():
                     d_gt_flat = d_targets[d_positions]
                     d_loss = soft_bucket_loss(d_logits, d_gt_flat, model.d_bucket_centers, d_valid_flat)
                 else:
-                    d_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
+                    d_loss = torch.tensor(0.0, device=device)
                     d_logits = None
 
                 # === Total loss ===
