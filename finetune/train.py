@@ -158,6 +158,7 @@ def train():
     # Learning rate scheduler with warmup
     warmup_steps = config["training"].get("warmup_steps", 500)
     grad_accum = config["training"].get("gradient_accumulation_steps", 1)
+    save_every_n_steps = config["training"].get("save_every_n_steps", 0)
 
     def lr_lambda(current_step):
         if current_step < warmup_steps:
@@ -227,6 +228,7 @@ def train():
             block_id = batch["block_id"].to(device)
             first_is_not_best = batch["first_is_not_best"].to(device)
             variation_epoch = batch["variation_epoch"].to(device)
+            pre_board_mask = batch["pre_board_mask"].to(device)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 # === Pass 1: Causal masking for board generation ===
@@ -249,6 +251,12 @@ def train():
                 ce_board = ce_loss_fn(board_logits.view(-1, V), target_ids.view(-1))
                 ce_board = ce_board.view(target_ids.shape)
                 board_loss = (ce_board * board_mask.float()).sum() / (board_mask.sum() + 1e-8)
+
+                # start_pos prediction loss (pre-board positions predict start_pos)
+                if pre_board_mask.any():
+                    start_pos_loss = (ce_board * pre_board_mask.float()).sum() / (pre_board_mask.sum() + 1e-8)
+                else:
+                    start_pos_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
                 # === Pass 2: Prefix masking for move + value prediction ===
                 wl_fourier_input = torch.zeros_like(wl_targets)
@@ -312,7 +320,7 @@ def train():
                 total_loss = (
                     final_move_weight * final_move_loss +
                     thinking_move_weight * thinking_move_loss +
-                    board_weight * board_loss +
+                    board_weight * (board_loss + start_pos_loss) +
                     wl_weight * wl_loss +
                     d_weight * d_loss
                 )
@@ -341,10 +349,63 @@ def train():
                 think_correct = (preds_think == target_ids) & thinking_move_mask
                 thinking_move_acc = think_correct.sum() / (thinking_move_mask.sum() + 1e-8)
 
-                # Board accuracy
+                # Board accuracy (per-token)
                 preds_board = torch.argmax(board_logits, dim=-1)
                 board_correct = (preds_board == target_ids) & board_mask
                 board_acc = board_correct.sum() / (board_mask.sum() + 1e-8)
+
+                # Board accuracy (per-block, grouped by block_id)
+                B, S = block_id.shape
+                max_bid = block_id.max() + 1
+                uid = block_id + (torch.arange(B, device=device) * max_bid).unsqueeze(1)
+                flat_uid = uid.view(-1)
+                flat_bc = board_correct.view(-1).float()
+                flat_bm = board_mask.view(-1)
+                bp = flat_bm.nonzero(as_tuple=True)[0]
+
+                if bp.numel() > 0:
+                    bp_uid = flat_uid[bp]
+                    bp_bc = flat_bc[bp]
+                    unique_uids, inv = bp_uid.unique(return_inverse=True)
+                    n_unique = unique_uids.shape[0]
+                    sum_correct = torch.zeros(n_unique, device=device).scatter_add_(0, inv, bp_bc)
+                    sum_total = torch.zeros(n_unique, device=device).scatter_add_(0, inv, torch.ones_like(bp_bc))
+                    board_total_acc = (sum_correct == sum_total).float().mean().item()
+
+                    # Intra-block offset for sub-metrics
+                    bp_pos = bp.float()
+                    block_starts = torch.full((n_unique,), float('inf'), device=device)
+                    block_starts.scatter_reduce_(0, inv, bp_pos, reduce="amin")
+                    intra_idx = (bp_pos - block_starts[inv]).long()
+
+                    # Squares (intra 1-64): per-board all-correct
+                    sq = (intra_idx >= 1) & (intra_idx <= 64)
+                    if sq.any():
+                        sq_correct = torch.zeros(n_unique, device=device).scatter_add_(0, inv[sq], bp_bc[sq])
+                        sq_total = torch.zeros(n_unique, device=device).scatter_add_(0, inv[sq], torch.ones_like(bp_bc[sq]))
+                        has_sq = sq_total > 0
+                        board_square_acc = ((sq_correct == sq_total) & has_sq).float().sum() / (has_sq.sum() + 1e-8)
+                        board_square_acc = board_square_acc.item()
+                    else:
+                        board_square_acc = 0.0
+
+                    # Castling (intra 66)
+                    castle = intra_idx == 66
+                    board_castling_acc = bp_bc[castle].mean().item() if castle.any() else 0.0
+
+                    # STM (intra 67, only present for some boards)
+                    stm_metric = intra_idx == 67
+                    board_stm_acc = bp_bc[stm_metric].mean().item() if stm_metric.any() else 0.0
+                else:
+                    board_total_acc = 0.0
+                    board_square_acc = 0.0
+                    board_castling_acc = 0.0
+                    board_stm_acc = 0.0
+
+                # start_pos accuracy
+                preds_pre_board = preds_board[pre_board_mask] if pre_board_mask.any() else torch.tensor([], device=device)
+                targets_pre_board = target_ids[pre_board_mask] if pre_board_mask.any() else torch.tensor([], device=device)
+                start_pos_acc = (preds_pre_board == targets_pre_board).float().mean().item() if preds_pre_board.numel() > 0 else 0.0
 
                 # WL MAE
                 if wl_logits_final is not None and stm_nonzero.shape[0] > 0:
@@ -380,18 +441,25 @@ def train():
             if step % config["training"]["log_every_n_steps"] == 0:
                 print(f"Step {step}: Loss {total_loss.item():.4f} "
                       f"(FinalMove: {final_move_loss.item():.4f}, ThinkMove: {thinking_move_loss.item():.4f}, "
-                      f"Board: {board_loss.item():.4f}, WL: {wl_loss.item():.4f}, D: {d_loss.item():.4f})")
+                      f"Board: {board_loss.item():.4f}, StartPos: {start_pos_loss.item():.4f}, "
+                      f"WL: {wl_loss.item():.4f}, D: {d_loss.item():.4f})")
 
                 wandb.log({
                     "train/total_loss": total_loss.item(),
                     "train/final_move_loss": final_move_loss.item(),
                     "train/thinking_move_loss": thinking_move_loss.item(),
                     "train/board_loss": board_loss.item(),
+                    "train/start_pos_loss": start_pos_loss.item(),
                     "train/wl_loss": wl_loss.item(),
                     "train/d_loss": d_loss.item(),
                     "train/final_move_acc": final_move_acc.item(),
                     "train/thinking_move_acc": thinking_move_acc.item(),
                     "train/board_acc": board_acc.item(),
+                    "train/board_total_acc": board_total_acc,
+                    "train/board_square_acc": board_square_acc,
+                    "train/board_castling_acc": board_castling_acc,
+                    "train/board_stm_acc": board_stm_acc,
+                    "train/start_pos_acc": start_pos_acc,
                     "train/wl_mae": wl_mae.item(),
                     "train/d_mae": d_mae.item(),
                     "train/epoch": epoch,
@@ -406,7 +474,21 @@ def train():
 
             step += 1
 
-        # Save checkpoint
+            # Save checkpoint every N steps
+            if save_every_n_steps and step % save_every_n_steps == 0:
+                ckpt = {
+                    "epoch": epoch,
+                    "step": step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "config": config,
+                }
+                checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_step_{step}.pt")
+                torch.save(ckpt, checkpoint_path)
+                print(f"Saved checkpoint to {checkpoint_path}")
+
+        # Save checkpoint at end of epoch
         ckpt = {
             "epoch": epoch + 1,
             "step": step,

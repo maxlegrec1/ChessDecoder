@@ -163,6 +163,16 @@ class ChessIterableDataset(IterableDataset):
                     for block_num, (b_start, b_end) in enumerate(adjusted_boundaries):
                         block_id[b_start:b_end] = block_num
 
+                    # Pre-board mask: positions just before each board block
+                    # that should predict start_pos via the board_head
+                    pre_board_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
+                    start_pos_id = token_to_idx["start_pos"]
+                    for (b_start, b_end) in adjusted_boundaries:
+                        pre_board_pos = b_start - 1
+                        if 0 <= pre_board_pos < self.max_seq_len:
+                            target_ids[pre_board_pos] = start_pos_id
+                            pre_board_mask[pre_board_pos] = True
+
                     yield {
                         "input_ids": input_ids,
                         "target_ids": target_ids,
@@ -173,6 +183,7 @@ class ChessIterableDataset(IterableDataset):
                         "d_targets": d_targets,
                         "wdl_valid": wdl_valid,
                         "block_id": block_id,
+                        "pre_board_mask": pre_board_mask,
                     }
             except Exception as e:
                 print(f"Error reading file {file_path}: {e}")
