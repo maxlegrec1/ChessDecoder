@@ -108,17 +108,70 @@ def train():
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
 
         state_dict = checkpoint["model_state_dict"]
+        def migrate_state_dict(state_dict, new_vocab_size):
+            """Migrate old checkpoint: expand vocab dim to new size, clone policy_head to thinking_policy_head."""
+            # Expand vocab-sized tensors if needed
+            for key in ["tok_embedding.weight", "board_head.weight", "board_head.bias",
+                        "policy_head.weight", "policy_head.bias"]:
+                if key not in state_dict:
+                    continue
+                t = state_dict[key]
+                if t.shape[0] < new_vocab_size:
+                    pad = torch.zeros(new_vocab_size - t.shape[0], *t.shape[1:], dtype=t.dtype, device=t.device)
+                    state_dict[key] = torch.cat([t, pad], dim=0)
 
-        # Checkpoint compatibility: rename old policy_head -> board_head
-        if "policy_head.weight" in state_dict and "board_head.weight" not in state_dict:
-            state_dict["board_head.weight"] = state_dict.pop("policy_head.weight")
-            state_dict["board_head.bias"] = state_dict.pop("policy_head.bias")
-        # Remove old 3-class value head (incompatible shape)
-        state_dict.pop("value_head.weight", None)
-        state_dict.pop("value_head.bias", None)
+            # Clone policy_head -> thinking_policy_head
+            if "policy_head.weight" in state_dict:
+                state_dict["thinking_policy_head.weight"] = state_dict["policy_head.weight"].clone()
+                state_dict["thinking_policy_head.bias"] = state_dict["policy_head.bias"].clone()
+
+            return state_dict
+        state_dict = migrate_state_dict(state_dict, vocab_size)
+        # # Checkpoint compatibility: rename old policy_head -> board_head
+        # if "policy_head.weight" in state_dict and "board_head.weight" not in state_dict:
+        #     state_dict["board_head.weight"] = state_dict.pop("policy_head.weight")
+        #     state_dict["board_head.bias"] = state_dict.pop("policy_head.bias")
+        # # Remove old 3-class value head (incompatible shape)
+        # state_dict.pop("value_head.weight", None)
+        # state_dict.pop("value_head.bias", None)
 
         model.load_state_dict(state_dict, strict=False)
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Migrate optimizer state dict: handle shape changes from vocab expansion / new params
+        opt_state = checkpoint["optimizer_state_dict"]
+        old_n_params = len(opt_state["param_groups"][0]["params"])
+        new_n_params = len(list(model.parameters()))
+        print(f"Migrating optimizer state: {old_n_params} -> {new_n_params} params")
+        # Update param_groups to match current optimizer
+        opt_state["param_groups"] = optimizer.state_dict()["param_groups"]
+        existing_step = next(iter(opt_state["state"].values()))["step"] if opt_state["state"] else torch.tensor(0)
+        step_val = existing_step.clone() if torch.is_tensor(existing_step) else torch.tensor(existing_step)
+        for i, param in enumerate(model.parameters()):
+            if i not in opt_state["state"]:
+                # New parameter index: initialize zero state
+                opt_state["state"][i] = {
+                    "step": step_val.clone(),
+                    "exp_avg": torch.zeros_like(param),
+                    "exp_avg_sq": torch.zeros_like(param),
+                }
+            else:
+                old_state = opt_state["state"][i]
+                old_exp_avg = old_state["exp_avg"]
+                # Check if shapes match or can be expanded along vocab dim only
+                if old_exp_avg.shape == param.shape:
+                    continue  # No migration needed
+                elif len(old_exp_avg.shape) == len(param.shape) and old_exp_avg.shape[1:] == param.shape[1:] and old_exp_avg.shape[0] < param.shape[0]:
+                    # Vocab expansion: pad dim 0 with zeros
+                    pad_size = param.shape[0] - old_exp_avg.shape[0]
+                    for key in ["exp_avg", "exp_avg_sq"]:
+                        old_t = old_state[key]
+                        pad = torch.zeros(pad_size, *old_t.shape[1:], dtype=old_t.dtype, device=old_t.device)
+                        old_state[key] = torch.cat([old_t, pad], dim=0)
+                else:
+                    # Incompatible shape (param indices shifted): reinitialize
+                    old_state["exp_avg"] = torch.zeros_like(param)
+                    old_state["exp_avg_sq"] = torch.zeros_like(param)
+        optimizer.load_state_dict(opt_state)
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_epoch = checkpoint["epoch"]
         step = checkpoint["step"]
