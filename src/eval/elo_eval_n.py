@@ -38,6 +38,48 @@ def estimate_elo(win_rate, stockfish_elo):
     return "N/A"
 
 
+class WLDCache:
+    """
+    Cache for WL/D values computed during predict_move_n.
+
+    The cache is valid as long as the history prefix remains unchanged.
+    When truncation occurs (history window slides), the cache must be invalidated
+    because the sequence structure changes and previously computed values are
+    no longer valid for the new context.
+    """
+
+    def __init__(self):
+        self.values = []  # List of (wl, d) tuples
+        self.last_initial_fen = None  # Track the initial_fen to detect truncation
+        self.history_start_idx = 0  # Track where in the full game history our window starts
+
+    def get_cached_values(self, initial_fen, history_start_idx):
+        """
+        Get cached values if still valid.
+
+        Returns None if cache is invalid (truncation detected), otherwise returns
+        the list of cached (wl, d) tuples.
+        """
+        # Cache is invalid if:
+        # 1. initial_fen changed (indicates truncation)
+        # 2. history_start_idx changed (history window slid)
+        if initial_fen != self.last_initial_fen or history_start_idx != self.history_start_idx:
+            return None
+        return self.values
+
+    def update(self, initial_fen, history_start_idx, wl_d_values):
+        """Update the cache with new values."""
+        self.values = wl_d_values
+        self.last_initial_fen = initial_fen
+        self.history_start_idx = history_start_idx
+
+    def clear(self):
+        """Clear the cache."""
+        self.values = []
+        self.last_initial_fen = None
+        self.history_start_idx = 0
+
+
 def build_history_for_model(move_history, fen_history, max_n, model_is_white, current_move_number):
     """
     Build the history for predict_move_n based on the game state.
@@ -53,6 +95,7 @@ def build_history_for_model(move_history, fen_history, max_n, model_is_white, cu
         initial_fen: The starting position for context
         history: List of (board_fen, move_uci) tuples for predict_move_n
         effective_n: The actual n value being used
+        start_idx: The starting index in the full history (for cache validation)
 
     Logic:
     - For white's first move (move 0): n=0, just initial position
@@ -67,7 +110,7 @@ def build_history_for_model(move_history, fen_history, max_n, model_is_white, cu
 
     if moves_played == 0:
         # First move of game (white's turn), no history available
-        return initial_fen, [], 0
+        return initial_fen, [], 0, 0
 
     # Calculate effective n (how many (board, move) pairs we can include)
     # Each move in history gives us one (board_fen_after_move, move) pair
@@ -94,11 +137,11 @@ def build_history_for_model(move_history, fen_history, max_n, model_is_white, cu
         # We're using moves from the beginning
         initial_fen = chess.STARTING_FEN
 
-    return initial_fen, history, effective_n
+    return initial_fen, history, effective_n, start_idx
 
 
 def play_game_n(player1_name, player2_name, engine_obj, model, max_n,
-                temperature=0.1, stockfish_elo=None, game_num=1):
+                temperature=0.1, stockfish_elo=None, game_num=1, use_cache=True):
     """
     Play a game between model and Stockfish using n-move context.
 
@@ -111,6 +154,7 @@ def play_game_n(player1_name, player2_name, engine_obj, model, max_n,
         temperature: Sampling temperature for model
         stockfish_elo: Stockfish ELO setting
         game_num: Game number for PGN
+        use_cache: Whether to use WL/D value caching (default True)
 
     Returns:
         result: Game result string ("1-0", "0-1", or "1/2-1/2")
@@ -136,6 +180,9 @@ def play_game_n(player1_name, player2_name, engine_obj, model, max_n,
     move_history = []  # List of UCI moves
     fen_history = []   # List of FENs after each move
 
+    # WL/D value cache for the model
+    wld_cache = WLDCache() if use_cache else None
+
     model_is_white = (player1_name == "Model")
 
     def _is_game_over(b):
@@ -157,7 +204,7 @@ def play_game_n(player1_name, player2_name, engine_obj, model, max_n,
             current_fen = board.fen()
 
             # Build history for this move
-            initial_fen, history, effective_n = build_history_for_model(
+            initial_fen, history, effective_n, start_idx = build_history_for_model(
                 move_history, fen_history, max_n, model_is_white, move_number
             )
 
@@ -166,10 +213,21 @@ def play_game_n(player1_name, player2_name, engine_obj, model, max_n,
                     # No history available, use regular predict_move
                     move_uci = model.predict_move(current_fen, temperature=temperature)
                 else:
-                    # Use predict_move_n with history
-                    move_uci = model.predict_move_n(
-                        initial_fen, history, temperature=temperature
+                    # Get cached values if available and valid
+                    cached_values = None
+                    if wld_cache is not None:
+                        cached_values = wld_cache.get_cached_values(initial_fen, start_idx)
+
+                    # Use predict_move_n with history and optional cache
+                    move_uci, wl_d_values = model.predict_move_n(
+                        initial_fen, history, temperature=temperature,
+                        cached_wl_d=cached_values
                     )
+
+                    # Update cache with computed values
+                    if wld_cache is not None:
+                        wld_cache.update(initial_fen, start_idx, wl_d_values)
+
             except Exception as e:
                 print(f"Model prediction error: {e}")
                 print(f"FEN: {current_fen}, History length: {len(history)}")

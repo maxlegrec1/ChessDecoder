@@ -375,17 +375,23 @@ class ChessDecoder(nn.Module):
 
     @torch.no_grad()
     def predict_move_n(self, initial_fen: str, history: list, temperature: float = 1.0,
-                       force_legal: bool = True, max_seq_len: int = 2048):
+                       force_legal: bool = True, max_seq_len: int = 2048,
+                       cached_wl_d: list = None):
         """
         Predicts the next move given an initial FEN and a history of (board_fen, move) pairs.
 
         The context is built as:
         [initial_board_68] [move1] [wl] [d] [board1_68] [move2] [wl] [d] ... [boardN_68]
 
-        For WL and D tokens in the history, they are predicted autoregressively:
-        - Pass 1: Predict all WL values at move positions (no fourier injection)
-        - Pass 2: Inject fourier(WL) at wl positions, predict all D values
-        - Pass 3: Inject fourier(WL) and fourier(D), predict final move
+        WL and D values are predicted sequentially (autoregressively):
+        - To predict WL_i: inject WL_1..WL_{i-1} and D_1..D_{i-1}
+        - To predict D_i: inject WL_1..WL_i and D_1..D_{i-1}
+
+        This requires 2n forward passes for n history positions, plus 1 for the final move.
+
+        Caching: Due to causal masking, WL_i and D_i only depend on context up to position i.
+        Previously computed values remain valid as long as the history prefix is unchanged.
+        When truncation occurs (history sliding window), cached values become invalid.
 
         Args:
             initial_fen: The initial board position FEN
@@ -395,16 +401,21 @@ class ChessDecoder(nn.Module):
             temperature: Sampling temperature (0.0 for argmax)
             force_legal: Whether to filter to legal moves only
             max_seq_len: Maximum sequence length (default 2048)
+            cached_wl_d: Optional list of (wl, d) tuples for history positions 0..k-1.
+                        If provided, only computes values for positions k..n-1.
+                        The caller is responsible for invalidating the cache on truncation.
 
         Returns:
-            move_str: UCI move string for the predicted move
+            Tuple of (move_str, wl_d_values) where:
+            - move_str: UCI move string for the predicted move
+            - wl_d_values: List of (wl, d) tuples for all n history positions (for caching)
         """
         self.eval()
         device = next(self.parameters()).device
 
         # If no history, fall back to predict_move
         if len(history) == 0:
-            return self.predict_move(initial_fen, temperature, force_legal)
+            return self.predict_move(initial_fen, temperature, force_legal), []
 
         # Check context length: 68 (initial) + n * 71 (move + wl + d + board) tokens
         n = len(history)
@@ -461,48 +472,71 @@ class ChessDecoder(nn.Module):
         block_id = torch.tensor(block_ids, dtype=torch.long).unsqueeze(0).to(device)
         seq_len = input_ids.shape[1]
 
-        # Pass 1: No fourier injection, get WL predictions at move positions
-        h1 = self(input_ids, mask_type="prefix", block_id=block_id)
-
-        wl_values_list = []
-        for move_pos in move_positions:
-            h_at_move = h1[0, move_pos, :]
-            wl_logits = self.wl_head(h_at_move.unsqueeze(0))
-            wl_idx = torch.argmax(wl_logits, dim=-1)
-            wl_values_list.append(self.wl_bucket_centers[wl_idx].item())
-
-        # Pass 2: Inject WL fourier at wl positions, get D predictions
+        # Initialize fourier injection tensors
         wl_positions_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
         d_positions_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
         wl_fourier_input = torch.zeros(1, seq_len, device=device)
         d_fourier_input = torch.zeros(1, seq_len, device=device)
 
-        for i, wl_pos in enumerate(wl_positions_list):
-            wl_positions_mask[0, wl_pos] = True
-            wl_fourier_input[0, wl_pos] = wl_values_list[i]
-
-        h2 = self(input_ids, mask_type="prefix", block_id=block_id,
-                  wl_values=wl_fourier_input, d_values=d_fourier_input,
-                  wl_positions=wl_positions_mask, d_positions=d_positions_mask)
-
+        # Use cached values if provided
+        wl_values_list = []
         d_values_list = []
-        for wl_pos in wl_positions_list:
-            h_at_wl = h2[0, wl_pos, :]
+        num_cached = len(cached_wl_d) if cached_wl_d else 0
+
+        if cached_wl_d:
+            for i, (wl_val, d_val) in enumerate(cached_wl_d):
+                wl_values_list.append(wl_val)
+                d_values_list.append(d_val)
+                # Set up fourier injection for cached values
+                wl_positions_mask[0, wl_positions_list[i]] = True
+                wl_fourier_input[0, wl_positions_list[i]] = wl_val
+                d_positions_mask[0, d_positions_list[i]] = True
+                d_fourier_input[0, d_positions_list[i]] = d_val
+
+        # Sequential prediction of remaining WL and D values
+        # For position i: predict WL_i with WL_1..WL_{i-1} and D_1..D_{i-1} injected
+        #                 predict D_i with WL_1..WL_i and D_1..D_{i-1} injected
+        for i in range(num_cached, n):
+            # Forward pass to predict WL_i
+            # At this point, WL_1..WL_{i-1} and D_1..D_{i-1} are already injected
+            h = self(input_ids, mask_type="prefix", block_id=block_id,
+                     wl_values=wl_fourier_input, d_values=d_fourier_input,
+                     wl_positions=wl_positions_mask, d_positions=d_positions_mask)
+
+            # Predict WL at move position i
+            h_at_move = h[0, move_positions[i], :]
+            wl_logits = self.wl_head(h_at_move.unsqueeze(0))
+            wl_idx = torch.argmax(wl_logits, dim=-1)
+            wl_val = self.wl_bucket_centers[wl_idx].item()
+            wl_values_list.append(wl_val)
+
+            # Inject WL_i for D_i prediction
+            wl_positions_mask[0, wl_positions_list[i]] = True
+            wl_fourier_input[0, wl_positions_list[i]] = wl_val
+
+            # Forward pass to predict D_i (with WL_i now injected)
+            h = self(input_ids, mask_type="prefix", block_id=block_id,
+                     wl_values=wl_fourier_input, d_values=d_fourier_input,
+                     wl_positions=wl_positions_mask, d_positions=d_positions_mask)
+
+            # Predict D at wl position i
+            h_at_wl = h[0, wl_positions_list[i], :]
             d_logits = self.d_head(h_at_wl.unsqueeze(0))
             d_idx = torch.argmax(d_logits, dim=-1)
-            d_values_list.append(self.d_bucket_centers[d_idx].item())
+            d_val = self.d_bucket_centers[d_idx].item()
+            d_values_list.append(d_val)
 
-        # Pass 3: Inject both WL and D fourier, predict final move
-        for i, d_pos in enumerate(d_positions_list):
-            d_positions_mask[0, d_pos] = True
-            d_fourier_input[0, d_pos] = d_values_list[i]
+            # Inject D_i for subsequent predictions
+            d_positions_mask[0, d_positions_list[i]] = True
+            d_fourier_input[0, d_positions_list[i]] = d_val
 
-        h3 = self(input_ids, mask_type="prefix", block_id=block_id,
-                  wl_values=wl_fourier_input, d_values=d_fourier_input,
-                  wl_positions=wl_positions_mask, d_positions=d_positions_mask)
+        # Final forward pass with all WL and D injected to predict move
+        h_final = self(input_ids, mask_type="prefix", block_id=block_id,
+                       wl_values=wl_fourier_input, d_values=d_fourier_input,
+                       wl_positions=wl_positions_mask, d_positions=d_positions_mask)
 
         # Policy head at last position (stm token of last board)
-        policy_logits = self.policy_head(h3)
+        policy_logits = self.policy_head(h_final)
         last_logits = policy_logits[0, -1, :]
 
         # Get the FEN for the last position (for legal move filtering)
@@ -545,7 +579,9 @@ class ChessDecoder(nn.Module):
         if move_str in replacements:
             move_str = replacements[move_str]
 
-        return move_str
+        # Return move and computed values for caching
+        wl_d_values = list(zip(wl_values_list, d_values_list))
+        return move_str, wl_d_values
 
     def _convert_move_to_vocab(self, uci: str) -> str:
         """Convert UCI move to vocabulary format (handle castling)."""
