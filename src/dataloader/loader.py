@@ -66,9 +66,9 @@ class ChessIterableDataset(IterableDataset):
                     # Slice the sequence
                     ids = ids[start_idx:]
 
-                    # Adjust wdl_data (move targets)
-                    wdl_data = [(m_idx - start_idx, best, wdl, valid)
-                                for m_idx, best, wdl, valid in wdl_data
+                    # Adjust wdl_data (move targets) - keep original_move_num unchanged
+                    wdl_data = [(m_idx - start_idx, best, wdl, valid, orig_move_num)
+                                for m_idx, best, wdl, valid, orig_move_num in wdl_data
                                 if m_idx >= start_idx]
 
                     # Adjust value_data
@@ -111,6 +111,7 @@ class ChessIterableDataset(IterableDataset):
                     input_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
                     target_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
                     move_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
+                    move_num = torch.full((self.max_seq_len,), -1, dtype=torch.long)  # Original game move number
                     wl_positions = torch.zeros((self.max_seq_len,), dtype=torch.bool)
                     d_positions = torch.zeros((self.max_seq_len,), dtype=torch.bool)
                     wl_targets = torch.zeros((self.max_seq_len,), dtype=torch.float32)
@@ -124,12 +125,13 @@ class ChessIterableDataset(IterableDataset):
                         target_ids[:seq_len-1] = input_ids[1:seq_len]
 
                     # Process move targets and value positions
-                    for move_idx, best_move, wdl, is_valid_wdl in wdl_data:
+                    for move_idx, best_move, wdl, is_valid_wdl, orig_move_num in wdl_data:
                         # Move target: at stm position (move_idx - 1), predict the move
                         stm_pos = move_idx - 1
                         if 0 <= stm_pos < self.max_seq_len:
                             target_ids[stm_pos] = token_to_idx[best_move]
                             move_mask[stm_pos] = True
+                            move_num[stm_pos] = orig_move_num
 
                     for wl_pos, d_pos, wl, d, is_valid in value_data:
                         # Mark WL and D placeholder positions
@@ -177,6 +179,7 @@ class ChessIterableDataset(IterableDataset):
                         "input_ids": input_ids,
                         "target_ids": target_ids,
                         "move_mask": move_mask,
+                        "move_num": move_num,  # Original game move number (0-indexed)
                         "wl_positions": wl_positions,
                         "d_positions": d_positions,
                         "wl_targets": wl_targets,

@@ -212,6 +212,7 @@ def train():
             input_ids = batch["input_ids"].to(device)
             target_ids = batch["target_ids"].to(device)
             move_mask = batch["move_mask"].to(device)
+            move_num = batch["move_num"].to(device)  # Original game move number (0-indexed)
             wl_positions = batch["wl_positions"].to(device)
             d_positions = batch["d_positions"].to(device)
             wl_targets = batch["wl_targets"].to(device)
@@ -421,14 +422,13 @@ def train():
                     d_mae = torch.tensor(0.0, device=device)
                     d_mse = torch.tensor(0.0, device=device)
 
-                # nth-move metrics
+                # nth-move metrics (using original game move numbers, not sequence position)
                 max_track_moves = config["training"].get("max_track_nth_moves", 20)
-                move_cumsum = move_mask.cumsum(dim=1)
-                move_indices = (move_cumsum - 1).long()
-                valid_nth_mask = move_mask & (move_indices < max_track_moves)
+                # Use move_num from loader which contains original game move number (0-indexed)
+                valid_nth_mask = move_mask & (move_num >= 0) & (move_num < max_track_moves)
 
                 if valid_nth_mask.any():
-                    flat_move_indices = move_indices[valid_nth_mask]
+                    flat_move_indices = move_num[valid_nth_mask]
                     flat_move_correct = move_correct[valid_nth_mask].float()
 
                     move_correct_by_nth = torch.zeros(max_track_moves, device=device)

@@ -50,10 +50,11 @@ def fen_to_position_tokens(fen: str):
 
 def game_to_token_ids(game_df, skip_board_prob=0.0):
     sequence = []
-    wdl_data = []  # (move_idx, best_move, wdl, is_valid_wdl) - legacy, kept for move targets
+    wdl_data = []  # (move_idx, best_move, wdl, is_valid_wdl, original_move_num)
     block_boundaries = []  # [(start_idx, end_idx), ...] for each board block
     value_data = []  # (wl_pos, d_pos, wl, d, is_valid_wdl)
 
+    move_num = 0  # Track original game move number (0-indexed)
     for i, row in enumerate(game_df.itertuples(index=False)):
         include_board = (i == 0) or (random.random() > skip_board_prob)
 
@@ -80,7 +81,8 @@ def game_to_token_ids(game_df, skip_board_prob=0.0):
             is_valid_wdl = pd.notna(row.win) and pd.notna(row.draw) and pd.notna(row.loss)
 
             wdl = [win, draw, loss]
-            wdl_data.append((move_idx, best_move, wdl, is_valid_wdl))
+            wdl_data.append((move_idx, best_move, wdl, is_valid_wdl, move_num))
+            move_num += 1
 
             # Append WL and D placeholder tokens
             wl_pos = len(sequence)
