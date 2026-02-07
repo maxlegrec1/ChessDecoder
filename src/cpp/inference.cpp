@@ -309,7 +309,7 @@ public:
     const std::vector<std::string>& tokensRef() const { return tokens; }
 
 private:
-    static constexpr const char* kVocabPath = "cpp/policy_index.txt";
+    static constexpr const char* kVocabPath = "src/cpp/policy_index.txt";
     std::vector<std::string> tokens;
     std::unordered_map<std::string, int> toIndex;
 };
@@ -935,7 +935,7 @@ public:
     const std::vector<std::string>& tokensRef() const { return tokens; }
 
 private:
-    static constexpr const char* kVocabPath = "cpp/leela_policy_index.txt";
+    static constexpr const char* kVocabPath = "src/cpp/leela_policy_index.txt";
     std::vector<std::string> tokens;
     std::unordered_map<std::string, int> toIndex;
 };
