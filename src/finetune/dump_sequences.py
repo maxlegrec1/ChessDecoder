@@ -14,7 +14,7 @@ import random
 import numpy as np
 import pandas as pd
 
-from finetune.data import variation_to_token_ids, _gumbel_reorder, _to_model_uci
+from src.finetune.data import variation_to_token_ids, _gumbel_reorder, _to_model_uci
 
 
 def dump_sample(row, sample_idx, max_variations=3, max_depth=5, tau_base=0.3, tau_alpha=1.0):
