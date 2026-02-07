@@ -2,53 +2,43 @@
 
 ## Overview
 
-The vocabulary system (`src/models/vocab.py`) defines how chess positions and moves are converted to token indices for the transformer model.
+The vocabulary system (`src/models/vocab.py`) defines how chess positions and moves are converted to token indices for the transformer model. It also defines **sub-vocabularies** that allow each prediction head to output logits over only its relevant token subset.
 
-**Total Vocabulary Size**: ~4,500 tokens
+**Total Vocabulary Size**: 1968 tokens
+**Board Sub-Vocabulary**: 41 tokens (for `board_head`)
+**Move Sub-Vocabulary**: 1924 tokens (for `policy_head` / `thinking_policy_head`)
 
 ---
 
-## Vocabulary Components
+## Full Vocabulary Components
 
-### 1. Policy Index (~1,900 tokens)
+### 1. Policy Index (1924 tokens) -- indices 0-1923
 
-All possible chess moves in UCI notation. These are the first tokens in the vocabulary (indices 0 to ~1,899).
+All possible chess moves in UCI notation. These are the first tokens in the vocabulary.
 
 ```python
 policy_index = [
-    # Standard moves from each square
-    "a1b1", "a1c1", "a1d1", ...,  # Rook-like moves from a1
-    "a1a2", "a1a3", ...,          # Vertical moves
-    "b1a3", "b1c3", ...,          # Knight moves from b1
-    ...
-
-    # Pawn promotions
-    "a2a1q", "a2a1r", "a2a1b", "a2a1n",  # Underpromotions
-    "a7a8q", "a7a8r", "a7a8b", "a7a8n",  # Standard promotions
+    "a1b1", "a1c1", ...,           # Standard moves from each square
+    "a7a8q", "a7a8r", "a7a8b",     # Promotions (queen, rook, bishop -- no knight suffix, default)
+    "a2a1q", "a2a1r", "a2a1b",     # Underpromotions
     ...
 ]
 ```
 
-**Move Generation Logic** (from `vocab.py`):
-- For each square, generate all possible destination squares
-- Knight moves: L-shaped patterns
-- Sliding pieces: Ray directions (horizontal, vertical, diagonal)
-- Pawn promotions: All 4 piece types (Q, R, B, N)
+**Move generation**: For each of the 64 squares, all reachable destination squares are enumerated (rook-like, bishop-like, knight-like moves). Pawn promotions include queen, rook, and bishop suffixes (knight promotion is the base move without suffix).
 
-**Castling Representation**:
-The model uses rook destination squares internally:
+**Castling representation**: The model uses king-captures-rook notation internally:
+
 | Standard UCI | Model's Internal |
 |--------------|------------------|
-| `e1g1` (O-O) | `e1h1` |
-| `e1c1` (O-O-O) | `e1a1` |
-| `e8g8` (O-O) | `e8h8` |
-| `e8c8` (O-O-O) | `e8a8` |
+| `e1g1` (O-O white) | `e1h1` |
+| `e1c1` (O-O-O white) | `e1a1` |
+| `e8g8` (O-O black) | `e8h8` |
+| `e8c8` (O-O-O black) | `e8a8` |
 
-This is converted back during inference in `model.py:168-175`.
+Conversion happens automatically in `predict_move()` and related methods.
 
----
-
-### 2. Piece Tokens (12 tokens)
+### 2. Piece Tokens (12 tokens) -- indices 1924-1935
 
 ```python
 piece_tokens = [
@@ -61,227 +51,206 @@ piece_tokens = [
 
 Used to represent pieces on the 64 board squares.
 
----
-
-### 3. Special Tokens (8 tokens)
+### 3. Special Tokens (12 tokens) -- indices 1936-1947
 
 ```python
 special_tokens = [
-    "start_pos",      # Marks beginning of board representation
-    "end_pos",        # Marks end of 64-square section
-    "white_to_move",  # Side to move indicator
-    "black_to_move",  # Side to move indicator
-    "empty",          # Empty square
-    "pad",            # Padding token
-    "bos",            # Beginning of sequence (unused currently)
-    "eos"             # End of sequence (unused currently)
+    "start_pos",       # Marks beginning of board representation
+    "end_pos",         # Marks end of 64-square section
+    "white_to_move",   # Side to move indicator
+    "black_to_move",   # Side to move indicator
+    "empty",           # Empty square
+    "pad",             # Padding token
+    "bos",             # Beginning of sequence (unused currently)
+    "eos",             # End of sequence (unused currently)
+    "wl_value",        # WL value placeholder (Fourier features injected here)
+    "d_value",         # D value placeholder (Fourier features injected here)
+    "start_think",     # Marks beginning of thinking block (finetuning)
+    "end_think"        # Marks end of thinking block (finetuning)
 ]
 ```
 
----
+### 4. Castling Rights Tokens (16 tokens) -- indices 1948-1963
 
-### 4. Castling Rights Tokens (16 tokens)
-
-All combinations of castling availability:
+All combinations of castling availability, generated from `itertools.combinations("KQkq", r)` for `r` in 1..4, plus `"no_castling_rights"`:
 
 ```python
 castling_tokens = [
-    "K",      # White kingside only
-    "Q",      # White queenside only
-    "KQ",     # White both
-    "k",      # Black kingside only
-    "q",      # Black queenside only
-    "Kk",     # White kingside + Black kingside
-    "Kq",     # White kingside + Black queenside
-    "Qk",     # etc...
-    "Qq",
-    "KQk",
-    "KQq",
-    "Kkq",
-    "Qkq",
-    "KQkq",   # All castling available (starting position)
-    "kq",     # Black both
-    "no_castling_rights"  # No castling available
+    "K", "Q", "k", "q",                           # Single rights
+    "KQ", "Kk", "Kq", "Qk", "Qq", "kq",          # Pairs
+    "KQk", "KQq", "Kkq", "Qkq",                   # Triples
+    "KQkq",                                         # All rights
+    "no_castling_rights"                             # None
 ]
+```
+
+### 5. Signal Tokens (4 tokens) -- indices 1964-1967
+
+```python
+["end_var", "continue_var", "new_variation", "generic_move"]
+```
+
+| Token | Purpose |
+|-------|---------|
+| `end_var` | Marks end of a variation line |
+| `continue_var` | Board head target at PV continuation positions (not in input sequence) |
+| `new_variation` | Board head target when starting a new variation after `end_var` (not in input sequence) |
+| `generic_move` | Board head target at STM positions signaling "a move comes next" (not in input sequence) |
+
+Note: `continue_var`, `new_variation`, and `generic_move` are **target-only tokens** -- they appear in `board_target_ids` but never in the input sequence. `end_var` appears in both input and target sequences.
+
+---
+
+## Sub-Vocabularies
+
+### Board Sub-Vocabulary (41 tokens)
+
+All tokens that `board_head` can predict. These are the tokens that can appear as targets in `board_target_ids`:
+
+```python
+board_vocab = (
+    piece_tokens                                              # 12 pieces
+    + ["start_pos", "end_pos", "white_to_move",
+       "black_to_move", "empty", "wl_value", "d_value"]      # 7 special
+    + castling_tokens                                          # 16 castling
+    + ["end_var", "continue_var", "new_variation",
+       "generic_move", "end_think", "start_think"]             # 6 signal
+)
+board_vocab_size = 41
+```
+
+**Why these tokens?** The board head predicts the natural shifted next-token for the sequence. Looking at every position in the sequence:
+- After a board square token, the next token is another piece/empty/end_pos -> **board tokens**
+- After end_pos, the next token is a castling rights token -> **castling tokens**
+- After castling, the next token is side_to_move -> **stm tokens**
+- After STM, the next token is a move (overridden to `generic_move`) -> **generic_move**
+- After a move, the next token is `wl_value` -> **wl_value**
+- After `wl_value`, the next token is `d_value` -> **d_value**
+- After `d_value`, the next token is `start_pos` (of next board) -> **start_pos**
+- After end of PV board STM, the target is `continue_var` (override) or `end_var` (natural) -> **continue_var, end_var**
+- After `end_var`, the target is `new_variation` (override) or `end_think` (natural) -> **new_variation, end_think**
+- After `start_think`, the target is `generic_move` (override) -> **generic_move**
+
+### Move Sub-Vocabulary (1924 tokens)
+
+All UCI policy moves. These are the tokens that can appear as targets in `move_target_ids`:
+
+```python
+move_vocab = policy_index  # Same as the policy_index list
+move_vocab_size = 1924
 ```
 
 ---
 
-## Key Mappings
+## Mapping Dictionaries
 
 ```python
-# Token string → vocabulary index
-token_to_idx: Dict[str, int]
-# Example: token_to_idx["e2e4"] = 847
+# Full vocabulary mappings
+token_to_idx: Dict[str, int]      # "e2e4" -> 847
+idx_to_token: Dict[int, str]      # 847 -> "e2e4"
+vocab_size: int                    # 1968
 
-# Vocabulary index → token string
-idx_to_token: Dict[int, str]
-# Example: idx_to_token[847] = "e2e4"
+# Board sub-vocabulary mappings
+board_token_to_idx: Dict[str, int]      # "white_king" -> 0
+board_idx_to_full_idx: List[int]        # [1924, 1925, ...] (board sub-idx -> full vocab idx)
+full_idx_to_board_idx: Dict[int, int]   # {1924: 0, 1925: 1, ...} (full vocab idx -> board sub-idx)
 
-# UCI move → policy index (within policy tokens only)
-policy_to_idx: Dict[str, int]
-# Example: policy_to_idx["e2e4"] = 847
+# Move sub-vocabulary mappings
+move_token_to_idx: Dict[str, int]       # "e2e4" -> 847 (same as policy_to_idx)
+move_idx_to_full_idx: List[int]         # [0, 1, 2, ...] (move sub-idx -> full vocab idx)
+full_idx_to_move_idx: Dict[int, int]    # {0: 0, 1: 1, ...} (full vocab idx -> move sub-idx)
 
-# Constants
-vocab_size: int  # Total vocabulary size (~4,500)
-POSITION_TOKEN_LENGTH = 68  # Fixed tokens per board position
+# Policy-specific lookup
+policy_to_idx: Dict[str, int]           # "e2e4" -> 847 (O(1) lookup)
 ```
 
 ---
 
 ## FEN to Token Conversion
 
-The function `fen_to_position_tokens()` in `data.py` converts a FEN string to 68 tokens:
+The function `fen_to_position_tokens()` in `src/dataloader/data.py` converts a FEN string to exactly 68 tokens:
 
-### Input FEN Example
-```
-rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1
-```
-
-### Conversion Process
+### Process
 
 ```python
 def fen_to_position_tokens(fen: str) -> List[str]:
     board = chess.Board(fen)
-    tokens = []
+    tokens = ["start_pos"]
 
-    # 1. Start marker
-    tokens.append("start_pos")
-
-    # 2. 64 square tokens (a1, b1, c1, ..., h8 order)
-    for square in chess.SQUARES:  # 0-63, a1=0, h8=63
+    # 64 squares in chess.SQUARES order (a1, b1, c1, ..., h8)
+    for square in chess.SQUARES:
         piece = board.piece_at(square)
-        if piece is None:
-            tokens.append("empty")
+        if piece:
+            color = "white" if piece.color == chess.WHITE else "black"
+            tokens.append(f"{color}_{chess.piece_name(piece.piece_type)}")
         else:
-            color = "white" if piece.color else "black"
-            piece_name = chess.piece_name(piece.piece_type)
-            tokens.append(f"{color}_{piece_name}")
+            tokens.append("empty")
 
-    # 3. End marker
     tokens.append("end_pos")
 
-    # 4. Castling rights
-    castling = board.castling_xfen()
-    if castling == "-":
-        tokens.append("no_castling_rights")
-    else:
-        tokens.append(castling)
+    # Castling rights
+    rights = ""
+    if board.has_kingside_castling_rights(chess.WHITE): rights += "K"
+    if board.has_queenside_castling_rights(chess.WHITE): rights += "Q"
+    if board.has_kingside_castling_rights(chess.BLACK): rights += "k"
+    if board.has_queenside_castling_rights(chess.BLACK): rights += "q"
+    tokens.append(rights if rights else "no_castling_rights")
 
-    # 5. Side to move
-    if board.turn == chess.WHITE:
-        tokens.append("white_to_move")
-    else:
-        tokens.append("black_to_move")
+    # Side to move
+    tokens.append("white_to_move" if board.turn == chess.WHITE else "black_to_move")
 
     return tokens  # Always exactly 68 tokens
 ```
 
-### Output Token Sequence (68 tokens)
+### Output Structure (68 tokens)
 
 ```
-Index  Token
-─────  ─────────────────
-0      start_pos
-1      white_rook        (a1)
-2      white_knight      (b1)
-3      white_bishop      (c1)
-4      white_queen       (d1)
-5      white_king        (e1)
-6      white_bishop      (f1)
-7      white_knight      (g1)
-8      white_rook        (h1)
-9      white_pawn        (a2)
-10     white_pawn        (b2)
-11     white_pawn        (c2)
-12     white_pawn        (d2)
-13     empty             (e2) ← pawn moved to e4
-14     white_pawn        (f2)
-15     white_pawn        (g2)
-16     white_pawn        (h2)
-17     empty             (a3)
+Index  Token             Description
+-----  ----------------  -----------
+0      start_pos         Board start marker
+1      <piece/empty>     Square a1
+2      <piece/empty>     Square b1
 ...
-28     white_pawn        (e4) ← pawn is here now
-...
-48     black_pawn        (a7)
-...
-56     black_rook        (a8)
-57     black_knight      (b8)
-58     black_bishop      (c8)
-59     black_queen       (d8)
-60     black_king        (e8)
-61     black_bishop      (f8)
-62     black_knight      (g8)
-63     black_rook        (h8)
-64     end_pos
-65     KQkq              (castling rights)
-66     black_to_move     (side to move)
+64     <piece/empty>     Square h8
+65     end_pos           Board end marker
+66     <castling>        Castling rights (e.g., "KQkq")
+67     <stm>             Side to move ("white_to_move" or "black_to_move")
 ```
 
-**Note**: Square ordering follows `chess.SQUARES` which is a1, b1, c1, ..., h1, a2, b2, ..., h8 (file-major order within each rank).
-
----
-
-## Square Index Mapping
+### Square Index Mapping
 
 ```
-Chess square → Index in token sequence (after start_pos)
+chess.SQUARES order: a1=0, b1=1, ..., h1=7, a2=8, ..., h8=63
+In token sequence: token_index = chess.square + 1 (offset by start_pos)
 
     a   b   c   d   e   f   g   h
-  ┌───┬───┬───┬───┬───┬───┬───┬───┐
-8 │57 │58 │59 │60 │61 │62 │63 │64 │  (indices 57-64 in tokens)
-  ├───┼───┼───┼───┼───┼───┼───┼───┤
-7 │49 │50 │51 │52 │53 │54 │55 │56 │
-  ├───┼───┼───┼───┼───┼───┼───┼───┤
-6 │41 │42 │43 │44 │45 │46 │47 │48 │
-  ├───┼───┼───┼───┼───┼───┼───┼───┤
-5 │33 │34 │35 │36 │37 │38 │39 │40 │
-  ├───┼───┼───┼───┼───┼───┼───┼───┤
-4 │25 │26 │27 │28 │29 │30 │31 │32 │
-  ├───┼───┼───┼───┼───┼───┼───┼───┤
-3 │17 │18 │19 │20 │21 │22 │23 │24 │
-  ├───┼───┼───┼───┼───┼───┼───┼───┤
-2 │ 9 │10 │11 │12 │13 │14 │15 │16 │
-  ├───┼───┼───┼───┼───┼───┼───┼───┤
-1 │ 1 │ 2 │ 3 │ 4 │ 5 │ 6 │ 7 │ 8 │  (indices 1-8 in tokens)
-  └───┴───┴───┴───┴───┴───┴───┴───┘
-
-Token index = chess.square + 1  (offset by start_pos)
+  +---+---+---+---+---+---+---+---+
+8 |57 |58 |59 |60 |61 |62 |63 |64 |
+  +---+---+---+---+---+---+---+---+
+7 |49 |50 |51 |52 |53 |54 |55 |56 |
+  +---+---+---+---+---+---+---+---+
+6 |41 |42 |43 |44 |45 |46 |47 |48 |
+  +---+---+---+---+---+---+---+---+
+5 |33 |34 |35 |36 |37 |38 |39 |40 |
+  +---+---+---+---+---+---+---+---+
+4 |25 |26 |27 |28 |29 |30 |31 |32 |
+  +---+---+---+---+---+---+---+---+
+3 |17 |18 |19 |20 |21 |22 |23 |24 |
+  +---+---+---+---+---+---+---+---+
+2 | 9 |10 |11 |12 |13 |14 |15 |16 |
+  +---+---+---+---+---+---+---+---+
+1 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+  +---+---+---+---+---+---+---+---+
 ```
 
 ---
 
-## Important Implementation Details
+## IGNORE_INDEX Convention
 
-### Move Token Detection
-
-In `model.py`, moves are identified by their token index:
-
-```python
-is_move = (x < self.num_policy_tokens)  # Policy tokens are first in vocab
-```
-
-This works because all move tokens have indices 0 to ~1,899, while board tokens (pieces, special tokens) have higher indices.
-
-### Vocabulary Construction Order
-
-```python
-# Order in vocabulary:
-# 1. Policy tokens (moves)     indices 0 to ~1,899
-# 2. Piece tokens              indices ~1,900 to ~1,911
-# 3. Special tokens            indices ~1,912 to ~1,919
-# 4. Castling tokens           indices ~1,920 to ~1,935
-```
-
-This ordering is critical because `is_move = (x < num_policy_tokens)` relies on moves being the lowest indices.
+Both `board_target_ids` and `move_target_ids` use `IGNORE_INDEX = -100` (PyTorch's `CrossEntropyLoss` default) for padding and positions that should not contribute to loss. This replaces the old approach of using `pad_id` as the target for positions to ignore.
 
 ---
 
 ## En Passant Note
 
-The current implementation does **not** encode the en passant square in the token sequence. The FEN's en passant field is parsed by `chess.Board()` but not included as a separate token.
-
-This means:
-- The model cannot distinguish positions that differ only in en passant availability
-- En passant moves are still valid (handled by `chess.Board.legal_moves`)
-- Could be a future improvement to add an en passant token
+The current implementation does **not** encode the en passant square in the token sequence. The FEN's en passant field is parsed by `chess.Board()` but not included as a separate token. This means positions that differ only in en passant availability are indistinguishable to the model.

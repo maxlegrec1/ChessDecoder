@@ -45,20 +45,13 @@ en_passant_tokens = [
 
 ---
 
-### 3. No Learning Rate Scheduling
+### 3. No Learning Rate Scheduling (Pretraining)
 
-**Issue**: Training uses a fixed learning rate.
+**Issue**: Pretraining uses a fixed learning rate with no warmup or decay.
 
 **Impact**: May converge slower or to worse optima than with proper scheduling.
 
-**Recommendation**:
-```python
-# Add to train.py
-scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    optimizer, T_0=1000, T_mult=2
-)
-# Or linear warmup + cosine decay
-```
+**Note**: Finetuning already has linear warmup via `LambdaLR` (default 500 warmup steps).
 
 ---
 
@@ -103,17 +96,11 @@ model = DDP(model, device_ids=[local_rank])
 
 ### 1. Mixed Precision Training
 
-**Status**: ✅ Implemented in `train.py`
+**Status**: Implemented in both `src/train/train.py` and `finetune/train.py`
 
-**Benefit**: ~2× speedup, ~50% memory reduction.
+**Benefit**: ~2x speedup, ~50% memory reduction.
 
-**Usage**: Set `use_amp: true` in `config.yaml` (enabled by default).
-
-```yaml
-# config.yaml
-training:
-  use_amp: true  # Set to false to disable
-```
+**Usage**: Set `use_amp: true` in config (enabled by default).
 
 **Implementation Details**:
 - Uses `torch.autocast` with float16 for forward passes
@@ -123,7 +110,7 @@ training:
 
 ### 2. Vectorized Prefix Mask via block_id
 
-**Status**: ✅ Implemented
+**Status**: Implemented
 
 **Benefit**: Eliminates Python loop overhead in prefix mask construction.
 
@@ -132,27 +119,79 @@ training:
 |----------------|------|------|
 | Legacy (Python loops) | 993 ms | 891 ms |
 | Vectorized (block_id) | 330 ms | 133 ms |
-| **Speedup** | **3.0×** | **6.7×** |
+| **Speedup** | **3.0x** | **6.7x** |
 
 **How it works**:
 
-1. **Dataloader** (`loader.py`) computes `block_id` tensor during data loading:
+1. **Dataloader** computes `block_id` tensor during data loading:
    - Each position gets a block ID indicating which board block it belongs to
    - Positions in the same block can attend to each other bidirectionally
-   - Orphan positions (padding, move tokens) get unique IDs
+   - Orphan positions (move tokens, structural tokens) get unique IDs
 
-2. **Model** (`model.py`) uses vectorized tensor operations:
+2. **Model** uses vectorized tensor operations:
    ```python
-   # Instead of nested Python loops:
    same_block = block_id.unsqueeze(-1) == block_id.unsqueeze(-2)  # [B, S, S]
    mask = causal_mask.unsqueeze(0) | same_block
    ```
 
-**Files Modified**:
-- `src/dataloader/data.py`: Returns `block_boundaries` from `game_to_token_ids()`
-- `src/dataloader/loader.py`: Builds and yields `block_id` tensor
-- `src/models/model.py`: Uses vectorized mask construction with `block_id`
-- `src/train/train.py`: Passes `block_id` to model
+### 3. Sub-Vocabulary Heads
+
+**Status**: Implemented
+
+**Benefit**: Reduces head output dimensions dramatically, improving efficiency and training signal quality.
+
+| Head | Old Output Size | New Output Size | Reduction |
+|------|----------------|-----------------|-----------|
+| `board_head` | 1968 (full vocab) | 41 (board sub-vocab) | 48x smaller |
+| `policy_head` | 1968 (full vocab) | 1924 (move sub-vocab) | 1.02x smaller |
+| `thinking_policy_head` | 1968 (full vocab) | 1924 (move sub-vocab) | 1.02x smaller |
+
+**Key changes**:
+- `board_head` outputs 41 logits over board sub-vocabulary only
+- `policy_head` / `thinking_policy_head` output 1924 logits over move sub-vocabulary only
+- Separate target tensors: `board_target_ids` (board sub-vocab indices) + `move_target_ids` (move sub-vocab indices)
+- Both use `IGNORE_INDEX = -100` instead of pad token for targets
+- Checkpoint migration extracts sub-vocab rows from old full-vocab heads
+
+### 4. Unified Board Loss
+
+**Status**: Implemented
+
+**Benefit**: Eliminates gradient imbalance between continuation and termination decisions.
+
+**Before**: 4 separate board-related losses (`board_loss`, `start_pos_loss`, `continue_var_loss`, `new_variation_loss`), creating a ~104x gradient imbalance favoring end_var over continue_var.
+
+**After**: Single `board_loss` over the board sub-vocabulary. All decisions (continue_var, end_var, new_variation, end_think, generic_move) are equally weighted within the unified loss.
+
+**Simplified board mask**:
+```python
+# Before (complex exclusion logic):
+board_mask = valid & ~move_mask & ~thinking_move_mask & ~wl_positions & ~d_positions & ~pre_first_move
+
+# After (simple):
+board_mask = (board_target_ids != IGNORE_INDEX) & (~pre_first_move_mask)
+```
+
+### 5. Soft Bucket Value Losses
+
+**Status**: Implemented
+
+**Benefit**: Better calibrated value predictions via distribution over buckets instead of single-point regression.
+
+- WL: 100 Gaussian CDF quantile buckets in [-1, 1] (concentrated near 0 via `wl_sigma=0.4`)
+- D: 100 uniform buckets in [0, 1]
+- Soft cross-entropy: target probability distributed across two nearest bucket centers via linear interpolation
+
+### 6. Fourier Value Injection
+
+**Status**: Implemented
+
+**Benefit**: Scalar WL/D values encoded as rich `embed_dim`-sized vectors via learned Fourier features.
+
+- `FourierEncoder` with 128 learned frequencies
+- Fourier embeddings **replace** token embeddings at `wl_value`/`d_value` positions
+- During training: ground-truth values discretized to nearest bucket center, then Fourier-encoded
+- During inference: predicted values injected sequentially (WL first, then D)
 
 ---
 
@@ -162,7 +201,7 @@ training:
 
 #### 1. Gradient Checkpointing
 
-**Benefit**: Trade compute for memory.
+**Benefit**: Trade compute for memory, enabling larger batch sizes.
 
 ```python
 from torch.utils.checkpoint import checkpoint
@@ -179,12 +218,12 @@ for layer in self.layers:
 
 **Idea**: Mirror boards horizontally (flip a-h to h-a).
 
-**Benefit**: 2× effective data, helps model learn symmetry.
+**Benefit**: 2x effective data, helps model learn symmetry.
 
 ```python
 def mirror_position(tokens):
-    # Swap files: a↔h, b↔g, c↔f, d↔e
-    # Mirror move: e2e4 → d2d4 (after adjusting)
+    # Swap files: a<->h, b<->g, c<->f, d<->e
+    # Mirror move: e2e4 -> d2d4 (after adjusting)
 ```
 
 #### 3. Curriculum Learning
@@ -232,79 +271,19 @@ def mirror_position(tokens):
 
 ---
 
-## Code Quality Improvements
-
-### 1. Type Hints
-
-Add type annotations throughout:
-```python
-def fen_to_position_tokens(fen: str) -> List[str]:
-    ...
-
-def game_to_token_ids(
-    game_df: pd.DataFrame,
-    skip_board_prob: float = 0.0
-) -> Tuple[List[int], List[Tuple[int, str, List[float], bool]], List[Tuple[int, int]]]:
-    ...
-```
-
-### 2. Configuration Validation
-
-Add schema validation for config files:
-```python
-from pydantic import BaseModel, validator
-
-class TrainingConfig(BaseModel):
-    learning_rate: float
-    batch_size: int
-    num_epochs: int
-
-    @validator('learning_rate')
-    def lr_must_be_positive(cls, v):
-        if v <= 0:
-            raise ValueError('learning_rate must be positive')
-        return v
-```
-
-### 3. Logging Improvements
-
-Replace print statements with proper logging:
-```python
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-logger.info(f"Starting epoch {epoch}")
-logger.debug(f"Batch loss: {loss.item()}")
-```
-
-### 4. Unit Tests
-
-Add tests for critical functions:
-```python
-def test_fen_to_tokens():
-    tokens = fen_to_position_tokens("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-    assert len(tokens) == 68
-    assert tokens[0] == "start_pos"
-    assert tokens[67] == "white_to_move"
-
-def test_vocab_consistency():
-    for token, idx in token_to_idx.items():
-        assert idx_to_token[idx] == token
-```
-
----
-
 ## Performance Optimization Checklist
 
 | Optimization | Status | Measured Speedup |
 |--------------|--------|------------------|
-| Mixed precision (FP16) | ✅ Implemented | ~2.5× |
-| Vectorized prefix masking | ✅ Implemented | 3× (fp32), 6.7× (fp16) |
-| Gradient checkpointing | ❌ Not implemented | Memory: 2-4× expected |
-| Multi-GPU (DDP) | ❌ Not implemented | Linear with GPUs |
-| Optimized data loading | ✅ IterableDataset | Baseline |
+| Mixed precision (FP16) | Implemented | ~2.5x |
+| Vectorized prefix masking | Implemented | 3x (fp32), 6.7x (fp16) |
+| Sub-vocabulary heads | Implemented | Reduced head parameters |
+| Unified board loss | Implemented | Simpler, balanced gradients |
+| Soft bucket value losses | Implemented | Better calibration |
+| Fourier value injection | Implemented | Rich scalar encoding |
+| Gradient checkpointing | Not implemented | Memory: 2-4x expected |
+| Multi-GPU (DDP) | Not implemented | Linear with GPUs |
+| Optimized data loading | IterableDataset | Baseline |
 
 ---
 
@@ -313,7 +292,7 @@ def test_vocab_consistency():
 ### Immediate (Quick Wins)
 
 1. Add validation loop to detect overfitting
-2. Implement learning rate scheduling
+2. Implement learning rate scheduling for pretraining
 
 ### Short-term
 
