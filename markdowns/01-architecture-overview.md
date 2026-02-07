@@ -11,7 +11,7 @@ The model is first **pretrained** on standard game sequences (board-move-value t
 1. **Fixed-length board representation**: Every chess position is encoded as exactly 68 tokens (`start_pos` + 64 squares + `end_pos` + castling + side_to_move).
 2. **Sub-vocabulary heads**: Each prediction head outputs logits over only its relevant sub-vocabulary, not the full vocab. The `board_head` predicts 41 board tokens, the policy heads predict 1924 UCI move tokens.
 3. **Two-pass architecture**: Board generation uses causal (autoregressive) attention. Move and value prediction use prefix attention (bidirectional within board blocks, causal across blocks).
-4. **Fourier value injection**: WL/D evaluation values are encoded via learned Fourier features and injected as embeddings at placeholder positions, providing value context for subsequent predictions.
+4. **Fourier value injection**: WL/D evaluation values are encoded via learned Fourier features and injected as embeddings at placeholder positions in **both** the causal and prefix passes, providing value context for board generation and move/value prediction alike.
 5. **Soft bucket losses**: Value heads predict distributions over 100 buckets rather than single scalars, using soft cross-entropy loss with linear interpolation between nearest buckets.
 
 ## Model Heads
@@ -149,7 +149,11 @@ Pos   board_mask  move_mask  wl_pos  d_pos   wdl_valid
 
 The pre_first_move_mask excludes positions 0-66 (everything before the first move_mask position at 67). This is because the first board has no causal context from prior moves, so training on it would be just memorizing the starting position.
 
-**wl_positions / d_positions**: Mark where Fourier features are injected and where value heads predict.
+**wl_positions**: Marks `wl_value` placeholder positions — used for Fourier WL injection (both passes) and where `d_head` reads hidden states (prefix pass).
+
+**d_positions**: Marks `d_value` placeholder positions — used for Fourier D injection (both passes) only. No head reads from these positions directly.
+
+Note: `wl_head` predicts at the **move token** position (`move_mask + 1`), not at `wl_positions`.
 
 ### Block IDs (for prefix mask)
 
@@ -172,7 +176,7 @@ Each board's 68 tokens share a block ID. Non-board tokens get unique IDs (constr
 
 ### Pass 1: Causal Attention (board_head)
 
-Standard lower-triangular mask. Each position can only attend to positions before it (and itself).
+Standard lower-triangular mask. Each position can only attend to positions before it (and itself). Fourier features are injected at `wl_value` and `d_value` positions (same as prefix pass), so the model sees real evaluation context when generating subsequent board tokens.
 
 ```
         pos: 0  1  2 ... 67 68 69 70 71 72 ... 138 139 140 141
@@ -257,7 +261,7 @@ Condensed view (grouping positions by type):
 | `wl_head` | pos 68 (move token after STM 0) | Board 0 + move (causal) | WL value for position 0 |
 | `d_head` | pos 69 (wl_value after move 0) | Board 0 + move + Fourier(WL) | D value for position 0 |
 
-**Fourier injection**: Before the prefix pass, the token embeddings at pos 69 and 70 (and 140, 141) are **replaced** with `FourierEncoder(wl_value)` and `FourierEncoder(d_value)` respectively, using ground-truth values during training.
+**Fourier injection**: Before **both** passes, the token embeddings at pos 69 and 70 (and 140, 141) are **replaced** with `FourierEncoder(wl_value)` and `FourierEncoder(d_value)` respectively, using ground-truth (discretized to nearest bucket) values during training. This gives the causal pass real value context when generating subsequent board tokens, and gives the prefix pass value context for move and value prediction.
 
 ---
 
@@ -406,7 +410,7 @@ Pos      block_id   Type
 
 ### Pass 1: Causal Attention Matrix (board_head)
 
-Standard lower-triangular. Shown in block form:
+Standard lower-triangular. Fourier features are injected at `wl_value`/`d_value` positions (same as prefix pass). Shown in block form:
 
 ```
               Block0  st  mv wl d  Block1  mv wl d  Block2  ev  mv wl d  Block3  ev  et  mv wl d
@@ -512,7 +516,7 @@ d      287  [ ............................................................1..1  
                     |                           |
               [Pass 1: Causal]           [Pass 2: Prefix]
               mask = lower-tri           mask = causal | same_block
-              no Fourier injection       Fourier(WL,D) replaces embeddings
+              Fourier(WL,D) injected     Fourier(WL,D) injected
                     |                           |
               h_causal [B,S,E]           h_prefix [B,S,E]
                     |                           |

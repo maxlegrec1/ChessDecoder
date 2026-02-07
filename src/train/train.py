@@ -253,8 +253,26 @@ def train():
             block_id = batch["block_id"].to(device)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                # === Prepare Fourier inputs (shared by both passes) ===
+                wl_fourier_input = torch.zeros_like(wl_targets)
+                d_fourier_input = torch.zeros_like(d_targets)
+
+                if wl_positions.any():
+                    wl_vals_at_pos = wl_targets[wl_positions]
+                    wl_disc = model.discretize_to_bucket(wl_vals_at_pos, model.wl_bucket_centers)
+                    wl_fourier_input[wl_positions] = wl_disc
+
+                if d_positions.any():
+                    d_vals_at_pos = d_targets[d_positions]
+                    d_disc = model.discretize_to_bucket(d_vals_at_pos, model.d_bucket_centers)
+                    d_fourier_input[d_positions] = d_disc
+
                 # === Pass 1: Causal masking for board generation ===
-                h_causal = model(input_ids, mask_type="causal")
+                h_causal = model(
+                    input_ids, mask_type="causal",
+                    wl_values=wl_fourier_input, d_values=d_fourier_input,
+                    wl_positions=wl_positions, d_positions=d_positions
+                )
                 board_logits = model.board_head(h_causal)
 
                 # Board mask: non-ignored positions, excluding pre-first-move
@@ -272,19 +290,6 @@ def train():
                 board_loss = (ce_board * board_mask.float()).sum() / (board_mask.sum() + 1e-8)
 
                 # === Pass 2: Prefix masking for move + value prediction ===
-                wl_fourier_input = torch.zeros_like(wl_targets)
-                d_fourier_input = torch.zeros_like(d_targets)
-
-                if wl_positions.any():
-                    wl_vals_at_pos = wl_targets[wl_positions]
-                    wl_disc = model.discretize_to_bucket(wl_vals_at_pos, model.wl_bucket_centers)
-                    wl_fourier_input[wl_positions] = wl_disc
-
-                if d_positions.any():
-                    d_vals_at_pos = d_targets[d_positions]
-                    d_disc = model.discretize_to_bucket(d_vals_at_pos, model.d_bucket_centers)
-                    d_fourier_input[d_positions] = d_disc
-
                 h_prefix = model(
                     input_ids, mask_type="prefix", block_id=block_id,
                     wl_values=wl_fourier_input, d_values=d_fourier_input,
