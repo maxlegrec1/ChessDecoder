@@ -60,7 +60,8 @@ echo "=========================================="
 echo " Converting tar files to Parquet"
 echo "=========================================="
 
-for TAR in "$TAR_DIR"/*.tar; do
+for FILE in $FILE_LIST; do
+    TAR="$TAR_DIR/$FILE"
     BASENAME=$(basename "$TAR" .tar)
     PARQUET="$OUTPUT_DIR/${BASENAME}.parquet"
     if [ -f "$PARQUET" ]; then
