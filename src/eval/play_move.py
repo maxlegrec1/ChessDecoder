@@ -9,10 +9,13 @@ from datetime import datetime # Added for timestamping
 from tqdm import tqdm
 from math import log10
 import os
+import shutil
 
 pgn_dir = "./pgns"
 os.makedirs(pgn_dir,exist_ok=True)
-STOCKFISH_PATH = "/mnt/2tb/ChessRL/stockfish/stockfish-ubuntu-x86-64-avx2"  # Adjust path if needed
+STOCKFISH_PATH = shutil.which("stockfish")
+if STOCKFISH_PATH is None:
+    raise RuntimeError("stockfish not found on PATH – download it from https://stockfishchess.org/download/")
 STOCKFISH_ELO = 2500  # Set the desired ELO rating
 N_GAMES = 200 # Reduced for faster testing, change back to 100 if needed
 

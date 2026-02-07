@@ -14,8 +14,11 @@ from datetime import datetime
 from tqdm import tqdm
 from math import log10
 import os
+import shutil
 
-STOCKFISH_PATH = "./stockfish-ubuntu-x86-64-avx2"
+STOCKFISH_PATH = shutil.which("stockfish")
+if STOCKFISH_PATH is None:
+    raise RuntimeError("stockfish not found on PATH – download it from https://stockfishchess.org/download/")
 
 
 def get_stockfish_move(engine_obj, bullet_board):

@@ -80,28 +80,11 @@ uv run python -c "import _inference_cpp; print('C++ extension OK')"
 
 ## Installing Stockfish
 
-Stockfish is needed for ELO evaluation. Install it for your platform:
+Stockfish is needed for ELO evaluation. Download the binary for your platform from
+<https://stockfishchess.org/download/> and make sure the `stockfish` executable is on your `PATH`.
 
-**Ubuntu / Debian:**
-
-```bash
-sudo apt update && sudo apt install stockfish
-```
-
-**macOS (Homebrew):**
-
-```bash
-brew install stockfish
-```
-
-**From source (latest):**
-
-```bash
-git clone https://github.com/official-stockfish/Stockfish.git
-cd Stockfish/src
-make -j$(nproc) build ARCH=x86-64-modern
-sudo cp stockfish /usr/local/bin/
-```
+Example : 
+sudo ln -s /mnt/2tb_2/decoder/stockfish-ubuntu-x86-64-avx2 /usr/local/bin/stockfish
 
 Verify with:
 
