@@ -23,7 +23,7 @@ from tqdm import tqdm
 from src.models.model import ChessDecoder
 from src.models.vocab import (vocab_size, token_to_idx, board_vocab_size, move_vocab_size,
                               board_idx_to_full_idx, move_idx_to_full_idx, board_token_to_idx)
-from finetune.loader import get_finetune_dataloader
+from src.finetune.loader import get_finetune_dataloader
 
 
 def load_config(config_path):
@@ -119,7 +119,7 @@ def load_pretrained_checkpoint(model, checkpoint_path, device):
 
 
 def train():
-    config = load_config("finetune/config.yaml")
+    config = load_config("src/finetune/config.yaml")
 
     device = torch.device(config["training"]["device"] if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")

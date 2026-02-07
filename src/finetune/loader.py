@@ -17,7 +17,7 @@ import json
 from src.dataloader.data import game_to_token_ids
 from src.models.vocab import (token_to_idx, full_idx_to_board_idx, full_idx_to_move_idx,
                               board_token_to_idx)
-from finetune.data import variation_to_token_ids
+from src.finetune.data import variation_to_token_ids
 
 
 class FinetuneIterableDataset(IterableDataset):
