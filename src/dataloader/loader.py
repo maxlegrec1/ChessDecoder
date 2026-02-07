@@ -7,7 +7,8 @@ import os
 import math
 import random
 from src.dataloader.data import game_to_token_ids
-from src.models.vocab import token_to_idx
+from src.models.vocab import (token_to_idx, full_idx_to_board_idx, full_idx_to_move_idx,
+                              board_token_to_idx)
 
 class ChessIterableDataset(IterableDataset):
     def __init__(self, parquet_dir, max_seq_len=2048, shuffle_files=True, shuffle_games=True, skip_board_prob=0.0):
@@ -107,9 +108,11 @@ class ChessIterableDataset(IterableDataset):
                     wdl_data = [d for d in wdl_data if d[0] in valid_move_indices]
 
                     seq_len = len(ids)
+                    IGNORE_INDEX = -100
 
                     input_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
-                    target_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
+                    board_target_ids = torch.full((self.max_seq_len,), IGNORE_INDEX, dtype=torch.long)
+                    move_target_ids = torch.full((self.max_seq_len,), IGNORE_INDEX, dtype=torch.long)
                     move_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
                     wl_positions = torch.zeros((self.max_seq_len,), dtype=torch.bool)
                     d_positions = torch.zeros((self.max_seq_len,), dtype=torch.bool)
@@ -119,20 +122,22 @@ class ChessIterableDataset(IterableDataset):
 
                     input_ids[:seq_len] = torch.tensor(ids, dtype=torch.long)
 
-                    # Default next-token target (shifted by 1)
+                    # Shifted board targets (mapped to board sub-vocab indices)
                     if seq_len > 1:
-                        target_ids[:seq_len-1] = input_ids[1:seq_len]
+                        for i in range(seq_len - 1):
+                            full_idx = input_ids[i + 1].item()
+                            board_target_ids[i] = full_idx_to_board_idx.get(full_idx, IGNORE_INDEX)
 
-                    # Process move targets and value positions
+                    # Process move targets: override stm positions with generic_move + move sub-vocab target
+                    generic_move_board_idx = board_token_to_idx["generic_move"]
                     for move_idx, best_move, wdl, is_valid_wdl in wdl_data:
-                        # Move target: at stm position (move_idx - 1), predict the move
                         stm_pos = move_idx - 1
                         if 0 <= stm_pos < self.max_seq_len:
-                            target_ids[stm_pos] = token_to_idx[best_move]
+                            board_target_ids[stm_pos] = generic_move_board_idx
+                            move_target_ids[stm_pos] = full_idx_to_move_idx[token_to_idx[best_move]]
                             move_mask[stm_pos] = True
 
                     for wl_pos, d_pos, wl, d, is_valid in value_data:
-                        # Mark WL and D placeholder positions
                         if wl_pos < self.max_seq_len:
                             wl_positions[wl_pos] = True
                             wl_targets[wl_pos] = wl
@@ -142,20 +147,11 @@ class ChessIterableDataset(IterableDataset):
                             d_targets[d_pos] = d
                             wdl_valid[d_pos] = is_valid
 
-                        # Also store targets at stm position for convenience
-                        # (stm_pos = wl_pos - 2 since sequence is [...stm, move, wl, d...])
                         stm_pos = wl_pos - 2
                         if 0 <= stm_pos < self.max_seq_len:
                             wl_targets[stm_pos] = wl
                             d_targets[stm_pos] = d
                             wdl_valid[stm_pos] = is_valid
-
-                        # At move, WL, and D positions: set target to pad so they're
-                        # excluded from board CE loss
-                        move_pos = wl_pos - 1  # move token position
-                        for pos in [move_pos, wl_pos, d_pos]:
-                            if 0 <= pos < self.max_seq_len:
-                                target_ids[pos] = self.pad_id
 
                     # Build block_id tensor
                     max_block_num = len(adjusted_boundaries)
@@ -163,19 +159,10 @@ class ChessIterableDataset(IterableDataset):
                     for block_num, (b_start, b_end) in enumerate(adjusted_boundaries):
                         block_id[b_start:b_end] = block_num
 
-                    # Pre-board mask: positions just before each board block
-                    # that should predict start_pos via the board_head
-                    pre_board_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
-                    start_pos_id = token_to_idx["start_pos"]
-                    for (b_start, b_end) in adjusted_boundaries:
-                        pre_board_pos = b_start - 1
-                        if 0 <= pre_board_pos < self.max_seq_len:
-                            target_ids[pre_board_pos] = start_pos_id
-                            pre_board_mask[pre_board_pos] = True
-
                     yield {
                         "input_ids": input_ids,
-                        "target_ids": target_ids,
+                        "board_target_ids": board_target_ids,
+                        "move_target_ids": move_target_ids,
                         "move_mask": move_mask,
                         "wl_positions": wl_positions,
                         "d_positions": d_positions,
@@ -183,7 +170,6 @@ class ChessIterableDataset(IterableDataset):
                         "d_targets": d_targets,
                         "wdl_valid": wdl_valid,
                         "block_id": block_id,
-                        "pre_board_mask": pre_board_mask,
                     }
             except Exception as e:
                 print(f"Error reading file {file_path}: {e}")

@@ -30,7 +30,7 @@ training:
   use_amp: true  # Mixed precision training (float16)
   checkpoint_dir: "checkpoints/"
   max_track_nth_moves: 20
-  resume_from: "checkpoints/run-1_20260128_231050/"
+  resume_from: "checkpoints/run-1_20260206_233243/"
 
 loss:
   move_weight: 5.0

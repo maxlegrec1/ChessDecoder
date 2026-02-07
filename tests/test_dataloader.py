@@ -1,8 +1,7 @@
 import time
 import torch
 from src.dataloader.loader import get_dataloader
-from src.models.vocab import idx_to_token
-import pandas as pd
+from src.models.vocab import idx_to_token, move_idx_to_full_idx, board_idx_to_full_idx, board_token_to_idx
 
 def test_dataloader():
     parquet_dir = 'parquets/'
@@ -29,7 +28,8 @@ def test_dataloader():
 
         # Check move_mask
         move_mask = batch["move_mask"]
-        target_ids = batch["target_ids"]
+        move_target_ids = batch["move_target_ids"]
+        board_target_ids = batch["board_target_ids"]
 
         # Get indices where mask is True
         masked_indices = torch.nonzero(move_mask[0]).squeeze()
@@ -39,12 +39,18 @@ def test_dataloader():
 
             print("  Checking move_mask targets:")
             for idx in indices_to_check:
-                token_id = target_ids[0, idx].item()
-                token = idx_to_token[token_id]
+                move_sub_idx = move_target_ids[0, idx].item()
+                full_idx = move_idx_to_full_idx[move_sub_idx]
+                token = idx_to_token[full_idx]
                 is_move = len(token) in [4, 5] and token[0] in "abcdefgh" and token[1] in "12345678"
                 print(f"    Index {idx}: {token} (Is move? {is_move})")
                 if not is_move:
                     print(f"    WARNING: Token at masked index {idx} is NOT a move: {token}")
+
+                # Check board_target_ids has generic_move at this position
+                board_sub_idx = board_target_ids[0, idx].item()
+                board_tok = idx_to_token[board_idx_to_full_idx[board_sub_idx]] if board_sub_idx >= 0 else "IGNORED"
+                print(f"      Board target: {board_tok}")
 
         # Check WL/D positions
         wl_positions = batch["wl_positions"]

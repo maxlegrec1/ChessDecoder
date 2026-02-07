@@ -1,4 +1,4 @@
-from src.eval.elo_eval import model_vs_stockfish
+from src.eval.elo_eval_n import model_vs_stockfish_n
 from src.models.model import ChessDecoder
 from src.models.vocab import vocab_size
 import torch
@@ -24,7 +24,7 @@ model = ChessDecoder(vocab_size=vocab_size, embed_dim=1024, num_heads=16, num_la
 #     torch.load("checkpoints/run-1_20260128_231050/checkpoint_epoch_10.pt")["model_state_dict"],
 #     vocab_size
 # ))
-model.load_state_dict(torch.load("checkpoints/run-1_20260206_233243/checkpoint_epoch_2.pt")["model_state_dict"])
+model.load_state_dict(torch.load("checkpoints/run-1_20260128_231050/checkpoint_epoch_13.pt")["model_state_dict"])
 model.eval()
 
-model_vs_stockfish(model, model1_name="decoder", num_games=100, temperature=0.0, elo=1500)
+model_vs_stockfish_n(model, model_name="decoder", num_games=100, temperature=0.0, elo=2000, max_n=1)

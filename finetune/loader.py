@@ -15,7 +15,8 @@ import random
 import json
 
 from src.dataloader.data import game_to_token_ids
-from src.models.vocab import token_to_idx
+from src.models.vocab import (token_to_idx, full_idx_to_board_idx, full_idx_to_move_idx,
+                              board_token_to_idx)
 from finetune.data import variation_to_token_ids
 
 
@@ -229,9 +230,11 @@ class FinetuneIterableDataset(IterableDataset):
     def _build_pretrain_tensors(self, ids, wdl_data, value_data, block_boundaries):
         """Build tensor dict for a pretrain sample (identical to ChessIterableDataset)."""
         seq_len = len(ids)
+        IGNORE_INDEX = -100
 
         input_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
-        target_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
+        board_target_ids = torch.full((self.max_seq_len,), IGNORE_INDEX, dtype=torch.long)
+        move_target_ids = torch.full((self.max_seq_len,), IGNORE_INDEX, dtype=torch.long)
         move_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
         thinking_move_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
         wl_positions = torch.zeros((self.max_seq_len,), dtype=torch.bool)
@@ -241,13 +244,20 @@ class FinetuneIterableDataset(IterableDataset):
         wdl_valid = torch.zeros((self.max_seq_len,), dtype=torch.bool)
 
         input_ids[:seq_len] = torch.tensor(ids, dtype=torch.long)
-        if seq_len > 1:
-            target_ids[:seq_len - 1] = input_ids[1:seq_len]
 
+        # Shifted board targets (mapped to board sub-vocab indices)
+        if seq_len > 1:
+            for i in range(seq_len - 1):
+                full_idx = input_ids[i + 1].item()
+                board_target_ids[i] = full_idx_to_board_idx.get(full_idx, IGNORE_INDEX)
+
+        # Move targets: override stm positions with generic_move + move sub-vocab target
+        generic_move_board_idx = board_token_to_idx["generic_move"]
         for move_idx, best_move, wdl, is_valid_wdl in wdl_data:
             stm_pos = move_idx - 1
             if 0 <= stm_pos < self.max_seq_len:
-                target_ids[stm_pos] = token_to_idx[best_move]
+                board_target_ids[stm_pos] = generic_move_board_idx
+                move_target_ids[stm_pos] = full_idx_to_move_idx[token_to_idx[best_move]]
                 move_mask[stm_pos] = True
 
         for wl_pos, d_pos, wl, d, is_valid in value_data:
@@ -264,29 +274,16 @@ class FinetuneIterableDataset(IterableDataset):
                 wl_targets[stm_pos] = wl
                 d_targets[stm_pos] = d
                 wdl_valid[stm_pos] = is_valid
-            move_pos = wl_pos - 1
-            for pos in [move_pos, wl_pos, d_pos]:
-                if 0 <= pos < self.max_seq_len:
-                    target_ids[pos] = self.pad_id
 
         max_block_num = len(block_boundaries)
         block_id = torch.arange(self.max_seq_len, dtype=torch.long) + max_block_num
         for block_num, (b_start, b_end) in enumerate(block_boundaries):
             block_id[b_start:b_end] = block_num
 
-        # Pre-board mask: positions just before each board block
-        # that should predict start_pos via the board_head
-        pre_board_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
-        start_pos_id = token_to_idx["start_pos"]
-        for (b_start, b_end) in block_boundaries:
-            pre_board_pos = b_start - 1
-            if 0 <= pre_board_pos < self.max_seq_len:
-                target_ids[pre_board_pos] = start_pos_id
-                pre_board_mask[pre_board_pos] = True
-
         return {
             "input_ids": input_ids,
-            "target_ids": target_ids,
+            "board_target_ids": board_target_ids,
+            "move_target_ids": move_target_ids,
             "move_mask": move_mask,
             "thinking_move_mask": thinking_move_mask,
             "wl_positions": wl_positions,
@@ -295,16 +292,19 @@ class FinetuneIterableDataset(IterableDataset):
             "d_targets": d_targets,
             "wdl_valid": wdl_valid,
             "block_id": block_id,
-            "pre_board_mask": pre_board_mask,
             "first_is_not_best": torch.tensor(False, dtype=torch.bool),
+            "continue_var_mask": torch.zeros((self.max_seq_len,), dtype=torch.bool),
+            "new_variation_mask": torch.zeros((self.max_seq_len,), dtype=torch.bool),
         }
 
     def _build_variation_tensors(self, ids, thinking_move_data, final_move_data, value_data, block_boundaries, first_is_not_best=False):
         """Build tensor dict for a thinking variation sample."""
         seq_len = len(ids)
+        IGNORE_INDEX = -100
 
         input_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
-        target_ids = torch.full((self.max_seq_len,), self.pad_id, dtype=torch.long)
+        board_target_ids = torch.full((self.max_seq_len,), IGNORE_INDEX, dtype=torch.long)
+        move_target_ids = torch.full((self.max_seq_len,), IGNORE_INDEX, dtype=torch.long)
         move_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
         thinking_move_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
         wl_positions = torch.zeros((self.max_seq_len,), dtype=torch.bool)
@@ -315,22 +315,47 @@ class FinetuneIterableDataset(IterableDataset):
 
         input_ids[:seq_len] = torch.tensor(ids, dtype=torch.long)
 
-        # Default next-token targets (shifted by 1) for board generation
+        # Shifted board targets (mapped to board sub-vocab indices)
         if seq_len > 1:
-            target_ids[:seq_len - 1] = input_ids[1:seq_len]
+            for i in range(seq_len - 1):
+                full_idx = input_ids[i + 1].item()
+                board_target_ids[i] = full_idx_to_board_idx.get(full_idx, IGNORE_INDEX)
 
-        # Thinking move targets (variation root moves + PV continuation moves)
+        # Thinking move targets: set move_target_ids + override board_target_ids
+        start_think_id = token_to_idx["start_think"]
+        end_var_id = token_to_idx["end_var"]
+        generic_move_board_idx = board_token_to_idx["generic_move"]
+
+        # Continuation masks for metrics only
+        continue_var_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
+        new_variation_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
+
         for predict_from_pos, move_token in thinking_move_data:
-            if 0 <= predict_from_pos < self.max_seq_len:
-                target_ids[predict_from_pos] = token_to_idx[move_token]
-                thinking_move_mask[predict_from_pos] = True
+            if not (0 <= predict_from_pos < self.max_seq_len):
+                continue
+            # Move target in move sub-vocab
+            move_target_ids[predict_from_pos] = full_idx_to_move_idx[token_to_idx[move_token]]
+            thinking_move_mask[predict_from_pos] = True
+
+            # Board target override based on input token type
+            tok_id = ids[predict_from_pos]
+            if tok_id == start_think_id:
+                board_target_ids[predict_from_pos] = generic_move_board_idx
+            elif tok_id == end_var_id:
+                board_target_ids[predict_from_pos] = board_token_to_idx["new_variation"]
+                new_variation_mask[predict_from_pos] = True
+            else:
+                # Board stm position - PV continuation
+                board_target_ids[predict_from_pos] = board_token_to_idx["continue_var"]
+                continue_var_mask[predict_from_pos] = True
 
         # Final move target (predicted from end_think via policy_head)
         if final_move_data is not None:
             end_think_pos, final_move_token = final_move_data
             if 0 <= end_think_pos < self.max_seq_len:
-                target_ids[end_think_pos] = token_to_idx[final_move_token]
+                move_target_ids[end_think_pos] = full_idx_to_move_idx[token_to_idx[final_move_token]]
                 move_mask[end_think_pos] = True
+                board_target_ids[end_think_pos] = generic_move_board_idx
 
         # Value targets
         for wl_pos, d_pos, wl, d, is_valid in value_data:
@@ -343,33 +368,9 @@ class FinetuneIterableDataset(IterableDataset):
                 d_targets[d_pos] = d
                 wdl_valid[d_pos] = is_valid
 
-        # Exclude move, wl, d positions from board generation targets
-        # For thinking moves: the token after predict_from_pos is the move token
-        for predict_from_pos, _ in thinking_move_data:
-            move_token_pos = predict_from_pos + 1
-            if 0 <= move_token_pos < self.max_seq_len:
-                target_ids[move_token_pos] = self.pad_id
-
-        # For final move: token after end_think
+        # Store WL/D targets at the final move position for convenience
         if final_move_data is not None:
             end_think_pos, _ = final_move_data
-            final_move_pos = end_think_pos + 1
-            if 0 <= final_move_pos < self.max_seq_len:
-                target_ids[final_move_pos] = self.pad_id
-
-        # Exclude wl and d token positions from board generation
-        for wl_pos, d_pos, _, _, _ in value_data:
-            for pos in [wl_pos, d_pos]:
-                if 0 <= pos < self.max_seq_len:
-                    target_ids[pos] = self.pad_id
-
-        # Store WL/D targets at the position that predicts WL (move token before wl_pos)
-        # For the final move: stm_pos = wl_pos - 2 pattern doesn't apply
-        # For variation values: wl is predicted from the move token before it
-        # We store at the move_mask/thinking_move_mask positions for convenience
-        if final_move_data is not None:
-            end_think_pos, _ = final_move_data
-            # The final wl/d are the last entry in value_data
             if value_data:
                 last_wl_pos, last_d_pos, last_wl, last_d, last_valid = value_data[-1]
                 if 0 <= end_think_pos < self.max_seq_len:
@@ -377,25 +378,16 @@ class FinetuneIterableDataset(IterableDataset):
                     d_targets[end_think_pos] = last_d
                     wdl_valid[end_think_pos] = last_valid
 
-        # Block IDs: board groups get shared IDs, everything else gets unique orphan IDs
+        # Block IDs
         max_block_num = len(block_boundaries)
         block_id = torch.arange(self.max_seq_len, dtype=torch.long) + max_block_num
         for block_num, (b_start, b_end) in enumerate(block_boundaries):
             block_id[b_start:b_end] = block_num
 
-        # Pre-board mask: positions just before each board block
-        # that should predict start_pos via the board_head
-        pre_board_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
-        start_pos_id = token_to_idx["start_pos"]
-        for (b_start, b_end) in block_boundaries:
-            pre_board_pos = b_start - 1
-            if 0 <= pre_board_pos < self.max_seq_len:
-                target_ids[pre_board_pos] = start_pos_id
-                pre_board_mask[pre_board_pos] = True
-
         return {
             "input_ids": input_ids,
-            "target_ids": target_ids,
+            "board_target_ids": board_target_ids,
+            "move_target_ids": move_target_ids,
             "move_mask": move_mask,
             "thinking_move_mask": thinking_move_mask,
             "wl_positions": wl_positions,
@@ -404,8 +396,9 @@ class FinetuneIterableDataset(IterableDataset):
             "d_targets": d_targets,
             "wdl_valid": wdl_valid,
             "block_id": block_id,
-            "pre_board_mask": pre_board_mask,
             "first_is_not_best": torch.tensor(first_is_not_best, dtype=torch.bool),
+            "continue_var_mask": continue_var_mask,
+            "new_variation_mask": new_variation_mask,
         }
 
 

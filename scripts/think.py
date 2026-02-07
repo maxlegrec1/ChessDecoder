@@ -10,7 +10,9 @@ import torch
 import torch.nn.functional as F
 
 from src.models.model import ChessDecoder
-from src.models.vocab import vocab_size, token_to_idx, idx_to_token
+from src.models.vocab import (vocab_size, token_to_idx, idx_to_token,
+                              board_idx_to_full_idx, move_idx_to_full_idx,
+                              board_token_to_idx)
 from src.dataloader.data import fen_to_position_tokens
 
 _PSEUDO_TO_STANDARD = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
@@ -36,10 +38,19 @@ def to_standard_uci(model_uci):
 
 
 def sample_token(logits, temperature):
+    """Sample from logits, returns sub-vocab index."""
     if temperature <= 0:
         return torch.argmax(logits).item()
     probs = F.softmax(logits / temperature, dim=-1)
     return torch.multinomial(probs, 1).item()
+
+
+# Pre-compute board sub-vocab lookup for signal tokens
+_BOARD_END_VAR_IDX = board_token_to_idx["end_var"]
+_BOARD_END_THINK_IDX = board_token_to_idx["end_think"]
+_BOARD_CONTINUE_VAR_IDX = board_token_to_idx["continue_var"]
+_BOARD_NEW_VARIATION_IDX = board_token_to_idx["new_variation"]
+_BOARD_GENERIC_MOVE_IDX = board_token_to_idx["generic_move"]
 
 
 def board_tokens_to_fen(tokens):
@@ -140,9 +151,11 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
         return model(inp, mask_type="causal")
 
     def sample_move(head, pos):
+        """Sample a move from policy/thinking_policy head. Returns full vocab idx."""
         h = prefix_forward()
-        logits = head(h)[0, pos, :]
-        return sample_token(logits, temperature)
+        logits = head(h)[0, pos, :]  # (move_vocab_size,)
+        move_sub_idx = sample_token(logits, temperature)
+        return move_idx_to_full_idx[move_sub_idx]  # full vocab idx
 
     def predict_wl(move_pos):
         h = prefix_forward()
@@ -180,10 +193,11 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
             if full():
                 break
             h = causal_forward()
-            logits = model.board_head(h)[0, -1, :]
-            tok = torch.argmax(logits).item()
-            append(tok, bid)
-            tok_strs.append(idx_to_token[tok])
+            logits = model.board_head(h)[0, -1, :]  # (board_vocab_size,)
+            board_sub_idx = torch.argmax(logits).item()
+            full_idx = board_idx_to_full_idx[board_sub_idx]
+            append(full_idx, bid)
+            tok_strs.append(idx_to_token[full_idx])
         fen_str = board_tokens_to_fen(tok_strs) if len(tok_strs) == 68 else "<truncated>"
         print(f"  board: {fen_str}")
 
@@ -259,39 +273,40 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
             state = "AFTER_BOARD"
 
         elif state == "AFTER_BOARD":
-            # Use board_head (causal) to let the model decide: next pv_move or end_var
+            # Use board_head (causal) to decide: end_var or continue_var (PV continuation)
             if full():
                 break
             h = causal_forward()
-            logits = model.board_head(h)[0, -1, :]
-            next_idx = sample_token(logits, temperature)
-            next_tok = idx_to_token[next_idx]
+            logits = model.board_head(h)[0, -1, :]  # (board_vocab_size,)
+            board_sub_idx = sample_token(logits, temperature)
 
-            if next_tok == "end_var":
-                append(next_idx, orphan())
+            if board_sub_idx == _BOARD_END_VAR_IDX:
+                full_idx = board_idx_to_full_idx[board_sub_idx]
+                append(full_idx, orphan())
                 print("  end_var")
                 state = "AFTER_END_VAR"
             else:
-                # Model wants to continue the PV -- sample the actual move
-                # from thinking_policy_head instead (board_head isn't trained for moves)
+                # continue_var (or any non-end_var): continue PV with thinking_policy_head
+                # Don't append continue_var to context (it's just a signal)
                 state = "MOVE"
 
         elif state == "AFTER_END_VAR":
-            # Use board_head to decide: new variation or end_think
+            # Use board_head to decide: end_think or new_variation (start another variation)
             if full():
                 break
             h = causal_forward()
-            logits = model.board_head(h)[0, -1, :]
-            next_idx = sample_token(logits, temperature)
-            next_tok = idx_to_token[next_idx]
+            logits = model.board_head(h)[0, -1, :]  # (board_vocab_size,)
+            board_sub_idx = sample_token(logits, temperature)
 
-            if next_tok == "end_think":
-                append(next_idx, orphan())
+            if board_sub_idx == _BOARD_END_THINK_IDX:
+                full_idx = board_idx_to_full_idx[board_sub_idx]
+                append(full_idx, orphan())
                 print("end_think")
                 ended_thinking = True
                 state = "FINAL"
             else:
-                # Start a new variation
+                # new_variation (or any non-end_think): start new variation
+                # Don't append new_variation to context (it's just a signal)
                 state = "MOVE"
 
         elif state == "FINAL":

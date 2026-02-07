@@ -8,7 +8,8 @@ import wandb
 from datetime import datetime
 from tqdm import tqdm
 from src.models.model import ChessDecoder
-from src.models.vocab import vocab_size, token_to_idx
+from src.models.vocab import (vocab_size, token_to_idx, board_vocab_size, move_vocab_size,
+                              board_idx_to_full_idx, move_idx_to_full_idx)
 from src.dataloader.loader import get_dataloader
 
 
@@ -87,8 +88,10 @@ def train():
         weight_decay=config["training"]["weight_decay"]
     )
 
-    # Loss function for board generation
-    ce_loss_fn = nn.CrossEntropyLoss(ignore_index=token_to_idx["pad"], reduction='none')
+    # Loss functions for board generation and move prediction
+    IGNORE_INDEX = -100
+    board_ce_fn = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction='none')
+    move_ce_fn = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction='none')
 
     # Mixed precision training
     use_amp = config["training"].get("use_amp", False)
@@ -108,25 +111,54 @@ def train():
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
 
         state_dict = checkpoint["model_state_dict"]
-        def migrate_state_dict(state_dict, new_vocab_size):
-            """Migrate old checkpoint: expand vocab dim to new size, clone policy_head to thinking_policy_head."""
-            # Expand vocab-sized tensors if needed
-            for key in ["tok_embedding.weight", "board_head.weight", "board_head.bias",
-                        "policy_head.weight", "policy_head.bias"]:
-                if key not in state_dict:
-                    continue
-                t = state_dict[key]
-                if t.shape[0] < new_vocab_size:
-                    pad = torch.zeros(new_vocab_size - t.shape[0], *t.shape[1:], dtype=t.dtype, device=t.device)
-                    state_dict[key] = torch.cat([t, pad], dim=0)
+        def migrate_state_dict(state_dict):
+            """Migrate old checkpoint: sub-vocab heads, expand embedding, clone thinking_policy_head."""
+            # Expand tok_embedding if needed
+            if "tok_embedding.weight" in state_dict:
+                t = state_dict["tok_embedding.weight"]
+                if t.shape[0] < vocab_size:
+                    pad = torch.zeros(vocab_size - t.shape[0], *t.shape[1:], dtype=t.dtype, device=t.device)
+                    state_dict["tok_embedding.weight"] = torch.cat([t, pad], dim=0)
 
-            # Clone policy_head -> thinking_policy_head
-            if "policy_head.weight" in state_dict:
+            # board_head: extract rows for board sub-vocab from old full-vocab weights
+            if "board_head.weight" in state_dict:
+                old_w = state_dict["board_head.weight"]
+                old_b = state_dict["board_head.bias"]
+                if old_w.shape[0] > board_vocab_size:
+                    old_vocab_sz = old_w.shape[0]
+                    new_w = torch.zeros(board_vocab_size, old_w.shape[1], dtype=old_w.dtype, device=old_w.device)
+                    new_b = torch.zeros(board_vocab_size, dtype=old_b.dtype, device=old_b.device)
+                    for i, full_idx in enumerate(board_idx_to_full_idx):
+                        if full_idx < old_vocab_sz:
+                            new_w[i] = old_w[full_idx]
+                            new_b[i] = old_b[full_idx]
+                    state_dict["board_head.weight"] = new_w
+                    state_dict["board_head.bias"] = new_b
+
+            # policy_head / thinking_policy_head: extract rows for move sub-vocab
+            for head in ["policy_head", "thinking_policy_head"]:
+                if f"{head}.weight" not in state_dict:
+                    continue
+                old_w = state_dict[f"{head}.weight"]
+                old_b = state_dict[f"{head}.bias"]
+                if old_w.shape[0] > move_vocab_size:
+                    old_vocab_sz = old_w.shape[0]
+                    new_w = torch.zeros(move_vocab_size, old_w.shape[1], dtype=old_w.dtype, device=old_w.device)
+                    new_b = torch.zeros(move_vocab_size, dtype=old_b.dtype, device=old_b.device)
+                    for i, full_idx in enumerate(move_idx_to_full_idx):
+                        if full_idx < old_vocab_sz:
+                            new_w[i] = old_w[full_idx]
+                            new_b[i] = old_b[full_idx]
+                    state_dict[f"{head}.weight"] = new_w
+                    state_dict[f"{head}.bias"] = new_b
+
+            # Clone policy_head -> thinking_policy_head (if not already present)
+            if "thinking_policy_head.weight" not in state_dict and "policy_head.weight" in state_dict:
                 state_dict["thinking_policy_head.weight"] = state_dict["policy_head.weight"].clone()
                 state_dict["thinking_policy_head.bias"] = state_dict["policy_head.bias"].clone()
 
             return state_dict
-        state_dict = migrate_state_dict(state_dict, vocab_size)
+        state_dict = migrate_state_dict(state_dict)
         # # Checkpoint compatibility: rename old policy_head -> board_head
         # if "policy_head.weight" in state_dict and "board_head.weight" not in state_dict:
         #     state_dict["board_head.weight"] = state_dict.pop("policy_head.weight")
@@ -210,7 +242,8 @@ def train():
 
         for batch in tqdm(dataloader):
             input_ids = batch["input_ids"].to(device)
-            target_ids = batch["target_ids"].to(device)
+            board_target_ids = batch["board_target_ids"].to(device)
+            move_target_ids = batch["move_target_ids"].to(device)
             move_mask = batch["move_mask"].to(device)
             wl_positions = batch["wl_positions"].to(device)
             d_positions = batch["d_positions"].to(device)
@@ -218,18 +251,15 @@ def train():
             d_targets = batch["d_targets"].to(device)
             wdl_valid = batch["wdl_valid"].to(device)
             block_id = batch["block_id"].to(device)
-            pre_board_mask = batch["pre_board_mask"].to(device)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 # === Pass 1: Causal masking for board generation ===
                 h_causal = model(input_ids, mask_type="causal")
                 board_logits = model.board_head(h_causal)
 
-                # Board mask: valid positions, excluding move/wl/d positions
-                valid_mask = target_ids != token_to_idx["pad"]
-                board_mask = valid_mask & (~move_mask) & (~wl_positions) & (~d_positions)
+                # Board mask: non-ignored positions, excluding pre-first-move
+                board_mask = board_target_ids != IGNORE_INDEX
 
-                # Exclude positions before the first move (pre-first-move tokens have no causal context)
                 first_move_idx = move_mask.int().argmax(dim=1)  # (B,)
                 has_moves = move_mask.any(dim=1)
                 first_move_idx[~has_moves] = move_mask.size(1)
@@ -237,19 +267,11 @@ def train():
                 pre_first_move_mask = indices < first_move_idx.unsqueeze(1)
                 board_mask = board_mask & (~pre_first_move_mask)
 
-                ce_board = ce_loss_fn(board_logits.view(-1, vocab_size), target_ids.view(-1))
-                ce_board = ce_board.view(target_ids.shape)
+                ce_board = board_ce_fn(board_logits.view(-1, board_vocab_size), board_target_ids.view(-1))
+                ce_board = ce_board.view(board_target_ids.shape)
                 board_loss = (ce_board * board_mask.float()).sum() / (board_mask.sum() + 1e-8)
 
-                # start_pos prediction loss (pre-board positions predict start_pos)
-                if pre_board_mask.any():
-                    start_pos_loss = (ce_board * pre_board_mask.float()).sum() / (pre_board_mask.sum() + 1e-8)
-                else:
-                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
-                    start_pos_loss = torch.tensor(0.0, device=device)
-
                 # === Pass 2: Prefix masking for move + value prediction ===
-                # Discretize ground truth to nearest bucket centers for fourier injection
                 wl_fourier_input = torch.zeros_like(wl_targets)
                 d_fourier_input = torch.zeros_like(d_targets)
 
@@ -271,8 +293,8 @@ def train():
 
                 # --- 1. Move prediction at stm positions ---
                 move_logits = model.policy_head(h_prefix)
-                ce_move = ce_loss_fn(move_logits.view(-1, vocab_size), target_ids.view(-1))
-                ce_move = ce_move.view(target_ids.shape)
+                ce_move = move_ce_fn(move_logits.view(-1, move_vocab_size), move_target_ids.view(-1))
+                ce_move = ce_move.view(move_target_ids.shape)
                 move_loss = (ce_move * move_mask.float()).sum() / (move_mask.sum() + 1e-8)
 
                 # --- 2. WL prediction at move token positions (stm + 1) ---
@@ -280,7 +302,6 @@ def train():
                 if stm_nonzero.shape[0] > 0:
                     wl_pred_batch = stm_nonzero[:, 0]
                     wl_pred_seq = stm_nonzero[:, 1] + 1  # move token = stm + 1
-                    # Clamp to valid range
                     wl_pred_seq = wl_pred_seq.clamp(max=h_prefix.shape[1] - 1)
                     h_at_move = h_prefix[wl_pred_batch, wl_pred_seq]  # (N, E)
                     wl_logits = model.wl_head(h_at_move)  # (N, 100)
@@ -288,12 +309,10 @@ def train():
                     wl_gt_flat = wl_targets[move_mask]    # (N,)
                     wl_loss = soft_bucket_loss(wl_logits, wl_gt_flat, model.wl_bucket_centers, wl_valid_flat)
                 else:
-                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
                     wl_loss = torch.tensor(0.0, device=device)
                     wl_logits = None
 
                 # --- 3. D prediction at WL placeholder positions (stm + 2) ---
-                # Hidden states come from wl_positions, but ground truth D values are stored at d_positions
                 if wl_positions.any():
                     h_at_wl = h_prefix[wl_positions]  # (M, E)
                     d_logits = model.d_head(h_at_wl)   # (M, 100)
@@ -301,14 +320,13 @@ def train():
                     d_gt_flat = d_targets[d_positions]
                     d_loss = soft_bucket_loss(d_logits, d_gt_flat, model.d_bucket_centers, d_valid_flat)
                 else:
-                    # Return zero without requires_grad to avoid memory leak from retaining computation graph
                     d_loss = torch.tensor(0.0, device=device)
                     d_logits = None
 
                 # === Total loss ===
                 total_loss = (
                     move_weight * move_loss +
-                    board_weight * (board_loss + start_pos_loss) +
+                    board_weight * board_loss +
                     wl_weight * wl_loss +
                     d_weight * d_loss
                 )
@@ -334,14 +352,14 @@ def train():
 
             # Metrics
             with torch.no_grad():
-                # Move accuracy
+                # Move accuracy (compare in move sub-vocab space)
                 preds_prefix = torch.argmax(move_logits, dim=-1)
-                move_correct = (preds_prefix == target_ids) & move_mask
+                move_correct = (preds_prefix == move_target_ids) & move_mask
                 move_acc = move_correct.sum() / (move_mask.sum() + 1e-8)
 
-                # Board accuracy (per-token)
+                # Board accuracy (per-token, compare in board sub-vocab space)
                 preds_causal = torch.argmax(board_logits, dim=-1)
-                board_correct = (preds_causal == target_ids) & board_mask
+                board_correct = (preds_causal == board_target_ids) & board_mask
                 board_acc = board_correct.sum() / (board_mask.sum() + 1e-8)
 
                 # Board accuracy (per-block, grouped by block_id)
@@ -392,11 +410,6 @@ def train():
                     board_castling_acc = 0.0
                     board_stm_acc = 0.0
 
-                # start_pos accuracy
-                preds_pre_board = preds_causal[pre_board_mask] if pre_board_mask.any() else torch.tensor([], device=device)
-                targets_pre_board = target_ids[pre_board_mask] if pre_board_mask.any() else torch.tensor([], device=device)
-                start_pos_acc = (preds_pre_board == targets_pre_board).float().mean().item() if preds_pre_board.numel() > 0 else 0.0
-
                 # WL MAE (expected value) and MSE (argmax bucket center)
                 if wl_logits is not None and stm_nonzero.shape[0] > 0:
                     wl_probs = F.softmax(wl_logits.float(), dim=-1)
@@ -445,14 +458,12 @@ def train():
             if step % config["training"]["log_every_n_steps"] == 0:
                 print(f"Step {step}: Loss {total_loss.item():.4f} "
                       f"(Move: {move_loss.item():.4f}, Board: {board_loss.item():.4f}, "
-                      f"StartPos: {start_pos_loss.item():.4f}, "
                       f"WL: {wl_loss.item():.4f}, D: {d_loss.item():.4f})")
 
                 log_dict = {
                     "train/total_loss": total_loss.item(),
                     "train/move_loss": move_loss.item(),
                     "train/board_loss": board_loss.item(),
-                    "train/start_pos_loss": start_pos_loss.item(),
                     "train/wl_loss": wl_loss.item(),
                     "train/d_loss": d_loss.item(),
                     "train/move_acc": move_acc.item(),
@@ -461,7 +472,6 @@ def train():
                     "train/board_square_acc": board_square_acc,
                     "train/board_castling_acc": board_castling_acc,
                     "train/board_stm_acc": board_stm_acc,
-                    "train/start_pos_acc": start_pos_acc,
                     "train/wl_mae": wl_mae.item(),
                     "train/wl_mse": wl_mse.item(),
                     "train/d_mae": d_mae.item(),

@@ -4,7 +4,9 @@ import torch.nn as nn
 import chess
 from torchtune.modules import TransformerSelfAttentionLayer, MultiHeadAttention, FeedForward, RMSNorm, RotaryPositionalEmbeddings
 from src.dataloader.data import fen_to_position_tokens
-from src.models.vocab import token_to_idx, idx_to_token
+from src.models.vocab import (token_to_idx, idx_to_token,
+                              board_vocab_size, move_vocab_size,
+                              board_idx_to_full_idx, move_idx_to_full_idx)
 
 
 def make_wl_buckets(n_buckets=100, sigma=0.4):
@@ -113,14 +115,14 @@ class ChessDecoder(nn.Module):
 
         self.norm = RMSNorm(dim=embed_dim)
 
-        # Board generation head (causal pass) — inherits old policy_head weights
-        self.board_head = nn.Linear(embed_dim, vocab_size)
+        # Board generation head (causal pass) — predicts board sub-vocabulary only
+        self.board_head = nn.Linear(embed_dim, board_vocab_size)
 
-        # Move prediction head (prefix pass) — new, separate
-        self.policy_head = nn.Linear(embed_dim, vocab_size)
+        # Move prediction head (prefix pass) — predicts move sub-vocabulary only
+        self.policy_head = nn.Linear(embed_dim, move_vocab_size)
 
         # Thinking move prediction head (prefix pass, variation moves)
-        self.thinking_policy_head = nn.Linear(embed_dim, vocab_size)
+        self.thinking_policy_head = nn.Linear(embed_dim, move_vocab_size)
 
         # Value heads
         self.wl_head = ValueHead(embed_dim, n_buckets, value_hidden_size)
@@ -194,6 +196,7 @@ class ChessDecoder(nn.Module):
     @torch.no_grad()
     def predict_move(self, fen: str, temperature: float = 1.0, force_legal: bool = True) -> str:
         """Predicts the next move given a FEN string."""
+        from src.models.vocab import move_token_to_idx as _move_tok_to_idx
         self.eval()
         device = next(self.parameters()).device
 
@@ -207,9 +210,9 @@ class ChessDecoder(nn.Module):
         # Forward pass using "prefix" mask to get full bidirectional board context
         h = self(input_ids, mask_type="prefix", block_id=block_id)
 
-        # Policy head at the last position (stm token)
+        # Policy head at the last position (stm token) — outputs move sub-vocab logits
         policy_logits = self.policy_head(h)
-        last_logits = policy_logits[0, -1, :]
+        last_logits = policy_logits[0, -1, :]  # (move_vocab_size,)
 
         if force_legal:
             board = chess.Board(fen)
@@ -224,8 +227,8 @@ class ChessDecoder(nn.Module):
                     elif uci == 'e8g8': uci = 'e8h8'
                     elif uci == 'e8c8': uci = 'e8a8'
 
-                if uci in token_to_idx:
-                    vocab_legal_moves.append(token_to_idx[uci])
+                if uci in _move_tok_to_idx:
+                    vocab_legal_moves.append(_move_tok_to_idx[uci])
 
             if vocab_legal_moves:
                 legal_mask = torch.full_like(last_logits, float('-inf'))
@@ -233,12 +236,14 @@ class ChessDecoder(nn.Module):
                 last_logits = last_logits + legal_mask
 
         if temperature == 0.0:
-            idx = torch.argmax(last_logits).item()
+            move_sub_idx = torch.argmax(last_logits).item()
         else:
             probs = torch.softmax(last_logits / temperature, dim=-1)
-            idx = torch.multinomial(probs, 1).item()
+            move_sub_idx = torch.multinomial(probs, 1).item()
 
-        move_str = idx_to_token[idx]
+        # Map move sub-vocab index back to full vocab
+        full_idx = move_idx_to_full_idx[move_sub_idx]
+        move_str = idx_to_token[full_idx]
 
         replacements = {
             'e1h1': 'e1g1', 'e1a1': 'e1c1',
@@ -258,6 +263,7 @@ class ChessDecoder(nn.Module):
             move_str: UCI move string
             wdl: dict with keys 'win', 'draw', 'loss'
         """
+        from src.models.vocab import move_token_to_idx as _move_tok_to_idx
         self.eval()
         device = next(self.parameters()).device
 
@@ -271,9 +277,9 @@ class ChessDecoder(nn.Module):
         # Forward pass 1: prefix mask for move prediction
         h = self(input_ids, mask_type="prefix", block_id=block_id)
 
-        # Policy head at stm position (last token of board)
+        # Policy head at stm position — outputs move sub-vocab logits
         policy_logits = self.policy_head(h)
-        last_logits = policy_logits[0, -1, :]
+        last_logits = policy_logits[0, -1, :]  # (move_vocab_size,)
 
         if force_legal:
             board = chess.Board(fen)
@@ -288,8 +294,8 @@ class ChessDecoder(nn.Module):
                     elif uci == 'e8g8': uci = 'e8h8'
                     elif uci == 'e8c8': uci = 'e8a8'
 
-                if uci in token_to_idx:
-                    vocab_legal_moves.append(token_to_idx[uci])
+                if uci in _move_tok_to_idx:
+                    vocab_legal_moves.append(_move_tok_to_idx[uci])
 
             if vocab_legal_moves:
                 legal_mask = torch.full_like(last_logits, float('-inf'))
@@ -297,16 +303,18 @@ class ChessDecoder(nn.Module):
                 last_logits = last_logits + legal_mask
 
         if temperature == 0.0:
-            idx = torch.argmax(last_logits).item()
+            move_sub_idx = torch.argmax(last_logits).item()
         else:
             probs = torch.softmax(last_logits / temperature, dim=-1)
-            idx = torch.multinomial(probs, 1).item()
+            move_sub_idx = torch.multinomial(probs, 1).item()
 
-        move_str = idx_to_token[idx]
+        # Map move sub-vocab index back to full vocab
+        full_move_idx = move_idx_to_full_idx[move_sub_idx]
+        move_str = idx_to_token[full_move_idx]
 
         # WL prediction: feed move token, get WL from hidden state at move position
         # Append move token + WL placeholder + D placeholder
-        move_token_id = torch.tensor([[idx]], dtype=torch.long, device=device)
+        move_token_id = torch.tensor([[full_move_idx]], dtype=torch.long, device=device)
         wl_token_id = torch.tensor([[token_to_idx["wl_value"]]], dtype=torch.long, device=device)
         d_token_id = torch.tensor([[token_to_idx["d_value"]]], dtype=torch.long, device=device)
 
@@ -315,15 +323,10 @@ class ChessDecoder(nn.Module):
 
         # Block id: board tokens in block 0, move/wl/d are orphans
         ext_block_id = torch.zeros(1, ext_seq_len, dtype=torch.long, device=device)
-        # Orphan IDs for move, wl, d positions
         ext_block_id[0, seq_len] = 1      # move
         ext_block_id[0, seq_len + 1] = 2  # wl
         ext_block_id[0, seq_len + 2] = 3  # d
 
-        # WL prediction: run with no fourier override to get WL logits at move position
-        # Then get WL bucket center, inject fourier for D prediction
-        # For simplicity, run full forward with fourier injection for both
-        # Step 1: Get WL prediction
         wl_positions = torch.zeros(1, ext_seq_len, dtype=torch.bool, device=device)
         d_positions = torch.zeros(1, ext_seq_len, dtype=torch.bool, device=device)
         wl_positions[0, seq_len + 1] = True
@@ -339,7 +342,6 @@ class ChessDecoder(nn.Module):
         wl_value = self.wl_bucket_centers[wl_idx].item()
 
         # D prediction at WL placeholder position (seq_len + 1)
-        # Need to re-run with fourier(WL) injected at WL position
         wl_fourier_input = torch.zeros(1, ext_seq_len, device=device)
         d_fourier_input = torch.zeros(1, ext_seq_len, device=device)
         wl_fourier_input[0, seq_len + 1] = self.wl_bucket_centers[wl_idx]
@@ -358,7 +360,6 @@ class ChessDecoder(nn.Module):
         d = d_value
         w = (1 - d + wl) / 2
         l = (1 - d - wl) / 2
-        # Clamp to valid range
         w = max(0.0, min(1.0, w))
         l = max(0.0, min(1.0, l))
         d = max(0.0, min(1.0, d))
@@ -389,10 +390,6 @@ class ChessDecoder(nn.Module):
 
         This requires 2n forward passes for n history positions, plus 1 for the final move.
 
-        Caching: Due to causal masking, WL_i and D_i only depend on context up to position i.
-        Previously computed values remain valid as long as the history prefix is unchanged.
-        When truncation occurs (history sliding window), cached values become invalid.
-
         Args:
             initial_fen: The initial board position FEN
             history: List of (board_fen, move_uci) tuples representing the game history.
@@ -402,14 +399,13 @@ class ChessDecoder(nn.Module):
             force_legal: Whether to filter to legal moves only
             max_seq_len: Maximum sequence length (default 2048)
             cached_wl_d: Optional list of (wl, d) tuples for history positions 0..k-1.
-                        If provided, only computes values for positions k..n-1.
-                        The caller is responsible for invalidating the cache on truncation.
 
         Returns:
             Tuple of (move_str, wl_d_values) where:
             - move_str: UCI move string for the predicted move
             - wl_d_values: List of (wl, d) tuples for all n history positions (for caching)
         """
+        from src.models.vocab import move_token_to_idx as _move_tok_to_idx
         self.eval()
         device = next(self.parameters()).device
 
@@ -427,20 +423,18 @@ class ChessDecoder(nn.Module):
         # Build the token sequence
         sequence = []
         block_ids = []
-        move_positions = []  # Positions of move tokens (for WL prediction)
-        wl_positions_list = []  # Positions of wl_value tokens (for D prediction)
-        d_positions_list = []  # Positions of d_value tokens
+        move_positions = []
+        wl_positions_list = []
+        d_positions_list = []
 
         # Initial board (block 0)
         initial_tokens = fen_to_position_tokens(initial_fen)
         sequence.extend(initial_tokens)
         block_ids.extend([0] * len(initial_tokens))
 
-        orphan_id = n + 1  # Start orphan IDs after all board block IDs
+        orphan_id = n + 1
 
-        # Add history: move + wl + d + board for each position
         for i, (board_fen, move_uci) in enumerate(history):
-            # Move token (orphan)
             move_token = self._convert_move_to_vocab(move_uci)
             if move_token not in token_to_idx:
                 raise ValueError(f"Move {move_uci} (converted to {move_token}) not in vocabulary")
@@ -450,35 +444,29 @@ class ChessDecoder(nn.Module):
             block_ids.append(orphan_id)
             orphan_id += 1
 
-            # WL placeholder (orphan)
             wl_positions_list.append(len(sequence))
             sequence.append("wl_value")
             block_ids.append(orphan_id)
             orphan_id += 1
 
-            # D placeholder (orphan)
             d_positions_list.append(len(sequence))
             sequence.append("d_value")
             block_ids.append(orphan_id)
             orphan_id += 1
 
-            # Board after this move (block i+1)
             board_tokens = fen_to_position_tokens(board_fen)
             sequence.extend(board_tokens)
             block_ids.extend([i + 1] * len(board_tokens))
 
-        # Convert to tensor
         input_ids = torch.tensor([token_to_idx[t] for t in sequence], dtype=torch.long).unsqueeze(0).to(device)
         block_id = torch.tensor(block_ids, dtype=torch.long).unsqueeze(0).to(device)
         seq_len = input_ids.shape[1]
 
-        # Initialize fourier injection tensors
         wl_positions_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
         d_positions_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
         wl_fourier_input = torch.zeros(1, seq_len, device=device)
         d_fourier_input = torch.zeros(1, seq_len, device=device)
 
-        # Use cached values if provided
         wl_values_list = []
         d_values_list = []
         num_cached = len(cached_wl_d) if cached_wl_d else 0
@@ -487,46 +475,35 @@ class ChessDecoder(nn.Module):
             for i, (wl_val, d_val) in enumerate(cached_wl_d):
                 wl_values_list.append(wl_val)
                 d_values_list.append(d_val)
-                # Set up fourier injection for cached values
                 wl_positions_mask[0, wl_positions_list[i]] = True
                 wl_fourier_input[0, wl_positions_list[i]] = wl_val
                 d_positions_mask[0, d_positions_list[i]] = True
                 d_fourier_input[0, d_positions_list[i]] = d_val
 
-        # Sequential prediction of remaining WL and D values
-        # For position i: predict WL_i with WL_1..WL_{i-1} and D_1..D_{i-1} injected
-        #                 predict D_i with WL_1..WL_i and D_1..D_{i-1} injected
         for i in range(num_cached, n):
-            # Forward pass to predict WL_i
-            # At this point, WL_1..WL_{i-1} and D_1..D_{i-1} are already injected
             h = self(input_ids, mask_type="prefix", block_id=block_id,
                      wl_values=wl_fourier_input, d_values=d_fourier_input,
                      wl_positions=wl_positions_mask, d_positions=d_positions_mask)
 
-            # Predict WL at move position i
             h_at_move = h[0, move_positions[i], :]
             wl_logits = self.wl_head(h_at_move.unsqueeze(0))
             wl_idx = torch.argmax(wl_logits, dim=-1)
             wl_val = self.wl_bucket_centers[wl_idx].item()
             wl_values_list.append(wl_val)
 
-            # Inject WL_i for D_i prediction
             wl_positions_mask[0, wl_positions_list[i]] = True
             wl_fourier_input[0, wl_positions_list[i]] = wl_val
 
-            # Forward pass to predict D_i (with WL_i now injected)
             h = self(input_ids, mask_type="prefix", block_id=block_id,
                      wl_values=wl_fourier_input, d_values=d_fourier_input,
                      wl_positions=wl_positions_mask, d_positions=d_positions_mask)
 
-            # Predict D at wl position i
             h_at_wl = h[0, wl_positions_list[i], :]
             d_logits = self.d_head(h_at_wl.unsqueeze(0))
             d_idx = torch.argmax(d_logits, dim=-1)
             d_val = self.d_bucket_centers[d_idx].item()
             d_values_list.append(d_val)
 
-            # Inject D_i for subsequent predictions
             d_positions_mask[0, d_positions_list[i]] = True
             d_fourier_input[0, d_positions_list[i]] = d_val
 
@@ -535,11 +512,10 @@ class ChessDecoder(nn.Module):
                        wl_values=wl_fourier_input, d_values=d_fourier_input,
                        wl_positions=wl_positions_mask, d_positions=d_positions_mask)
 
-        # Policy head at last position (stm token of last board)
+        # Policy head at last position — outputs move sub-vocab logits
         policy_logits = self.policy_head(h_final)
-        last_logits = policy_logits[0, -1, :]
+        last_logits = policy_logits[0, -1, :]  # (move_vocab_size,)
 
-        # Get the FEN for the last position (for legal move filtering)
         last_fen = history[-1][0]
 
         if force_legal:
@@ -555,8 +531,8 @@ class ChessDecoder(nn.Module):
                     elif uci == 'e8g8': uci = 'e8h8'
                     elif uci == 'e8c8': uci = 'e8a8'
 
-                if uci in token_to_idx:
-                    vocab_legal_moves.append(token_to_idx[uci])
+                if uci in _move_tok_to_idx:
+                    vocab_legal_moves.append(_move_tok_to_idx[uci])
 
             if vocab_legal_moves:
                 legal_mask = torch.full_like(last_logits, float('-inf'))
@@ -564,14 +540,15 @@ class ChessDecoder(nn.Module):
                 last_logits = last_logits + legal_mask
 
         if temperature == 0.0:
-            idx = torch.argmax(last_logits).item()
+            move_sub_idx = torch.argmax(last_logits).item()
         else:
             probs = torch.softmax(last_logits / temperature, dim=-1)
-            idx = torch.multinomial(probs, 1).item()
+            move_sub_idx = torch.multinomial(probs, 1).item()
 
-        move_str = idx_to_token[idx]
+        # Map move sub-vocab index back to full vocab
+        full_idx = move_idx_to_full_idx[move_sub_idx]
+        move_str = idx_to_token[full_idx]
 
-        # Convert castling moves back to standard UCI
         replacements = {
             'e1h1': 'e1g1', 'e1a1': 'e1c1',
             'e8h8': 'e8g8', 'e8a8': 'e8c8'
@@ -579,7 +556,6 @@ class ChessDecoder(nn.Module):
         if move_str in replacements:
             move_str = replacements[move_str]
 
-        # Return move and computed values for caching
         wl_d_values = list(zip(wl_values_list, d_values_list))
         return move_str, wl_d_values
 

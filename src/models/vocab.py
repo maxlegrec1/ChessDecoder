@@ -232,11 +232,31 @@ castling_tokens = ["".join(c) for r in range(1, 5) for c in itertools.combinatio
 special_tokens = ["start_pos", "end_pos", "white_to_move", "black_to_move", "empty", "pad", "bos", "eos",
                   "wl_value", "d_value", "start_think", "end_think"]
 
-# Build vocabulary: policy moves + piece tokens + special tokens + castling + end_var
-vocab = policy_index + piece_tokens + special_tokens + castling_tokens + ["end_var"]
+# Build vocabulary: policy moves + piece tokens + special tokens + castling + end_var + continuation tokens + generic_move
+vocab = policy_index + piece_tokens + special_tokens + castling_tokens + ["end_var", "continue_var", "new_variation", "generic_move"]
 token_to_idx = {t: i for i, t in enumerate(vocab)}
 idx_to_token = {i: t for i, t in enumerate(vocab)}
 vocab_size = len(vocab)
 
 # Position length: start_pos + 64 board tokens + end_pos + castling + side_to_move = 68
 POSITION_TOKEN_LENGTH = 68
+
+# Board sub-vocabulary: all tokens that board_head can predict (41 tokens)
+board_vocab = (piece_tokens
+               + ["start_pos", "end_pos", "white_to_move", "black_to_move", "empty",
+                  "wl_value", "d_value"]
+               + castling_tokens
+               + ["end_var", "continue_var", "new_variation", "generic_move", "end_think", "start_think"])
+board_vocab_size = len(board_vocab)  # 41
+board_token_to_idx = {t: i for i, t in enumerate(board_vocab)}
+board_idx_to_full_idx = [token_to_idx[t] for t in board_vocab]  # maps board vocab idx -> full vocab idx
+
+# Move sub-vocabulary: all UCI policy moves (1924 tokens)
+move_vocab = policy_index
+move_vocab_size = len(move_vocab)  # 1924
+move_token_to_idx = {t: i for i, t in enumerate(move_vocab)}
+move_idx_to_full_idx = [token_to_idx[t] for t in move_vocab]  # maps move vocab idx -> full vocab idx
+
+# Reverse mappings: full vocab idx -> sub-vocab idx
+full_idx_to_board_idx = {token_to_idx[t]: i for i, t in enumerate(board_vocab)}
+full_idx_to_move_idx = {token_to_idx[t]: i for i, t in enumerate(move_vocab)}
