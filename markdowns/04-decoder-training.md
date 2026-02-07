@@ -8,29 +8,39 @@ The pretraining loop (`src/train/train.py`) uses the two-pass architecture to tr
 
 ## Two-Pass Training Strategy
 
+### Fourier Input Preparation (shared by both passes)
+
+Ground-truth WL/D values are discretized to nearest bucket centers and used as Fourier feature inputs. These are computed once and injected into **both** passes, so the model sees real evaluation context in both causal and prefix attention.
+
+```python
+# Discretize ground-truth values to bucket centers
+wl_fourier_input[wl_positions] = discretize_to_bucket(wl_targets[wl_positions])
+d_fourier_input[d_positions] = discretize_to_bucket(d_targets[d_positions])
+```
+
 ### Pass 1: Causal Masking (Board Generation)
 
 ```python
-h_causal = model(input_ids, mask_type="causal")
+h_causal = model(input_ids, mask_type="causal",
+                 wl_values=wl_fourier_input, d_values=d_fourier_input,
+                 wl_positions=wl_positions, d_positions=d_positions)
 board_logits = model.board_head(h_causal)  # [B, S, 41]
 ```
 
-Standard autoregressive attention. The `board_head` outputs 41 logits (board sub-vocabulary) at every position. Loss is computed only at positions within `board_mask`.
+Standard autoregressive attention with Fourier-encoded WL/D values at placeholder positions. The `board_head` outputs 41 logits (board sub-vocabulary) at every position. Loss is computed only at positions within `board_mask`.
 
 ### Pass 2: Prefix Masking (Move + Value Prediction)
 
 ```python
-h_prefix = model(
-    input_ids, mask_type="prefix", block_id=block_id,
-    wl_values=wl_fourier_input, d_values=d_fourier_input,
-    wl_positions=wl_positions, d_positions=d_positions
-)
+h_prefix = model(input_ids, mask_type="prefix", block_id=block_id,
+                 wl_values=wl_fourier_input, d_values=d_fourier_input,
+                 wl_positions=wl_positions, d_positions=d_positions)
 move_logits = model.policy_head(h_prefix)      # [B, S, 1924]
 wl_logits = model.wl_head(h_at_move)           # [N, 100]
 d_logits = model.d_head(h_at_wl)               # [M, 100]
 ```
 
-Bidirectional within board blocks. Uses Fourier-encoded WL/D values at placeholder positions. During training, ground-truth WL/D values are discretized to nearest bucket centers and injected as Fourier features.
+Bidirectional within board blocks. Same Fourier-encoded WL/D values are injected at placeholder positions.
 
 ---
 
@@ -101,7 +111,7 @@ WL prediction happens at the **move token position** (STM + 1), where the model 
 
 ### 4. D Loss (Soft Bucket Cross-Entropy)
 
-Same soft bucket loss but with 100 uniform buckets in [0, 1]. D prediction happens at the **wl_value placeholder position** (STM + 2), where the Fourier-encoded WL value has been injected.
+Same soft bucket loss but with 100 uniform buckets in [0, 1]. D prediction happens at the **wl_value placeholder position** (STM + 2) during the prefix pass, where the Fourier-encoded WL value has been injected.
 
 **Weight**: 1.0
 

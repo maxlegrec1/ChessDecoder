@@ -189,14 +189,18 @@ Both heads output logits over the same 1924-token move sub-vocabulary. At initia
 
 Same as pretraining, finetuning uses two forward passes per batch:
 
+Fourier inputs are prepared once (ground-truth WL/D discretized to nearest bucket centers) and injected into **both** passes.
+
 ### Pass 1: Causal (Board Generation)
 
 ```python
-h_causal = model(input_ids, mask_type="causal")
+h_causal = model(input_ids, mask_type="causal",
+                 wl_values=wl_fourier_input, d_values=d_fourier_input,
+                 wl_positions=wl_positions, d_positions=d_positions)
 board_logits = model.board_head(h_causal)  # [B, S, 41]
 ```
 
-Standard autoregressive attention. The board_head predicts all board-related tokens including structural tokens (`wl_value`, `d_value`, `start_pos`) and decision tokens (`generic_move`, `continue_var`, `end_var`, `new_variation`, `end_think`).
+Standard autoregressive attention with Fourier-encoded WL/D values at placeholder positions. The board_head predicts all board-related tokens including structural tokens (`wl_value`, `d_value`, `start_pos`) and decision tokens (`generic_move`, `continue_var`, `end_var`, `new_variation`, `end_think`).
 
 ### Pass 2: Prefix (Move + Value Prediction)
 
@@ -211,7 +215,7 @@ wl_logits = model.wl_head(h_at_move)                     # [N, 100]
 d_logits = model.d_head(h_at_wl)                         # [M, 100]
 ```
 
-Bidirectional within board blocks (via `block_id`). Ground-truth WL/D values are discretized to nearest bucket centers and injected as Fourier features at placeholder positions.
+Bidirectional within board blocks (via `block_id`). Same Fourier-encoded WL/D values are injected at placeholder positions.
 
 ### Board Mask Construction
 
