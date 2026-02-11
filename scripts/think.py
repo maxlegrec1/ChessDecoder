@@ -147,8 +147,19 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
                      wl_positions=wl_pos, d_positions=d_pos)
 
     def causal_forward():
+        S = len(token_ids)
         inp = torch.tensor([token_ids], dtype=torch.long, device=device)
-        return model(inp, mask_type="causal")
+        wl_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
+        d_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
+        wl_val = torch.zeros(1, S, device=device)
+        d_val = torch.zeros(1, S, device=device)
+        for p, v in wl_entries:
+            wl_pos[0, p] = True; wl_val[0, p] = v
+        for p, v in d_entries:
+            d_pos[0, p] = True; d_val[0, p] = v
+        return model(inp, mask_type="causal",
+                     wl_values=wl_val, d_values=d_val,
+                     wl_positions=wl_pos, d_positions=d_pos)
 
     def sample_move(head, pos):
         """Sample a move from policy/thinking_policy head. Returns full vocab idx."""
