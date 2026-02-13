@@ -12,6 +12,7 @@ data:
   max_depth: 5
   tau_base: 0.3
   tau_alpha: 1.0
+  train_split: 0.8
 
 model:
   embed_dim: 1024
@@ -33,9 +34,10 @@ training:
   device: "cuda"
   use_amp: true
   checkpoint_dir: "checkpoints/"
-  pretrain_checkpoint: "checkpoints/run-1_20260128_231050/checkpoint_epoch_13.pt"
+  pretrain_checkpoint: "checkpoint_epoch_16.pt"
   warmup_steps: 500
   save_every_n_steps: 10000
+  val_batches: 100
 
 loss:
   final_move_weight: 5.0

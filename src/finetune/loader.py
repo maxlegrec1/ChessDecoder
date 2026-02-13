@@ -23,8 +23,8 @@ from src.finetune.data import variation_to_token_ids
 class FinetuneIterableDataset(IterableDataset):
     def __init__(
         self,
-        pretrain_parquet_dir,
-        variation_parquet_dir,
+        pretrain_parquet_dir=None,
+        variation_parquet_dir=None,
         max_seq_len=1024,
         variation_ratio=0.2,
         max_variations=3,
@@ -34,9 +34,9 @@ class FinetuneIterableDataset(IterableDataset):
         skip_board_prob=0.0,
         tau_base=0.3,
         tau_alpha=1.0,
+        pretrain_files=None,
+        variation_files=None,
     ):
-        self.pretrain_parquet_dir = pretrain_parquet_dir
-        self.variation_parquet_dir = variation_parquet_dir
         self.max_seq_len = max_seq_len
         self.variation_ratio = variation_ratio
         self.max_variations = max_variations
@@ -48,13 +48,24 @@ class FinetuneIterableDataset(IterableDataset):
         self.tau_alpha = tau_alpha
         self.pad_id = token_to_idx["pad"]
 
-        self.pretrain_files = sorted(glob.glob(os.path.join(pretrain_parquet_dir, "*.parquet")))
-        self.variation_files = sorted(glob.glob(os.path.join(variation_parquet_dir, "*.parquet")))
+        if pretrain_files is not None:
+            self.pretrain_files = pretrain_files
+        elif pretrain_parquet_dir is not None:
+            self.pretrain_files = sorted(glob.glob(os.path.join(pretrain_parquet_dir, "*.parquet")))
+        else:
+            self.pretrain_files = []
+
+        if variation_files is not None:
+            self.variation_files = variation_files
+        elif variation_parquet_dir is not None:
+            self.variation_files = sorted(glob.glob(os.path.join(variation_parquet_dir, "*.parquet")))
+        else:
+            self.variation_files = []
 
         if not self.pretrain_files:
-            print(f"Warning: No pretrain parquet files found in {pretrain_parquet_dir}")
+            print(f"Warning: No pretrain parquet files")
         if not self.variation_files:
-            print(f"Warning: No variation parquet files found in {variation_parquet_dir}")
+            print(f"Warning: No variation parquet files")
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -66,34 +77,39 @@ class FinetuneIterableDataset(IterableDataset):
         else:
             nw = worker_info.num_workers
             wid = worker_info.id
+            # Shard pretrain files across workers (large dataset, one pass per epoch)
             per_w = int(math.ceil(len(self.pretrain_files) / nw))
             pretrain_files = self.pretrain_files[wid * per_w: min((wid + 1) * per_w, len(self.pretrain_files))]
-            per_w_v = int(math.ceil(len(self.variation_files) / nw))
-            variation_files = self.variation_files[wid * per_w_v: min((wid + 1) * per_w_v, len(self.variation_files))]
+            # Don't shard variation files — each worker gets all of them.
+            # Variation data is small and recycled many times per epoch anyway.
+            # Sharding with fewer files than workers leaves some workers with 0 files,
+            # causing their variation_epoch counter to spike meaninglessly.
+            variation_files = list(self.variation_files)
 
         pretrain_iter = self._pretrain_iter(pretrain_files)
         variation_iter = self._variation_iter(variation_files)
-        variation_epoch = 0
+        pretrain_epoch = 0
 
         while True:
             if random.random() < self.variation_ratio:
                 sample = next(variation_iter, None)
                 if sample is None:
-                    # Restart variation iterator
-                    variation_epoch += 1
-                    variation_iter = self._variation_iter(variation_files)
-                    sample = next(variation_iter, None)
-                    if sample is None:
-                        # No variation data at all, fall through to pretrain
-                        sample = next(pretrain_iter, None)
-                        if sample is None:
-                            return
-                sample["variation_epoch"] = torch.tensor(variation_epoch, dtype=torch.long)
+                    # Variation data exhausted — epoch is over
+                    return
+                sample["pretrain_epoch"] = torch.tensor(pretrain_epoch, dtype=torch.long)
             else:
                 sample = next(pretrain_iter, None)
                 if sample is None:
-                    return
-                sample["variation_epoch"] = torch.tensor(variation_epoch, dtype=torch.long)
+                    # Restart pretrain iterator
+                    pretrain_epoch += 1
+                    pretrain_iter = self._pretrain_iter(pretrain_files)
+                    sample = next(pretrain_iter, None)
+                    if sample is None:
+                        # No pretrain data at all, fall through to variation
+                        sample = next(variation_iter, None)
+                        if sample is None:
+                            return
+                sample["pretrain_epoch"] = torch.tensor(pretrain_epoch, dtype=torch.long)
 
             yield sample
 
@@ -429,3 +445,69 @@ def get_finetune_dataloader(
         tau_alpha=tau_alpha,
     )
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
+
+
+def get_finetune_train_val_dataloaders(
+    pretrain_parquet_dir,
+    variation_parquet_dir,
+    train_split=0.8,
+    batch_size=16,
+    num_workers=0,
+    max_seq_len=1024,
+    variation_ratio=0.2,
+    max_variations=3,
+    max_depth=5,
+    skip_board_prob=0.0,
+    tau_base=0.3,
+    tau_alpha=1.0,
+):
+    """Create train and validation dataloaders by splitting files."""
+    all_pretrain = sorted(glob.glob(os.path.join(pretrain_parquet_dir, "*.parquet")))
+    all_variation = sorted(glob.glob(os.path.join(variation_parquet_dir, "*.parquet")))
+
+    # Split by file count
+    n_pt = int(len(all_pretrain) * train_split)
+    n_vt = int(len(all_variation) * train_split)
+    # Ensure at least 1 file in val if possible
+    if n_pt == len(all_pretrain) and len(all_pretrain) > 1:
+        n_pt -= 1
+    if n_vt == len(all_variation) and len(all_variation) > 1:
+        n_vt -= 1
+
+    train_pretrain = all_pretrain[:n_pt]
+    val_pretrain = all_pretrain[n_pt:]
+    train_variation = all_variation[:n_vt]
+    val_variation = all_variation[n_vt:]
+
+    print(f"Train/val split: pretrain {len(train_pretrain)}/{len(val_pretrain)} files, "
+          f"variation {len(train_variation)}/{len(val_variation)} files")
+
+    common_kwargs = dict(
+        max_seq_len=max_seq_len,
+        variation_ratio=variation_ratio,
+        max_variations=max_variations,
+        max_depth=max_depth,
+        skip_board_prob=skip_board_prob,
+        tau_base=tau_base,
+        tau_alpha=tau_alpha,
+    )
+
+    train_dataset = FinetuneIterableDataset(
+        pretrain_files=train_pretrain,
+        variation_files=train_variation,
+        shuffle_files=True,
+        shuffle_games=True,
+        **common_kwargs,
+    )
+    val_dataset = FinetuneIterableDataset(
+        pretrain_files=val_pretrain,
+        variation_files=val_variation,
+        shuffle_files=False,
+        shuffle_games=False,
+        **common_kwargs,
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=max(1, num_workers // 2))
+
+    return train_loader, val_loader

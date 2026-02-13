@@ -23,7 +23,7 @@ from tqdm import tqdm
 from src.models.model import ChessDecoder
 from src.models.vocab import (vocab_size, token_to_idx, board_vocab_size, move_vocab_size,
                               board_idx_to_full_idx, move_idx_to_full_idx, board_token_to_idx)
-from src.finetune.loader import get_finetune_dataloader
+from src.finetune.loader import get_finetune_dataloader, get_finetune_train_val_dataloaders
 
 
 def load_config(config_path):
@@ -118,6 +118,173 @@ def load_pretrained_checkpoint(model, checkpoint_path, device):
     return checkpoint
 
 
+def compute_accuracies(board_target_ids, board_logits, board_mask, preds_board,
+                        move_target_ids, move_mask, thinking_move_mask,
+                        final_logits, think_logits,
+                        continue_var_mask, new_variation_mask):
+    """Compute accuracy metrics from a batch. Returns dict of accuracy values."""
+    accs = {}
+
+    # Board accuracy
+    board_correct = (preds_board == board_target_ids) & board_mask
+    accs["board_acc"] = board_correct.sum().item() / (board_mask.sum().item() + 1e-8)
+
+    # Final move accuracy
+    preds_final = torch.argmax(final_logits, dim=-1)
+    final_correct = (preds_final == move_target_ids) & move_mask
+    accs["final_move_acc"] = final_correct.sum().item() / (move_mask.sum().item() + 1e-8)
+
+    # Thinking move accuracy
+    preds_think = torch.argmax(think_logits, dim=-1)
+    think_correct = (preds_think == move_target_ids) & thinking_move_mask
+    accs["thinking_move_acc"] = think_correct.sum().item() / (thinking_move_mask.sum().item() + 1e-8)
+
+    # Structural token accuracies
+    end_var_board_idx = board_token_to_idx["end_var"]
+    end_think_board_idx = board_token_to_idx["end_think"]
+    continue_var_board_idx = board_token_to_idx["continue_var"]
+    new_variation_board_idx = board_token_to_idx["new_variation"]
+
+    end_var_target_mask = (board_target_ids == end_var_board_idx) & board_mask
+    end_think_target_mask = (board_target_ids == end_think_board_idx) & board_mask
+
+    accs["end_var_acc"] = (preds_board[end_var_target_mask] == end_var_board_idx).float().mean().item() if end_var_target_mask.any() else 0.0
+    accs["end_think_acc"] = (preds_board[end_think_target_mask] == end_think_board_idx).float().mean().item() if end_think_target_mask.any() else 0.0
+    accs["continue_var_acc"] = (preds_board[continue_var_mask] == continue_var_board_idx).float().mean().item() if continue_var_mask.any() else 0.0
+    accs["new_variation_acc"] = (preds_board[new_variation_mask] == new_variation_board_idx).float().mean().item() if new_variation_mask.any() else 0.0
+
+    return accs
+
+
+def validate(model, val_dataloader, val_batches, device, use_amp, config):
+    """Run validation and return averaged accuracy metrics."""
+    model.eval()
+    IGNORE_INDEX = -100
+
+    # Accumulate counts for weighted averaging
+    counts = {}  # metric_name -> (correct_sum, total_sum)
+    metric_keys = ["board_acc", "final_move_acc", "thinking_move_acc",
+                   "end_var_acc", "end_think_acc", "continue_var_acc", "new_variation_acc"]
+    for k in metric_keys:
+        counts[k] = [0.0, 0.0]
+
+    n_batches = 0
+    with torch.no_grad():
+        for batch in val_dataloader:
+            if n_batches >= val_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            board_target_ids = batch["board_target_ids"].to(device)
+            move_target_ids = batch["move_target_ids"].to(device)
+            move_mask = batch["move_mask"].to(device)
+            thinking_move_mask = batch["thinking_move_mask"].to(device)
+            wl_positions = batch["wl_positions"].to(device)
+            d_positions = batch["d_positions"].to(device)
+            wl_targets = batch["wl_targets"].to(device)
+            d_targets = batch["d_targets"].to(device)
+            block_id = batch["block_id"].to(device)
+            continue_var_mask = batch["continue_var_mask"].to(device)
+            new_variation_mask = batch["new_variation_mask"].to(device)
+
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                # Fourier inputs
+                wl_fourier_input = torch.zeros_like(wl_targets)
+                d_fourier_input = torch.zeros_like(d_targets)
+                if wl_positions.any():
+                    wl_fourier_input[wl_positions] = model.discretize_to_bucket(
+                        wl_targets[wl_positions], model.wl_bucket_centers)
+                if d_positions.any():
+                    d_fourier_input[d_positions] = model.discretize_to_bucket(
+                        d_targets[d_positions], model.d_bucket_centers)
+
+                # Pass 1: Causal
+                h_causal = model(
+                    input_ids, mask_type="causal",
+                    wl_values=wl_fourier_input, d_values=d_fourier_input,
+                    wl_positions=wl_positions, d_positions=d_positions,
+                )
+                board_logits = model.board_head(h_causal)
+
+                # Board mask
+                board_mask = board_target_ids != IGNORE_INDEX
+                any_move = move_mask | thinking_move_mask
+                first_move_idx = any_move.int().argmax(dim=1)
+                has_moves = any_move.any(dim=1)
+                first_move_idx[~has_moves] = any_move.size(1)
+                indices = torch.arange(any_move.size(1), device=device).unsqueeze(0)
+                pre_first_move_mask = indices < first_move_idx.unsqueeze(1)
+                board_mask = board_mask & (~pre_first_move_mask)
+
+                preds_board = torch.argmax(board_logits, dim=-1)
+
+                # Pass 2: Prefix
+                h_prefix = model(
+                    input_ids, mask_type="prefix", block_id=block_id,
+                    wl_values=wl_fourier_input, d_values=d_fourier_input,
+                    wl_positions=wl_positions, d_positions=d_positions,
+                )
+                final_logits = model.policy_head(h_prefix)
+                think_logits = model.thinking_policy_head(h_prefix)
+
+            # Compute accuracies
+            accs = compute_accuracies(
+                board_target_ids, board_logits, board_mask, preds_board,
+                move_target_ids, move_mask, thinking_move_mask,
+                final_logits, think_logits,
+                continue_var_mask, new_variation_mask,
+            )
+
+            # Accumulate with counts for proper weighted averaging
+            counts["board_acc"][0] += (preds_board == board_target_ids)[board_mask].float().sum().item()
+            counts["board_acc"][1] += board_mask.sum().item()
+
+            preds_final = torch.argmax(final_logits, dim=-1)
+            counts["final_move_acc"][0] += ((preds_final == move_target_ids) & move_mask).sum().item()
+            counts["final_move_acc"][1] += move_mask.sum().item()
+
+            preds_think = torch.argmax(think_logits, dim=-1)
+            counts["thinking_move_acc"][0] += ((preds_think == move_target_ids) & thinking_move_mask).sum().item()
+            counts["thinking_move_acc"][1] += thinking_move_mask.sum().item()
+
+            end_var_board_idx = board_token_to_idx["end_var"]
+            end_think_board_idx = board_token_to_idx["end_think"]
+            continue_var_board_idx = board_token_to_idx["continue_var"]
+            new_variation_board_idx = board_token_to_idx["new_variation"]
+
+            ev_mask = (board_target_ids == end_var_board_idx) & board_mask
+            counts["end_var_acc"][0] += (preds_board[ev_mask] == end_var_board_idx).sum().item() if ev_mask.any() else 0
+            counts["end_var_acc"][1] += ev_mask.sum().item()
+
+            et_mask = (board_target_ids == end_think_board_idx) & board_mask
+            counts["end_think_acc"][0] += (preds_board[et_mask] == end_think_board_idx).sum().item() if et_mask.any() else 0
+            counts["end_think_acc"][1] += et_mask.sum().item()
+
+            counts["continue_var_acc"][0] += (preds_board[continue_var_mask] == continue_var_board_idx).sum().item() if continue_var_mask.any() else 0
+            counts["continue_var_acc"][1] += continue_var_mask.sum().item()
+
+            counts["new_variation_acc"][0] += (preds_board[new_variation_mask] == new_variation_board_idx).sum().item() if new_variation_mask.any() else 0
+            counts["new_variation_acc"][1] += new_variation_mask.sum().item()
+
+            n_batches += 1
+
+    model.train()
+
+    # Compute final averaged metrics
+    results = {}
+    for k in metric_keys:
+        correct, total = counts[k]
+        results[k] = correct / (total + 1e-8)
+
+    print(f"  Validation ({n_batches} batches): "
+          f"board={results['board_acc']:.4f}, final_move={results['final_move_acc']:.4f}, "
+          f"think_move={results['thinking_move_acc']:.4f}, "
+          f"end_var={results['end_var_acc']:.4f}, continue_var={results['continue_var_acc']:.4f}, "
+          f"end_think={results['end_think_acc']:.4f}, new_var={results['new_variation_acc']:.4f}")
+
+    return results
+
+
 def train():
     config = load_config("src/finetune/config.yaml")
 
@@ -163,10 +330,12 @@ def train():
         step = ft_checkpoint["step"]
         print(f"Resumed from epoch {start_epoch}, step {step}")
 
-    # Dataloader
-    dataloader = get_finetune_dataloader(
+    # Dataloaders (train/val split)
+    val_batches = config["training"].get("val_batches", 100)
+    dataloader, val_dataloader = get_finetune_train_val_dataloaders(
         pretrain_parquet_dir=config["data"]["pretrain_parquet_dir"],
         variation_parquet_dir=config["data"]["variation_parquet_dir"],
+        train_split=config["data"].get("train_split", 0.8),
         batch_size=config["data"]["batch_size"],
         num_workers=config["data"].get("num_workers", 0),
         max_seq_len=config["data"]["max_seq_len"],
@@ -261,7 +430,7 @@ def train():
             wdl_valid = batch["wdl_valid"].to(device)
             block_id = batch["block_id"].to(device)
             first_is_not_best = batch["first_is_not_best"].to(device)
-            variation_epoch = batch["variation_epoch"].to(device)
+            pretrain_epoch = batch["pretrain_epoch"].to(device)
             continue_var_mask = batch["continue_var_mask"].to(device)
             new_variation_mask = batch["new_variation_mask"].to(device)
 
@@ -518,7 +687,12 @@ def train():
                     "train/batch_normal_samples": batch_has_normal,
                     "train/final_move_acc_reordered": final_move_acc_reordered.item(),
                     "train/n_reordered_samples": n_reordered,
-                    "train/variation_epoch": variation_epoch.max().item(),
+                    "train/pretrain_epoch": pretrain_epoch.max().item(),
+                    # Structural token accuracies (dedicated section)
+                    "accuracies/train_end_var_acc": end_var_acc,
+                    "accuracies/train_continue_var_acc": continue_var_acc,
+                    "accuracies/train_end_think_acc": end_think_acc,
+                    "accuracies/train_new_variation_acc": new_variation_acc,
                 })
 
             step += 1
@@ -536,6 +710,21 @@ def train():
                 checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_step_{step}.pt")
                 torch.save(ckpt, checkpoint_path)
                 print(f"Saved checkpoint to {checkpoint_path}")
+
+        # Validation at end of epoch
+        print(f"Running validation for epoch {epoch + 1}...")
+        val_results = validate(model, val_dataloader, val_batches, device, use_amp, config)
+        wandb.log({
+            "accuracies/val_end_var_acc": val_results["end_var_acc"],
+            "accuracies/val_continue_var_acc": val_results["continue_var_acc"],
+            "accuracies/val_end_think_acc": val_results["end_think_acc"],
+            "accuracies/val_new_variation_acc": val_results["new_variation_acc"],
+            "accuracies/val_board_acc": val_results["board_acc"],
+            "accuracies/val_final_move_acc": val_results["final_move_acc"],
+            "accuracies/val_thinking_move_acc": val_results["thinking_move_acc"],
+            "train/epoch": epoch,
+            "train/step": step,
+        })
 
         # Save checkpoint at end of epoch
         ckpt = {
