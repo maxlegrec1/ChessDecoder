@@ -1,4 +1,5 @@
 import os
+import math
 import yaml
 import torch
 import torch.nn as nn
@@ -16,6 +17,16 @@ from src.dataloader.loader import get_dataloader
 def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.0):
+    """Linear warmup followed by cosine decay to min_lr_ratio * base_lr."""
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return current_step / max(1, warmup_steps)
+        progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
@@ -97,6 +108,15 @@ def train():
     use_amp = config["training"].get("use_amp", False)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     print(f"Mixed precision training: {'enabled' if use_amp else 'disabled'}")
+
+    # Learning rate scheduler
+    scheduler = None
+    if config["training"].get("use_scheduler", False):
+        warmup_steps = config["training"].get("warmup_steps", 1000)
+        total_steps = config["training"].get("total_steps", 100000)
+        min_lr_ratio = config["training"].get("min_lr_ratio", 0.0)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio)
+        print(f"LR scheduler: cosine with {warmup_steps} warmup steps, {total_steps} total steps")
 
     # Resume from checkpoint if specified
     if resume_from:
@@ -205,6 +225,8 @@ def train():
                     old_state["exp_avg_sq"] = torch.zeros_like(param)
         optimizer.load_state_dict(opt_state)
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = checkpoint["epoch"]
         step = checkpoint["step"]
 
@@ -346,6 +368,8 @@ def train():
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                if scheduler is not None:
+                    scheduler.step()
 
             # Detach tensors used for metrics to prevent memory leak from retained computation graph
             board_logits = board_logits.detach()
@@ -483,7 +507,8 @@ def train():
                     "train/d_mse": d_mse.item(),
                     "train/epoch": epoch,
                     "train/step": step,
-                    "train/grad_step": step / config["training"].get("gradient_accumulation_steps", 1)
+                    "train/grad_step": step / config["training"].get("gradient_accumulation_steps", 1),
+                    "train/lr": optimizer.param_groups[0]["lr"]
                 }
 
                 for i in range(max_track_moves):
@@ -509,6 +534,8 @@ def train():
                 "scaler_state_dict": scaler.state_dict(),
                 "config": config,
             }
+            if scheduler is not None:
+                checkpoint["scheduler_state_dict"] = scheduler.state_dict()
             checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
             torch.save(checkpoint, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")

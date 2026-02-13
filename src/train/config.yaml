@@ -28,6 +28,10 @@ training:
   save_every_n_steps: 1000
   device: "cuda"
   use_amp: true  # Mixed precision training (float16)
+  use_scheduler: true  # Cosine LR schedule with linear warmup
+  warmup_steps: 1000  # Linear warmup optimizer steps
+  total_steps: 100000  # Total optimizer steps for cosine decay
+  min_lr_ratio: 0.0  # Minimum LR as fraction of initial LR
   checkpoint_dir: "checkpoints/"
   max_track_nth_moves: 20
   resume_from: "checkpoints/run-1_20260206_233243/"
