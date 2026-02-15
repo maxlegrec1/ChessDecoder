@@ -499,19 +499,33 @@ def train():
 
             step += 1
 
-        # Save checkpoint
-        if (epoch + 1) % 1 == 0:
-            checkpoint = {
-                "epoch": epoch + 1,
-                "step": step,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "config": config,
-            }
-            checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
-            torch.save(checkpoint, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
+            # Save checkpoint every N steps
+            save_every = config["training"].get("save_every_n_steps")
+            if save_every and step % save_every == 0:
+                checkpoint = {
+                    "epoch": epoch,
+                    "step": step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "config": config,
+                }
+                checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_{step}.pt")
+                torch.save(checkpoint, checkpoint_path)
+                print(f"Saved checkpoint to {checkpoint_path}")
+
+        # Save checkpoint at end of epoch
+        checkpoint = {
+            "epoch": epoch + 1,
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "config": config,
+        }
+        checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}")
 
 if __name__ == "__main__":
     train()
