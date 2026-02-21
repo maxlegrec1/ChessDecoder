@@ -55,8 +55,10 @@ def train():
 
     # Check if resuming from checkpoint
     resume_from = config["training"].get("resume_from")
+    seed = config["training"].get("seed", 42)
     start_epoch = 0
     step = 0
+    resume_epoch_step = 0  # batches to skip in the first epoch on resume
 
     # Model
     model = ChessDecoder(
@@ -78,7 +80,8 @@ def train():
         batch_size=config["data"]["batch_size"],
         num_workers=config["data"].get("num_workers", 0),
         max_seq_len=config["data"]["max_seq_len"],
-        skip_board_prob=config["data"].get("skip_board_prob", 0.0)
+        skip_board_prob=config["data"].get("skip_board_prob", 0.0),
+        seed=seed,
     )
 
     # Optimizer
@@ -207,8 +210,9 @@ def train():
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_epoch = checkpoint["epoch"]
         step = checkpoint["step"]
+        resume_epoch_step = checkpoint.get("epoch_step", 0)
 
-        print(f"Resumed from epoch {start_epoch}, step {step}")
+        print(f"Resumed from epoch {start_epoch}, step {step}, epoch_step {resume_epoch_step}")
 
         run_checkpoint_dir = resume_from
     else:
@@ -221,13 +225,25 @@ def train():
 
     print(f"Checkpoints will be saved to: {run_checkpoint_dir}")
 
-    # Initialize wandb
+    # Initialize wandb (resume existing run if ID file exists in checkpoint dir)
+    wandb_id_path = os.path.join(run_checkpoint_dir, "wandb_run_id.txt")
+    wandb_run_id = None
+    if os.path.exists(wandb_id_path):
+        wandb_run_id = open(wandb_id_path).read().strip()
+        print(f"Resuming wandb run: {wandb_run_id}")
+
     wandb.init(
         project=config["project_name"],
         name=config["run_name"],
         config=config,
-        resume="allow" if resume_from else None,
+        id=wandb_run_id,
+        resume="must" if wandb_run_id else None,
     )
+
+    if not wandb_run_id:
+        with open(wandb_id_path, "w") as f:
+            f.write(wandb.run.id)
+        print(f"Saved wandb run ID to {wandb_id_path}")
 
     model.train()
 
@@ -240,7 +256,24 @@ def train():
     for epoch in range(start_epoch, config["training"]["num_epochs"]):
         print(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
 
+        # Set epoch on dataset for deterministic seeding (workers pick this up)
+        dataloader.dataset.epoch = epoch
+
+        # On resume, fast-forward the dataloader to where we left off
+        skip_batches = resume_epoch_step
+        resume_epoch_step = 0  # only skip on the first epoch after resume
+        if skip_batches > 0:
+            print(f"Fast-forwarding dataloader by {skip_batches} batches...")
+
+        epoch_step = 0
+
         for batch in tqdm(dataloader):
+            epoch_step += 1
+            if epoch_step <= skip_batches:
+                if epoch_step == skip_batches:
+                    print(f"Fast-forwarded {skip_batches} batches, resuming training...")
+                continue
+
             input_ids = batch["input_ids"].to(device)
             board_target_ids = batch["board_target_ids"].to(device)
             move_target_ids = batch["move_target_ids"].to(device)
@@ -505,6 +538,7 @@ def train():
                 checkpoint = {
                     "epoch": epoch,
                     "step": step,
+                    "epoch_step": epoch_step,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scaler_state_dict": scaler.state_dict(),
@@ -514,10 +548,11 @@ def train():
                 torch.save(checkpoint, checkpoint_path)
                 print(f"Saved checkpoint to {checkpoint_path}")
 
-        # Save checkpoint at end of epoch
+        # Save checkpoint at end of epoch (epoch_step=0 so next epoch starts fresh)
         checkpoint = {
             "epoch": epoch + 1,
             "step": step,
+            "epoch_step": 0,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),

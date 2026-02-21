@@ -11,13 +11,15 @@ from src.models.vocab import (token_to_idx, full_idx_to_board_idx, full_idx_to_m
                               board_token_to_idx)
 
 class ChessIterableDataset(IterableDataset):
-    def __init__(self, parquet_dir, max_seq_len=2048, shuffle_files=True, shuffle_games=True, skip_board_prob=0.0):
+    def __init__(self, parquet_dir, max_seq_len=2048, shuffle_files=True, shuffle_games=True, skip_board_prob=0.0, seed=42):
         self.parquet_dir = parquet_dir
         self.max_seq_len = max_seq_len
         self.shuffle_files = shuffle_files
         self.shuffle_games = shuffle_games
         self.skip_board_prob = skip_board_prob
         self.pad_id = token_to_idx["pad"]
+        self.seed = seed
+        self.epoch = 0  # set externally before each epoch for deterministic resumption
 
         # Find all parquet files
         self.files = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
@@ -26,6 +28,12 @@ class ChessIterableDataset(IterableDataset):
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+
+        # Deterministic seeding: same seed+epoch+worker → same shuffle order
+        epoch_seed = self.seed + self.epoch * 100003 + worker_id * 997
+        random.seed(epoch_seed)
+        np.random.seed(epoch_seed % (2**32))
 
         # Determine which files this worker should read
         if worker_info is None:  # Single-process data loading
@@ -33,7 +41,6 @@ class ChessIterableDataset(IterableDataset):
         else:
             # Split files among workers
             per_worker = int(math.ceil(len(self.files) / float(worker_info.num_workers)))
-            worker_id = worker_info.id
             iter_start = worker_id * per_worker
             iter_end = min(iter_start + per_worker, len(self.files))
             files_to_read = self.files[iter_start:iter_end]
@@ -175,12 +182,13 @@ class ChessIterableDataset(IterableDataset):
                 print(f"Error reading file {file_path}: {e}")
                 continue
 
-def get_dataloader(parquet_dir, batch_size=16, num_workers=0, max_seq_len=2048, skip_board_prob=0.0):
+def get_dataloader(parquet_dir, batch_size=16, num_workers=0, max_seq_len=2048, skip_board_prob=0.0, seed=42):
     dataset = ChessIterableDataset(
         parquet_dir,
         shuffle_files=True,
         shuffle_games=True,
         max_seq_len=max_seq_len,
-        skip_board_prob=skip_board_prob
+        skip_board_prob=skip_board_prob,
+        seed=seed,
     )
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
