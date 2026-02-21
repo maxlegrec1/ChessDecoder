@@ -7,7 +7,7 @@ data:
   batch_size: 16
   num_workers: 4
   max_seq_len: 1024
-  variation_ratio: 0.2
+  variation_ratio: 0.8
   max_variations: 3
   max_depth: 5
   tau_base: 0.3
@@ -34,7 +34,7 @@ training:
   device: "cuda"
   use_amp: true
   checkpoint_dir: "checkpoints/"
-  pretrain_checkpoint: "checkpoint_epoch_16.pt"
+  pretrain_checkpoint: "checkpoints/finetune-thinking-v1_20260212_221042/checkpoint_step_280000.pt"
   warmup_steps: 500
   save_every_n_steps: 10000
   val_batches: 100

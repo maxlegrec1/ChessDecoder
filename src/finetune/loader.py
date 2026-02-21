@@ -201,7 +201,7 @@ class FinetuneIterableDataset(IterableDataset):
                         continue
 
                     try:
-                        ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best = \
+                        ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best, max_depth_end_var_positions, max_var_end_think_position = \
                             variation_to_token_ids(
                                 row,
                                 max_variations=self.max_variations,
@@ -218,7 +218,7 @@ class FinetuneIterableDataset(IterableDataset):
                         # Try with fewer variations/depth
                         for reduced_vars in range(self.max_variations - 1, 0, -1):
                             for reduced_depth in range(self.max_depth, 0, -1):
-                                ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best = \
+                                ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best, max_depth_end_var_positions, max_var_end_think_position = \
                                     variation_to_token_ids(
                                         row, max_variations=reduced_vars, max_depth=reduced_depth,
                                         tau_base=self.tau_base, tau_alpha=self.tau_alpha,
@@ -237,6 +237,8 @@ class FinetuneIterableDataset(IterableDataset):
                     yield self._build_variation_tensors(
                         ids, thinking_move_data, final_move_data, value_data, block_boundaries,
                         first_is_not_best=first_is_not_best,
+                        max_depth_end_var_positions=max_depth_end_var_positions,
+                        max_var_end_think_position=max_var_end_think_position,
                     )
 
             except Exception as e:
@@ -311,9 +313,11 @@ class FinetuneIterableDataset(IterableDataset):
             "first_is_not_best": torch.tensor(False, dtype=torch.bool),
             "continue_var_mask": torch.zeros((self.max_seq_len,), dtype=torch.bool),
             "new_variation_mask": torch.zeros((self.max_seq_len,), dtype=torch.bool),
+            "end_var_max_depth_mask": torch.zeros((self.max_seq_len,), dtype=torch.bool),
+            "end_think_max_var_mask": torch.zeros((self.max_seq_len,), dtype=torch.bool),
         }
 
-    def _build_variation_tensors(self, ids, thinking_move_data, final_move_data, value_data, block_boundaries, first_is_not_best=False):
+    def _build_variation_tensors(self, ids, thinking_move_data, final_move_data, value_data, block_boundaries, first_is_not_best=False, max_depth_end_var_positions=None, max_var_end_think_position=None):
         """Build tensor dict for a thinking variation sample."""
         seq_len = len(ids)
         IGNORE_INDEX = -100
@@ -400,6 +404,18 @@ class FinetuneIterableDataset(IterableDataset):
         for block_num, (b_start, b_end) in enumerate(block_boundaries):
             block_id[b_start:b_end] = block_num
 
+        # Max depth / max variation masks
+        end_var_max_depth_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
+        end_think_max_var_mask = torch.zeros((self.max_seq_len,), dtype=torch.bool)
+
+        if max_depth_end_var_positions:
+            for pos in max_depth_end_var_positions:
+                if 0 <= pos < self.max_seq_len:
+                    end_var_max_depth_mask[pos] = True
+
+        if max_var_end_think_position is not None and 0 <= max_var_end_think_position < self.max_seq_len:
+            end_think_max_var_mask[max_var_end_think_position] = True
+
         return {
             "input_ids": input_ids,
             "board_target_ids": board_target_ids,
@@ -415,6 +431,8 @@ class FinetuneIterableDataset(IterableDataset):
             "first_is_not_best": torch.tensor(first_is_not_best, dtype=torch.bool),
             "continue_var_mask": continue_var_mask,
             "new_variation_mask": new_variation_mask,
+            "end_var_max_depth_mask": end_var_max_depth_mask,
+            "end_think_max_var_mask": end_think_max_var_mask,
         }
 
 

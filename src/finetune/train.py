@@ -164,7 +164,8 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
     # Accumulate counts for weighted averaging
     counts = {}  # metric_name -> (correct_sum, total_sum)
     metric_keys = ["board_acc", "final_move_acc", "thinking_move_acc",
-                   "end_var_acc", "end_think_acc", "continue_var_acc", "new_variation_acc"]
+                   "end_var_acc", "end_think_acc", "continue_var_acc", "new_variation_acc",
+                   "end_var_max_depth_acc", "end_think_max_var_acc"]
     for k in metric_keys:
         counts[k] = [0.0, 0.0]
 
@@ -186,6 +187,8 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
             block_id = batch["block_id"].to(device)
             continue_var_mask = batch["continue_var_mask"].to(device)
             new_variation_mask = batch["new_variation_mask"].to(device)
+            end_var_max_depth_mask = batch["end_var_max_depth_mask"].to(device)
+            end_think_max_var_mask = batch["end_think_max_var_mask"].to(device)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 # Fourier inputs
@@ -266,6 +269,12 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
             counts["new_variation_acc"][0] += (preds_board[new_variation_mask] == new_variation_board_idx).sum().item() if new_variation_mask.any() else 0
             counts["new_variation_acc"][1] += new_variation_mask.sum().item()
 
+            counts["end_var_max_depth_acc"][0] += (preds_board[end_var_max_depth_mask] == end_var_board_idx).sum().item() if end_var_max_depth_mask.any() else 0
+            counts["end_var_max_depth_acc"][1] += end_var_max_depth_mask.sum().item()
+
+            counts["end_think_max_var_acc"][0] += (preds_board[end_think_max_var_mask] == end_think_board_idx).sum().item() if end_think_max_var_mask.any() else 0
+            counts["end_think_max_var_acc"][1] += end_think_max_var_mask.sum().item()
+
             n_batches += 1
 
     model.train()
@@ -280,7 +289,8 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
           f"board={results['board_acc']:.4f}, final_move={results['final_move_acc']:.4f}, "
           f"think_move={results['thinking_move_acc']:.4f}, "
           f"end_var={results['end_var_acc']:.4f}, continue_var={results['continue_var_acc']:.4f}, "
-          f"end_think={results['end_think_acc']:.4f}, new_var={results['new_variation_acc']:.4f}")
+          f"end_think={results['end_think_acc']:.4f}, new_var={results['new_variation_acc']:.4f}, "
+          f"end_var@maxd={results['end_var_max_depth_acc']:.4f}, end_think@maxv={results['end_think_max_var_acc']:.4f}")
 
     return results
 
@@ -433,6 +443,8 @@ def train():
             pretrain_epoch = batch["pretrain_epoch"].to(device)
             continue_var_mask = batch["continue_var_mask"].to(device)
             new_variation_mask = batch["new_variation_mask"].to(device)
+            end_var_max_depth_mask = batch["end_var_max_depth_mask"].to(device)
+            end_think_max_var_mask = batch["end_think_max_var_mask"].to(device)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 # === Prepare Fourier inputs (shared by both passes) ===
@@ -623,6 +635,16 @@ def train():
                 else:
                     new_variation_acc = 0.0
 
+                # end_var at max depth / end_think at max variations accuracy
+                if end_var_max_depth_mask.any():
+                    end_var_max_depth_acc = (preds_board[end_var_max_depth_mask] == end_var_board_idx).float().mean().item()
+                else:
+                    end_var_max_depth_acc = 0.0
+                if end_think_max_var_mask.any():
+                    end_think_max_var_acc = (preds_board[end_think_max_var_mask] == end_think_board_idx).float().mean().item()
+                else:
+                    end_think_max_var_acc = 0.0
+
                 # WL MAE
                 if wl_logits_final is not None and stm_nonzero.shape[0] > 0:
                     wl_probs = F.softmax(wl_logits_final.float(), dim=-1)
@@ -693,6 +715,8 @@ def train():
                     "accuracies/train_continue_var_acc": continue_var_acc,
                     "accuracies/train_end_think_acc": end_think_acc,
                     "accuracies/train_new_variation_acc": new_variation_acc,
+                    "accuracies/train_end_var_max_depth_acc": end_var_max_depth_acc,
+                    "accuracies/train_end_think_max_var_acc": end_think_max_var_acc,
                 })
 
             step += 1
@@ -722,6 +746,8 @@ def train():
             "accuracies/val_board_acc": val_results["board_acc"],
             "accuracies/val_final_move_acc": val_results["final_move_acc"],
             "accuracies/val_thinking_move_acc": val_results["thinking_move_acc"],
+            "accuracies/val_end_var_max_depth_acc": val_results["end_var_max_depth_acc"],
+            "accuracies/val_end_think_max_var_acc": val_results["end_think_max_var_acc"],
             "train/epoch": epoch,
             "train/step": step,
         })

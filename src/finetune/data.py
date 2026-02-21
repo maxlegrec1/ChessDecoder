@@ -116,6 +116,8 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
     block_boundaries = []
     thinking_move_data = []  # (position_idx, move_token_str) for thinking_policy_head
     value_data = []  # (wl_pos, d_pos, wl, d, is_valid)
+    max_depth_end_var_positions = []  # positions where end_var is board target AND variation reached max_depth
+    num_included_variations = 0
 
     # 1. Root board (block 0)
     block_start = len(sequence)
@@ -182,10 +184,20 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
                     sequence.append(pv_move_model)
 
         # end_var token
+        end_var_seq_pos = len(sequence)
         sequence.append("end_var")
+        num_included_variations += 1
+
+        if sampled_depth == max_depth:
+            # Position before end_var has board_target = end_var (stm of last board)
+            max_depth_end_var_positions.append(end_var_seq_pos - 1)
 
     # 4. end_think token
+    at_max_variations = (num_included_variations == max_variations)
+    end_think_seq_pos = len(sequence)
     sequence.append("end_think")
+    # Position before end_think (last end_var) when max variations were used
+    max_var_end_think_position = (end_think_seq_pos - 1) if at_max_variations else None
 
     # 5. Final move (predicted from end_think via policy_head)
     final_move_model = _to_model_uci(mcts_action)
@@ -217,4 +229,4 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
     # Convert to token IDs
     ids = [token_to_idx[t] for t in sequence]
 
-    return ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best
+    return ids, thinking_move_data, final_move_data, value_data, block_boundaries, ranking, first_is_not_best, max_depth_end_var_positions, max_var_end_think_position
