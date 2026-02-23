@@ -238,9 +238,18 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
                 continue_var_mask, new_variation_mask,
             )
 
+            # Exclude ambiguous structural tokens from board accuracy
+            structural_target = (
+                (board_target_ids == board_token_to_idx["end_var"]) |
+                (board_target_ids == board_token_to_idx["continue_var"]) |
+                (board_target_ids == board_token_to_idx["new_variation"]) |
+                (board_target_ids == board_token_to_idx["end_think"])
+            )
+            board_mask_no_struct = board_mask & ~structural_target
+
             # Accumulate with counts for proper weighted averaging
-            counts["board_acc"][0] += (preds_board == board_target_ids)[board_mask].float().sum().item()
-            counts["board_acc"][1] += board_mask.sum().item()
+            counts["board_acc"][0] += (preds_board == board_target_ids)[board_mask_no_struct].float().sum().item()
+            counts["board_acc"][1] += board_mask_no_struct.sum().item()
 
             preds_final = torch.argmax(final_logits, dim=-1)
             counts["final_move_acc"][0] += ((preds_final == move_target_ids) & move_mask).sum().item()
@@ -596,8 +605,20 @@ def train():
 
                 # Board accuracy (per-token, board sub-vocab space)
                 preds_board = torch.argmax(board_logits, dim=-1)
-                board_correct = (preds_board == board_target_ids) & board_mask
-                board_acc = board_correct.sum() / (board_mask.sum() + 1e-8)
+
+                # Exclude ambiguous structural tokens from board accuracy metrics
+                # (end_var/continue_var and end_think/new_variation are unpredictable
+                #  due to random depth/variation sampling)
+                structural_target = (
+                    (board_target_ids == board_token_to_idx["end_var"]) |
+                    (board_target_ids == board_token_to_idx["continue_var"]) |
+                    (board_target_ids == board_token_to_idx["new_variation"]) |
+                    (board_target_ids == board_token_to_idx["end_think"])
+                )
+                board_mask_no_struct = board_mask & ~structural_target
+
+                board_correct = (preds_board == board_target_ids) & board_mask_no_struct
+                board_acc = board_correct.sum() / (board_mask_no_struct.sum() + 1e-8)
 
                 # Board accuracy (per-block, grouped by block_id)
                 B, S = block_id.shape
@@ -605,7 +626,7 @@ def train():
                 uid = block_id + (torch.arange(B, device=device) * max_bid).unsqueeze(1)
                 flat_uid = uid.view(-1)
                 flat_bc = board_correct.view(-1).float()
-                flat_bm = board_mask.view(-1)
+                flat_bm = board_mask_no_struct.view(-1)
                 bp = flat_bm.nonzero(as_tuple=True)[0]
 
                 if bp.numel() > 0:
