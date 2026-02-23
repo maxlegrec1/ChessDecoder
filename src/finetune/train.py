@@ -322,15 +322,17 @@ def train():
 
     # Check if resuming from a finetune checkpoint
     resume_from = config["training"].get("resume_from")
+    seed = config["training"].get("seed", 42)
     start_epoch = 0
     step = 0
+    resume_epoch_step = 0  # batches to skip in the first epoch on resume
 
     if resume_from:
         checkpoint_files = [f for f in os.listdir(resume_from) if f.startswith("checkpoint_") and f.endswith(".pt")]
         if not checkpoint_files:
             raise ValueError(f"No checkpoint files found in {resume_from}")
 
-        checkpoint_files.sort(key=lambda x: int(x.split("_")[-1].replace(".pt", "")))
+        checkpoint_files.sort(key=lambda x: os.path.getmtime(os.path.join(resume_from, x)))
         latest_checkpoint = os.path.join(resume_from, checkpoint_files[-1])
 
         print(f"Resuming finetune from checkpoint: {latest_checkpoint}")
@@ -338,7 +340,8 @@ def train():
         model.load_state_dict(ft_checkpoint["model_state_dict"])
         start_epoch = ft_checkpoint["epoch"]
         step = ft_checkpoint["step"]
-        print(f"Resumed from epoch {start_epoch}, step {step}")
+        resume_epoch_step = ft_checkpoint.get("epoch_step", 0)
+        print(f"Resumed from epoch {start_epoch}, step {step}, epoch_step {resume_epoch_step}")
 
     # Dataloaders (train/val split)
     val_batches = config["training"].get("val_batches", 100)
@@ -354,6 +357,7 @@ def train():
         max_depth=config["data"].get("max_depth", 5),
         tau_base=config["data"].get("tau_base", 0.3),
         tau_alpha=config["data"].get("tau_alpha", 1.0),
+        seed=seed,
     )
 
     # Optimizer
@@ -407,13 +411,25 @@ def train():
     print(f"Gradient accumulation steps: {grad_accum}")
     print(f"Warmup steps: {warmup_steps}")
 
-    # Initialize wandb
+    # Initialize wandb (resume existing run if ID file exists in checkpoint dir)
+    wandb_id_path = os.path.join(run_checkpoint_dir, "wandb_run_id.txt")
+    wandb_run_id = None
+    if os.path.exists(wandb_id_path):
+        wandb_run_id = open(wandb_id_path).read().strip()
+        print(f"Resuming wandb run: {wandb_run_id}")
+
     wandb.init(
         project=config["project_name"],
         name=config["run_name"],
         config=config,
-        resume="allow" if resume_from else None,
+        id=wandb_run_id,
+        resume="must" if wandb_run_id else None,
     )
+
+    if not wandb_run_id:
+        with open(wandb_id_path, "w") as f:
+            f.write(wandb.run.id)
+        print(f"Saved wandb run ID to {wandb_id_path}")
 
     model.train()
 
@@ -427,7 +443,23 @@ def train():
     for epoch in range(start_epoch, config["training"]["num_epochs"]):
         print(f"Epoch {epoch + 1}/{config['training']['num_epochs']}")
 
+        # Set epoch on dataset for deterministic seeding (workers pick this up)
+        dataloader.dataset.epoch = epoch
+
+        # On resume, fast-forward the dataloader to where we left off
+        skip_batches = resume_epoch_step
+        resume_epoch_step = 0  # only skip on the first epoch after resume
+        if skip_batches > 0:
+            print(f"Fast-forwarding dataloader by {skip_batches} batches...")
+
+        epoch_step = 0
+
         for batch in tqdm(dataloader):
+            epoch_step += 1
+            if epoch_step <= skip_batches:
+                if epoch_step == skip_batches:
+                    print(f"Fast-forwarded {skip_batches} batches, resuming training...")
+                continue
             input_ids = batch["input_ids"].to(device)
             board_target_ids = batch["board_target_ids"].to(device)
             move_target_ids = batch["move_target_ids"].to(device)
@@ -726,6 +758,7 @@ def train():
                 ckpt = {
                     "epoch": epoch,
                     "step": step,
+                    "epoch_step": epoch_step,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scaler_state_dict": scaler.state_dict(),
@@ -752,10 +785,11 @@ def train():
             "train/step": step,
         })
 
-        # Save checkpoint at end of epoch
+        # Save checkpoint at end of epoch (epoch_step=0 so next epoch starts fresh)
         ckpt = {
             "epoch": epoch + 1,
             "step": step,
+            "epoch_step": 0,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
