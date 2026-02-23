@@ -3,11 +3,11 @@ run_name: "finetune-thinking-v1"
 
 data:
   pretrain_parquet_dir: "/home/maxime/parquet_files_decoder/"
-  variation_parquet_dir: "parquets_variations/"
+  variation_parquet_dir: "/datadrive/variations/"
   batch_size: 16
   num_workers: 4
-  max_seq_len: 1024
-  variation_ratio: 0.8
+  max_seq_len: 4096
+  variation_ratio: 1
   max_variations: 3
   max_depth: 5
   tau_base: 0.3
@@ -18,7 +18,7 @@ model:
   embed_dim: 1024
   num_heads: 16
   num_layers: 12
-  max_seq_len: 1024
+  max_seq_len: 4096
   d_ff: 1536
   n_buckets: 100
   wl_sigma: 0.4
@@ -28,16 +28,17 @@ model:
 training:
   learning_rate: 3.0e-5
   weight_decay: 0.1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 1
   num_epochs: 5
   log_every_n_steps: 10
   device: "cuda"
   use_amp: true
   checkpoint_dir: "checkpoints/"
-  pretrain_checkpoint: "checkpoints/finetune-thinking-v1_20260212_221042/checkpoint_step_280000.pt"
+  pretrain_checkpoint: "checkpoints/run-1_resume_from/checkpoint_616000.pt"
   warmup_steps: 500
-  save_every_n_steps: 10000
+  save_every_n_steps: 1000
   val_batches: 100
+  resume_from: "checkpoints/finetune-thinking-v1_20260222_212132"
 
 loss:
   final_move_weight: 5.0
