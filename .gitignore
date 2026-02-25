@@ -38,3 +38,29 @@ stockfish-ubuntu-x86-64-avx2
 
 # uv lock files in subpackages
 src/cpp/decoder/uv.lock
+
+# IDE / editor settings
+.idea
+.vscode
+
+# Shell / environment dotfiles (leaked from home dir)
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.ripgreprc
+
+# Claude Code / MCP
+.mcp.json
+
+# Bare git refs (leaked into worktree)
+/HEAD
+/config
+/hooks
+/objects
+/refs
+
+# Verification cache
+scripts/.verify_cache/
