@@ -98,6 +98,13 @@ def load_model(checkpoint_path, device):
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
+    # Save bucket centers before .half() — they must stay FP32 for
+    # exact match with C++ (which loads them from FP32 files).
+    wl_centers = model.wl_bucket_centers.clone()
+    d_centers = model.d_bucket_centers.clone()
+    model.half()
+    model.wl_bucket_centers = wl_centers
+    model.d_bucket_centers = d_centers
     model.eval()
     return model, max_seq_len
 
@@ -171,14 +178,14 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
     def predict_wl(move_pos):
         h = prefix_forward()
         logits = model.wl_head(h[0, move_pos:move_pos+1, :])
-        probs = F.softmax(logits.float(), dim=-1)
-        return (probs * model.wl_bucket_centers.unsqueeze(0)).sum(-1).item()
+        wl_idx = torch.argmax(logits, dim=-1)
+        return model.wl_bucket_centers[wl_idx].item()
 
     def predict_d(wl_pos):
         h = prefix_forward()
         logits = model.d_head(h[0, wl_pos:wl_pos+1, :])
-        probs = F.softmax(logits.float(), dim=-1)
-        return (probs * model.d_bucket_centers.unsqueeze(0)).sum(-1).item()
+        d_idx = torch.argmax(logits, dim=-1)
+        return model.d_bucket_centers[d_idx].item()
 
     def emit_wl_d(move_pos):
         """Predict WL/D, append fourier tokens, print values."""
