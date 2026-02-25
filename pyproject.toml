@@ -20,6 +20,9 @@ dependencies = [
     "wandb>=0.23.1",
 ]
 
+[tool.uv]
+no-build-isolation-package = ["decoder-inference-cpp"]
+
 [tool.uv.sources]
 chessrl-inference-cpp = { path = "src/cpp", editable = true }
 decoder-inference-cpp = { path = "src/cpp/decoder", editable = true }
