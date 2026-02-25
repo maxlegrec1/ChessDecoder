@@ -23,8 +23,8 @@ stockfish-ubuntu-x86-64-avx2
 # Compiled extensions
 *.so
 
-# Export artifacts
-export/
+# Export artifacts (top-level output dir, not src/export/)
+/export/
 
 # Model checkpoints (top-level)
 *.pt

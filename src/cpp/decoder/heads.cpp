@@ -1,9 +1,7 @@
 #include "heads.hpp"
 
-#include <cmath>
 #include <cstring>
 #include <fstream>
-#include <numeric>
 #include <stdexcept>
 
 namespace decoder
@@ -171,26 +169,6 @@ std::vector<float> loadFP32(const std::string& path, size_t expected_elements)
     return data;
 }
 
-// Softmax-weighted sum for value prediction.
-// Python: probs = F.softmax(logits.float(), dim=-1); return (probs * centers).sum()
-// .float() means softmax in FP32 on FP16-precision logits — which is what we have.
-float softmax_sum(const float* logits, const float* centers, int n)
-{
-    float max_val = logits[0];
-    for (int i = 1; i < n; i++)
-        if (logits[i] > max_val) max_val = logits[i];
-
-    float sum_exp = 0.0f;
-    float weighted_sum = 0.0f;
-    for (int i = 0; i < n; i++)
-    {
-        float e = std::exp(logits[i] - max_val);
-        sum_exp += e;
-        weighted_sum += e * centers[i];
-    }
-    return weighted_sum / sum_exp;
-}
-
 } // anonymous namespace
 
 Heads::Heads(const std::string& weights_dir, int embed_dim,
@@ -201,8 +179,9 @@ Heads::Heads(const std::string& weights_dir, int embed_dim,
     , move_vocab_size_(move_vocab_size)
     , value_hidden_size_(value_hidden_size)
     , n_buckets_(n_buckets)
-    , num_fourier_freq_(num_fourier_freq)
 {
+    (void)num_fourier_freq;  // Fourier is baked into TorchScript backbone
+
     std::string d = weights_dir;
     if (d.back() != '/') d += '/';
 
@@ -220,9 +199,6 @@ Heads::Heads(const std::string& weights_dir, int embed_dim,
     d_w1_bias_ = loadFP16(d + "d_head_w1_bias.bin", value_hidden_size);
     d_w2_weight_ = loadFP16(d + "d_head_w2_weight.bin", n_buckets * value_hidden_size);
     d_w2_bias_ = loadFP16(d + "d_head_w2_bias.bin", n_buckets);
-    fourier_frequencies_ = loadFP16(d + "fourier_frequencies.bin", num_fourier_freq);
-    fourier_proj_weight_ = loadFP16(d + "fourier_proj_weight.bin", embed_dim * 2 * num_fourier_freq);
-    fourier_proj_bias_ = loadFP16(d + "fourier_proj_bias.bin", embed_dim);
     wl_bucket_centers_ = loadFP32(d + "wl_bucket_centers.bin", n_buckets);
     d_bucket_centers_ = loadFP32(d + "d_bucket_centers.bin", n_buckets);
 }
@@ -243,100 +219,11 @@ void Heads::gemv(const float* W, const float* x, const float* b,
     }
 }
 
-// Mish activation: x * tanh(softplus(x)), FP16 output.
-float Heads::mish(float x)
-{
-    float sp = std::log(1.0f + std::exp(x));
-    return round_fp16(x * std::tanh(sp));
-}
-
-// Hidden states from TRT --fp16 are already FP16-precision.
-// No need to pre-round them.
-void Heads::evalBoardHead(const float* hidden, float* logits) const
-{
-    gemv(board_weight_.data(), hidden, board_bias_.data(),
-         board_vocab_size_, embed_dim_, logits);
-}
-
 void Heads::evalPolicyHead(const float* hidden, float* logits) const
 {
     gemv(policy_weight_.data(), hidden, policy_bias_.data(),
          move_vocab_size_, embed_dim_, logits);
 }
 
-void Heads::evalThinkingPolicyHead(const float* hidden, float* logits) const
-{
-    gemv(thinking_policy_weight_.data(), hidden, thinking_policy_bias_.data(),
-         move_vocab_size_, embed_dim_, logits);
-}
-
-void Heads::evalWlHead(const float* hidden, float* logits) const
-{
-    // Layer 1: Linear(E -> H), output FP16
-    std::vector<float> h(value_hidden_size_);
-    gemv(wl_w1_weight_.data(), hidden, wl_w1_bias_.data(),
-         value_hidden_size_, embed_dim_, h.data());
-    // Mish: FP32 compute, FP16 output
-    for (int i = 0; i < value_hidden_size_; i++)
-        h[i] = mish(h[i]);
-    // Layer 2: Linear(H -> n_buckets), output FP16
-    gemv(wl_w2_weight_.data(), h.data(), wl_w2_bias_.data(),
-         n_buckets_, value_hidden_size_, logits);
-}
-
-void Heads::evalDHead(const float* hidden, float* logits) const
-{
-    std::vector<float> h(value_hidden_size_);
-    gemv(d_w1_weight_.data(), hidden, d_w1_bias_.data(),
-         value_hidden_size_, embed_dim_, h.data());
-    for (int i = 0; i < value_hidden_size_; i++)
-        h[i] = mish(h[i]);
-    gemv(d_w2_weight_.data(), h.data(), d_w2_bias_.data(),
-         n_buckets_, value_hidden_size_, logits);
-}
-
-void Heads::evalFourier(float value, float* embedding) const
-{
-    // FP16 Fourier encoding: matches PyTorch .half() behavior.
-    //   f = 2 * pi * value * frequencies
-    //   features = [cos(f), sin(f)]
-    //   embedding = proj(features)
-    int F = num_fourier_freq_;
-    float val = round_fp16(value);
-    float two_pi = round_fp16(2.0f * static_cast<float>(M_PI));
-    float two_pi_val = round_fp16(two_pi * val);
-
-    std::vector<float> features(2 * F);
-    for (int i = 0; i < F; i++)
-    {
-        float angle = round_fp16(two_pi_val * fourier_frequencies_[i]);
-        features[i] = round_fp16(std::cos(angle));
-        features[F + i] = round_fp16(std::sin(angle));
-    }
-
-    gemv(fourier_proj_weight_.data(), features.data(), fourier_proj_bias_.data(),
-         embed_dim_, 2 * F, embedding);
-}
-
-float Heads::predictWl(const float* hidden) const
-{
-    std::vector<float> logits(n_buckets_);
-    evalWlHead(hidden, logits.data());
-    // Argmax to bucket center (matches training data generation and model.predict_move)
-    int best = 0;
-    for (int i = 1; i < n_buckets_; i++)
-        if (logits[i] > logits[best]) best = i;
-    return wl_bucket_centers_[best];
-}
-
-float Heads::predictD(const float* hidden) const
-{
-    std::vector<float> logits(n_buckets_);
-    evalDHead(hidden, logits.data());
-    int best = 0;
-    for (int i = 1; i < n_buckets_; i++)
-        if (logits[i] > logits[best]) best = i;
-    return d_bucket_centers_[best];
-}
 
 } // namespace decoder
