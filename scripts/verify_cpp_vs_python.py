@@ -94,7 +94,7 @@ def run_cpp(fens, export_dir):
 
     print("  Loading libtorch backbone...", flush=True)
     engine = cpp.ThinkingInferenceEngine(
-        f"{export_dir}/backbone_causal.pt",
+        f"{export_dir}/backbone.pt",
         f"{export_dir}/weights",
         f"{export_dir}/vocab.json",
         f"{export_dir}/config.json",

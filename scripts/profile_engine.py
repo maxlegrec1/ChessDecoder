@@ -8,7 +8,7 @@ import torch
 import _decoder_inference_cpp as cpp
 
 engine = cpp.ThinkingInferenceEngine(
-    "export/backbone_causal.pt", "export/weights",
+    "export/backbone.pt", "export/weights",
     "export/vocab.json", "export/config.json")
 
 # Use the same 100 FENs from verify

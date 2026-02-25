@@ -92,7 +92,7 @@ def run_cpp(fens, export_dir):
     import _decoder_inference_cpp as cpp
 
     engine = cpp.ThinkingInferenceEngine(
-        f"{export_dir}/backbone_causal.pt",
+        f"{export_dir}/backbone.pt",
         f"{export_dir}/weights",
         f"{export_dir}/vocab.json",
         f"{export_dir}/config.json",

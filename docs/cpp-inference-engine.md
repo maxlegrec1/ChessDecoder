@@ -68,7 +68,7 @@ uv run python src/export/export_torchscript.py \
 This produces:
 ```
 export/
-├── backbone_causal.pt   # TorchScript traced backbone (FP16)
+├── backbone.pt          # TorchScript traced backbone (FP16)
 ├── config.json          # Model dimensions (embed_dim, num_layers, etc.)
 ├── vocab.json           # Full 1968-token vocabulary
 └── weights/
@@ -132,7 +132,7 @@ uv run python scripts/verify_cpp_vs_python.py \
 import _decoder_inference_cpp as cpp
 
 engine = cpp.ThinkingInferenceEngine(
-    "export/backbone_causal.pt",
+    "export/backbone.pt",
     "export/weights",
     "export/vocab.json",
     "export/config.json",
@@ -176,7 +176,7 @@ Uses the C++ engine as a drop-in replacement for the Python `ThinkingModelWrappe
 
 If the model architecture changes (different `embed_dim`, `num_layers`, `num_heads`, `head_dim`, vocabulary size, head structure), you need to:
 
-1. Update `src/export/backbone_causal.py` if the backbone forward signature changes
+1. Update `src/export/backbone_causal.py` if the backbone forward signature changes (this is the Python wrapper, not the exported file)
 2. Update `src/export/export_onnx.py` `export_head_weights()` if heads change
 3. Re-export with `export_torchscript.py` (produces new `config.json` with dimensions)
 4. The C++ engine reads dimensions from `config.json` at runtime — no recompilation needed for dimension changes

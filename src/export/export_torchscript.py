@@ -5,7 +5,7 @@ Usage:
     uv run python src/export/export_torchscript.py --checkpoint checkpoint_step_32000.pt --output-dir export/
 
 Outputs:
-    export/backbone_causal.pt   - TorchScript traced causal backbone (FP16)
+    export/backbone.pt          - TorchScript traced backbone (FP16)
     export/weights/             - Head + fourier weights as raw FP16/FP32 .bin files
     export/vocab.json           - Full vocabulary mapping
     export/config.json          - Model config for C++ engine
@@ -56,7 +56,7 @@ def export_torchscript(backbone, output_dir, config):
              override_values, override_mask),
         )
 
-    path = output_dir / "backbone_causal.pt"
+    path = output_dir / "backbone.pt"
     traced.save(str(path))
     print(f"  TorchScript saved to {path}")
 
@@ -147,7 +147,7 @@ def main():
     export_torchscript(causal_backbone, output_dir, config)
 
     print("\nDone! Files:")
-    print(f"  {output_dir}/backbone_causal.pt")
+    print(f"  {output_dir}/backbone.pt")
     if not args.skip_weights:
         print(f"  {output_dir}/weights/")
         print(f"  {output_dir}/vocab.json")
