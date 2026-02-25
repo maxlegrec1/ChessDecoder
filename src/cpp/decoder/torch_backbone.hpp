@@ -4,10 +4,28 @@
 #include <torch/script.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace decoder
 {
+
+/// Per-tier CUDA graph state for board generation at smaller KV buffer sizes.
+/// Each tier captures a CUDA graph with a fixed-size KV buffer (128..2048),
+/// reducing memory bandwidth vs the full max_cache_len buffer.
+struct BoardGenTier
+{
+    int max_len;
+    torch::Tensor mask;       // [1, 1, 1, max_len + 1]
+    torch::Tensor buf_k;      // [NL, 1, NH, max_len, HD]
+    torch::Tensor buf_v;      // [NL, 1, NH, max_len, HD]
+    torch::Tensor out_h;      // [1, 1, E] graph output
+    torch::Tensor out_pk;     // [NL, 1, NH, max_len+1, HD] graph output
+    torch::Tensor out_pv;     // [NL, 1, NH, max_len+1, HD] graph output
+    at::cuda::CUDAGraph graph;
+    int len{0};
+};
 
 /// Wraps a TorchScript causal backbone with KV cache management.
 /// Replaces TRT-based CausalBackbone + PrefixBackbone with a single libtorch model
@@ -142,6 +160,24 @@ public:
     /// Set the causal graph input token ID (GPU-side, for starting a board gen loop).
     void setGraphInput(int64_t token_id);
 
+    // ==================== Tiered board generation ============================
+
+    /// Select smallest board gen tier whose buffer fits max_needed_pos.
+    /// Returns tier index (0..NUM_TIERS-1), or -1 to use the full-size graph.
+    int selectBoardTier(int max_needed_pos) const;
+
+    /// Prepare board generation: copy causal cache to tier buffer, set initial token.
+    void prepareBoardGen(int tier_idx, int64_t initial_token_id);
+
+    /// One board generation step using the selected tier's graph.
+    /// Returns the full token index as a GPU scalar (int64).
+    torch::Tensor boardGenStep(int tier_idx,
+        const torch::Tensor& head_w_t, const torch::Tensor& head_b,
+        const torch::Tensor& lut, int64_t position);
+
+    /// Finish board generation: sync tier buffer back to the full-size graph buffer.
+    void finishBoardGen(int tier_idx);
+
 private:
     /// Internal forward: runs the model, optionally updates causal cache.
     void forwardInternal(const int64_t* input_ids_ptr, const int64_t* input_pos_ptr,
@@ -191,6 +227,11 @@ private:
     torch::Tensor pg_out_h_, pg_out_pk_, pg_out_pv_;
     at::cuda::CUDAGraph prefix_graph_;
     int pg_len_;
+
+    // ---- Tiered board generation graphs ----
+    static constexpr int kBoardTierSizes[] = {128, 256, 512, 1024, 2048};
+    static constexpr int kNumBoardTiers = 5;
+    std::vector<std::unique_ptr<BoardGenTier>> board_tiers_;
 };
 
 } // namespace decoder

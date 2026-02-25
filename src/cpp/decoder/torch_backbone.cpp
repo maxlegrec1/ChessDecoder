@@ -140,11 +140,66 @@ void TorchCausalBackbone::captureGraphs()
             pg_out_pv_ = elements[2].toTensor();
         }
         prefix_graph_.capture_end();
+
+        // ---- Board generation tier graphs ----
+        // Each tier captures a graph with a smaller KV buffer, reducing
+        // memory bandwidth for board generation at early sequence positions.
+        // All tiers share cg_ids_, cg_pos_, cg_ov_, cg_om_ with the main causal graph.
+        board_tiers_.resize(kNumBoardTiers);
+        for (int t = 0; t < kNumBoardTiers; t++)
+        {
+            board_tiers_[t] = std::make_unique<BoardGenTier>();
+            auto& tier = *board_tiers_[t];
+            tier.max_len = kBoardTierSizes[t];
+            tier.mask = torch::full({1, 1, 1, tier.max_len + 1}, -1e9f, opts_fp32);
+            tier.buf_k = torch::zeros({num_layers_, 1, num_heads_, tier.max_len, head_dim_}, opts_fp16);
+            tier.buf_v = torch::zeros({num_layers_, 1, num_heads_, tier.max_len, head_dim_}, opts_fp16);
+            tier.len = 0;
+
+            // Warmup on capture stream
+            for (int i = 0; i < 3; i++)
+            {
+                std::vector<torch::jit::IValue> inputs = {
+                    cg_ids_, cg_pos_, tier.mask, tier.buf_k, tier.buf_v, cg_ov_, cg_om_
+                };
+                model_.forward(inputs);
+            }
+            capture_stream.synchronize();
+
+            // Capture tier graph
+            tier.graph.capture_begin(pool);
+            {
+                std::vector<torch::jit::IValue> inputs = {
+                    cg_ids_, cg_pos_, tier.mask, tier.buf_k, tier.buf_v, cg_ov_, cg_om_
+                };
+                auto output = model_.forward(inputs);
+                auto elements = output.toTuple()->elements();
+                tier.out_h = elements[0].toTensor();
+                tier.out_pk = elements[1].toTensor();
+                tier.out_pv = elements[2].toTensor();
+            }
+            tier.graph.capture_end();
+        }
     }
 
     graphs_captured_ = true;
     // Sync on default stream to ensure capture is fully done
     c10::cuda::getCurrentCUDAStream().synchronize();
+
+    // Log tier memory usage
+    size_t tier_mem = 0;
+    for (int t = 0; t < kNumBoardTiers; t++)
+    {
+        int ml = kBoardTierSizes[t];
+        // buf_k + buf_v: 2 * NL * NH * ml * HD * 2 bytes (FP16)
+        // mask: (ml+1) * 4 bytes
+        size_t bytes = 2ULL * num_layers_ * num_heads_ * ml * head_dim_ * 2 + (ml + 1) * 4;
+        tier_mem += bytes;
+    }
+    std::cout << "[TorchBackbone] Board gen tiers: ";
+    for (int t = 0; t < kNumBoardTiers; t++)
+        std::cout << kBoardTierSizes[t] << (t < kNumBoardTiers - 1 ? ", " : "");
+    std::cout << " (" << tier_mem / (1024 * 1024) << " MB)" << std::endl;
 }
 
 // ============================================================================
@@ -235,6 +290,110 @@ torch::Tensor TorchCausalBackbone::causalBoardStep(
     cg_ids_.index_put_({0, 0}, full_idx);
 
     return full_idx;  // GPU scalar tensor (int64)
+}
+
+// ============================================================================
+// Tiered board generation
+// ============================================================================
+
+int TorchCausalBackbone::selectBoardTier(int max_needed_pos) const
+{
+    for (int t = 0; t < kNumBoardTiers; t++)
+    {
+        if (board_tiers_[t]->max_len >= max_needed_pos)
+            return t;
+    }
+    return -1;  // use full-size graph
+}
+
+void TorchCausalBackbone::prepareBoardGen(int tier_idx, int64_t initial_token_id)
+{
+    torch::NoGradGuard no_grad;
+    auto& tier = *board_tiers_[tier_idx];
+
+    // Copy current causal graph buffer to tier buffer
+    int len = cg_len_;
+    if (len > 0)
+    {
+        using namespace torch::indexing;
+        tier.buf_k.index({Slice(), Slice(), Slice(), Slice(0, len)})
+            .copy_(cg_buf_k_.index({Slice(), Slice(), Slice(), Slice(0, len)}));
+        tier.buf_v.index({Slice(), Slice(), Slice(), Slice(0, len)})
+            .copy_(cg_buf_v_.index({Slice(), Slice(), Slice(), Slice(0, len)}));
+    }
+
+    // Set up mask: unmask [0..len-1] and [tier.max_len] (where cat puts new KV)
+    tier.mask.fill_(-1e9f);
+    if (len > 0)
+    {
+        using namespace torch::indexing;
+        tier.mask.index_put_({0, 0, 0, Slice(0, len)}, 0.0f);
+    }
+    tier.mask.index_put_({0, 0, 0, tier.max_len}, 0.0f);
+    tier.len = len;
+
+    // Set initial token (shared input tensors)
+    cg_ids_[0][0] = initial_token_id;
+    cg_ov_.index_put_({0, 0}, static_cast<at::Half>(0.0f));
+    cg_om_.index_put_({0, 0}, false);
+}
+
+torch::Tensor TorchCausalBackbone::boardGenStep(
+    int tier_idx,
+    const torch::Tensor& head_w_t,
+    const torch::Tensor& head_b,
+    const torch::Tensor& lut,
+    int64_t position)
+{
+    torch::NoGradGuard no_grad;
+    auto& tier = *board_tiers_[tier_idx];
+
+    // Set position (shared input tensor)
+    cg_pos_[0][0] = position;
+
+    // Replay tier's captured graph
+    tier.graph.replay();
+
+    // Copy new KV from tier.max_len position to tier.len
+    using namespace torch::indexing;
+    tier.buf_k.index_put_({Slice(), Slice(), Slice(), tier.len},
+                           tier.out_pk.index({Slice(), Slice(), Slice(), tier.max_len}));
+    tier.buf_v.index_put_({Slice(), Slice(), Slice(), tier.len},
+                           tier.out_pv.index({Slice(), Slice(), Slice(), tier.max_len}));
+    tier.mask.index_put_({0, 0, 0, tier.len}, 0.0f);
+    tier.len++;
+
+    // GPU board head eval: FP16 matmul + argmax + LUT lookup
+    auto logits = torch::mm(tier.out_h.view({1, embed_dim_}), head_w_t) + head_b;
+    auto sub_idx = torch::argmax(logits, 1).squeeze();
+    auto full_idx = lut.index({sub_idx});
+
+    // Feed back to graph input for next step (GPU→GPU, no sync)
+    cg_ids_.index_put_({0, 0}, full_idx);
+
+    return full_idx;  // GPU scalar tensor (int64)
+}
+
+void TorchCausalBackbone::finishBoardGen(int tier_idx)
+{
+    torch::NoGradGuard no_grad;
+    auto& tier = *board_tiers_[tier_idx];
+    int len = tier.len;
+
+    // Copy tier's filled KV entries to the full-size graph buffer
+    using namespace torch::indexing;
+    cg_buf_k_.index({Slice(), Slice(), Slice(), Slice(0, len)})
+        .copy_(tier.buf_k.index({Slice(), Slice(), Slice(), Slice(0, len)}));
+    cg_buf_v_.index({Slice(), Slice(), Slice(), Slice(0, len)})
+        .copy_(tier.buf_v.index({Slice(), Slice(), Slice(), Slice(0, len)}));
+
+    // Set up main graph mask
+    cg_mask_.fill_(-1e9f);
+    cg_mask_.index_put_({0, 0, 0, Slice(0, len)}, 0.0f);
+    cg_mask_.index_put_({0, 0, 0, max_cache_len_}, 0.0f);
+
+    cg_len_ = len;
+    cache_len_ = len;
 }
 
 void TorchCausalBackbone::syncCausalCacheToGraph()

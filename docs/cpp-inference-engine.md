@@ -2,7 +2,7 @@
 
 C++/libtorch inference engine for the ChessDecoder thinking model. Replicates the full Python thinking inference pipeline with CUDA graph acceleration.
 
-**Current performance**: ~520 tok/s FP16 on GPU (6.5x over Python's ~80 tok/s).
+**Current performance**: ~672 tok/s FP16 avg (875 tok/s @ 712 tokens, 992 tok/s @ 427 tokens). ~8.4x over Python's ~80 tok/s.
 
 ## Architecture
 
@@ -46,11 +46,12 @@ After each board generation phase, the causal cache results are synced to the pr
 
 ### CUDA Graphs
 
-Three CUDA graphs are captured at initialization:
+Multiple CUDA graphs are captured at initialization:
 
 1. **Causal graph** — 1-token incremental with `max_seq_len`-wide padded KV buffer
 2. **Prefix graph** — 1-token incremental with `max_seq_len`-wide padded KV buffer
-3. **Board gen** uses the causal graph with GPU-side head eval (matmul + argmax + LUT) to avoid any CPU synchronization during the 67-step board generation loop
+3. **Tiered board gen graphs** — 5 additional causal graphs at sizes 128, 256, 512, 1024, 2048. Board generation selects the smallest tier that fits `board_start_pos + 67`, reducing KV bandwidth by up to 20x at early positions. Falls back to the full-size graph for positions > 2048. All tier graphs share input tensors with the main causal graph. (~186 MB additional memory)
+4. **Board gen** uses the selected tier/causal graph with GPU-side head eval (matmul + argmax + LUT) to avoid any CPU synchronization during the 67-step board generation loop
 
 Key detail: after `cat(past_k, new_k)`, the new token's KV lands at position `max_len` (not `cache_len`). A scatter copy moves it to `cache_len` after each replay.
 
@@ -186,7 +187,7 @@ If the model architecture changes (different `embed_dim`, `num_layers`, `num_hea
 
 ### Performance
 
-- **Board generation is 83% of total time** (~1.60 ms/tok). Each step replays a CUDA graph captured at `max_seq_len=4096`, reading the full padded KV buffer even when the actual position is much shorter (e.g., position 200 reads 201MB instead of the needed 10MB).
+- **Board generation is ~77% of total time** (~1.15 ms/tok). Tiered CUDA graphs reduce KV bandwidth at early positions, but later boards still use larger tiers.
 - **No quantization**: runs in FP16. INT8 quantization would roughly halve memory bandwidth requirements.
 - **Single-batch only**: no batched inference. Each `predict_move` call processes one FEN.
 - **CPU↔GPU syncs**: causal catch-up before each board (non-first) does a `syncGraphToCausalCache` → dynamic forward → `syncCausalCacheToGraph` round-trip to maintain numerical exactness.
@@ -194,7 +195,7 @@ If the model architecture changes (different `embed_dim`, `num_layers`, `num_hea
 
 ### Correctness
 
-- **FP16 precision**: tiny differences in GEMM kernel dispatch (padded 4096-wide buffer vs exact-sized dynamic tensors) can cause rare adjacent-bucket flips in WL/D values. Token sequences and moves match ~97-100% across 100 FENs.
+- **FP16 precision**: different GEMM kernel dispatch across buffer sizes (tiered 128-2048 vs Python's dynamic tensors) can cause rare board token divergences that cascade into different thinking traces. Moves match 98% and COT exact match is 85% across 100 FENs.
 - **Causal catch-up**: subsequent boards use a non-graph forward to avoid accumulating FP16 precision drift. This costs ~0.1 ms/tok but ensures board token accuracy.
 
 ### Deployment
@@ -208,7 +209,7 @@ If the model architecture changes (different `embed_dim`, `num_layers`, `num_hea
 
 ### Near-term (high impact, moderate effort)
 
-1. **Tiered CUDA graphs for board generation** — Capture additional graphs at smaller KV buffer sizes (128, 256, 512, 1024, 2048). Select the smallest tier that fits the current position. For a typical 712-token sequence, this reduces average KV bandwidth from 201MB to ~30MB per step, estimated **~700-750 tok/s** (+35-40%).
+1. ~~**Tiered CUDA graphs for board generation**~~ — **DONE**. 5 tiers (128-2048) reduce board_gen from 1.60 to 1.15 ms/tok. Overall ~520 → ~672 tok/s (+29%).
 
 2. **INT8 weight-only quantization** — Quantize the backbone weights to INT8 while keeping activations in FP16 (W8A16). Halves weight memory bandwidth (~288MB → ~144MB). Combined with tiered graphs, could reach **~1000 tok/s**.
 
@@ -228,6 +229,6 @@ If the model architecture changes (different `embed_dim`, `num_layers`, `num_hea
 
 8. **Custom CUDA kernels** — Replace PyTorch's generic `torch::mm` / `torch::cat` / `index_put` with fused kernels (e.g., fused KV scatter, fused head eval). The current board gen loop has ~5 kernel launches per step that could be fused into 1-2.
 
-9. **TensorRT backbone** — The TRT backbone (`trt_backbone.hpp/cpp`) exists but is not fully integrated. TRT would optimize the full backbone graph (layer fusion, kernel auto-tuning) for potentially 2-3x over TorchScript. Main blocker: TRT's KV cache handling is non-trivial.
+9. **TensorRT backbone** — TRT would optimize the full backbone graph (layer fusion, kernel auto-tuning) for potentially 2-3x over TorchScript. Main blocker: TRT's KV cache handling is non-trivial.
 
 10. **Continuous batching / tree search** — Instead of generating one full thinking trace per FEN, explore multiple variation branches in parallel and prune early. Would require fundamental changes to the state machine.

@@ -488,9 +488,9 @@ std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float t
             }
 
             // Phase 2: Generate 67 board tokens via GPU-only loop
+            // Use tiered CUDA graphs with smaller KV buffers when possible
             {
                 double _t0 = pnow();
-                backbone_->setGraphInput(token_ids_.back());
 
                 auto output_ids = torch::zeros({67},
                     torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
@@ -499,17 +499,40 @@ std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float t
                 int max_board_tokens = std::min(67, max_seq_len_ - board_start_pos - 1);
                 if (max_board_tokens < 0) max_board_tokens = 0;
 
-                for (int i = 0; i < max_board_tokens; i++)
+                int needed = board_start_pos + max_board_tokens;
+                int tier = backbone_->selectBoardTier(needed);
+
+                if (tier >= 0)
                 {
-                    output_ids[i] = backbone_->causalBoardStep(
-                        board_head_w_gpu_t_, board_head_b_gpu_, board_lut_gpu_,
-                        board_start_pos + i);
+                    // Use smaller tier graph (less KV bandwidth)
+                    backbone_->prepareBoardGen(tier, token_ids_.back());
+                    for (int i = 0; i < max_board_tokens; i++)
+                    {
+                        output_ids[i] = backbone_->boardGenStep(tier,
+                            board_head_w_gpu_t_, board_head_b_gpu_, board_lut_gpu_,
+                            board_start_pos + i);
+                    }
+                    // One sync to collect all token IDs
+                    auto ids_cpu = output_ids.cpu();
+                    for (int i = 0; i < max_board_tokens; i++)
+                        append(static_cast<int>(ids_cpu[i].item<int64_t>()), board_bid);
+                    backbone_->finishBoardGen(tier);
+                }
+                else
+                {
+                    // Fallback: use full-size graph (positions > 2048)
+                    backbone_->setGraphInput(token_ids_.back());
+                    for (int i = 0; i < max_board_tokens; i++)
+                    {
+                        output_ids[i] = backbone_->causalBoardStep(
+                            board_head_w_gpu_t_, board_head_b_gpu_, board_lut_gpu_,
+                            board_start_pos + i);
+                    }
+                    auto ids_cpu = output_ids.cpu();
+                    for (int i = 0; i < max_board_tokens; i++)
+                        append(static_cast<int>(ids_cpu[i].item<int64_t>()), board_bid);
                 }
 
-                // One sync to collect all token IDs
-                auto ids_cpu = output_ids.cpu();
-                for (int i = 0; i < max_board_tokens; i++)
-                    append(static_cast<int>(ids_cpu[i].item<int64_t>()), board_bid);
                 if (profiling) { psync(); prof_board_gen += profNow() - _t0; }
             }
 
