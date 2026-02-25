@@ -19,7 +19,7 @@ constexpr int kNumBuckets = 100;
 class DecoderVocab
 {
 public:
-    /// Load vocabulary from vocab.json exported by export_onnx.py.
+    /// Load vocabulary from vocab.json exported by export_torchscript.py.
     explicit DecoderVocab(const std::string& vocab_json_path);
 
     // Full vocabulary lookups

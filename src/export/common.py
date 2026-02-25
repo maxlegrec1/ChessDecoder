@@ -1,7 +1,7 @@
 """
 Shared export utilities: model loading, head weights, vocabulary, config.
 
-Used by both export_torchscript.py and export_onnx.py.
+Used by export_torchscript.py.
 """
 
 import json

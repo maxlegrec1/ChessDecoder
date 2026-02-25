@@ -177,7 +177,7 @@ Uses the C++ engine as a drop-in replacement for the Python `ThinkingModelWrappe
 If the model architecture changes (different `embed_dim`, `num_layers`, `num_heads`, `head_dim`, vocabulary size, head structure), you need to:
 
 1. Update `src/export/backbone_causal.py` if the backbone forward signature changes (this is the Python wrapper, not the exported file)
-2. Update `src/export/export_onnx.py` `export_head_weights()` if heads change
+2. Update `src/export/common.py` `export_head_weights()` if heads change
 3. Re-export with `export_torchscript.py` (produces new `config.json` with dimensions)
 4. The C++ engine reads dimensions from `config.json` at runtime — no recompilation needed for dimension changes
 5. If head *structure* changes (e.g., adding a new head), update `heads.hpp/cpp` and `decoder_engine.cpp`
