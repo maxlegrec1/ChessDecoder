@@ -1,5 +1,5 @@
 """
-Exportable causal backbone for ONNX/TRT.
+Exportable causal backbone for TorchScript tracing.
 
 Standalone module that replicates the ChessDecoder backbone with:
 - Explicit KV cache I/O (past/present per layer, stacked)
@@ -7,8 +7,7 @@ Standalone module that replicates the ChessDecoder backbone with:
 - Manual RoPE via precomputed cos/sin cache + index_select
 - No torchtune dependencies — all standard PyTorch ops
 
-Includes Fourier encoder for WL/D value injection (runs on GPU in TRT
-to exactly match PyTorch FP16 behavior).
+Includes Fourier encoder for WL/D value injection.
 """
 
 import math
@@ -83,22 +82,22 @@ class BackboneCausal(nn.Module):
             input_ids:       [1, S] int64
             input_pos:       [1, S] int64
             attention_mask:  [1, 1, S, S+past_len] float32 (0 or -1e9)
-            past_keys:       [NL, 1, NH, past_len, HD] float32
-            past_values:     [NL, 1, NH, past_len, HD] float32
-            override_values: [1, S] float32 — scalar values for Fourier encoding
+            past_keys:       [NL, 1, NH, past_len, HD] float16
+            past_values:     [NL, 1, NH, past_len, HD] float16
+            override_values: [1, S] float16 — scalar values for Fourier encoding
             override_mask:   [1, S] bool — True at positions to override with Fourier
 
         Returns:
-            hidden_states:   [1, S, E] float32
-            present_keys:    [NL, 1, NH, S+past_len, HD] float32
-            present_values:  [NL, 1, NH, S+past_len, HD] float32
+            hidden_states:   [1, S, E] float16
+            present_keys:    [NL, 1, NH, S+past_len, HD] float16
+            present_values:  [NL, 1, NH, S+past_len, HD] float16
         """
         B, S = input_ids.shape
 
         # Token embedding with Fourier override
         h = self.tok_embedding(input_ids)
         # Always compute Fourier for all positions, then blend with mask
-        # (avoids data-dependent branching for ONNX export)
+        # (avoids data-dependent branching for TorchScript tracing)
         fourier_embs = self._fourier_encode(override_values.reshape(-1)).reshape(B, S, -1).to(h.dtype)
         mask_expanded = override_mask.unsqueeze(-1)  # [B, S, 1]
         h = torch.where(mask_expanded, fourier_embs, h)

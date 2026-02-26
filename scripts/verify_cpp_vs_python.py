@@ -1,5 +1,5 @@
 """
-Verify C++ TRT inference matches Python PyTorch inference.
+Verify C++ libtorch inference matches Python PyTorch inference.
 
 Compares full COT token sequences and final moves on 100 FENs.
 Both implementations must use temperature=0 (deterministic argmax).
@@ -199,7 +199,7 @@ def compare_values(py_entries, cpp_entries, label):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Verify C++ TRT vs Python PyTorch thinking inference")
+    parser = argparse.ArgumentParser(description="Verify C++ libtorch vs Python PyTorch thinking inference")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--export-dir", default="export")
     parser.add_argument("--num-fens", type=int, default=100)

@@ -17,11 +17,14 @@ PYBIND11_MODULE(_decoder_inference_cpp, m)
              py::arg("vocab_path"),
              py::arg("config_path"),
              "Construct engine from TorchScript backbone + weights.")
+        // NOTE: Engine is NOT thread-safe. gil_scoped_release allows Python
+        // GC/signals during long calls, but do not call from multiple threads.
         .def("predict_move", &decoder::ThinkingInferenceEngine::predictMove,
              py::arg("fen"),
              py::arg("temperature") = 0.0f,
              py::call_guard<py::gil_scoped_release>(),
-             "Predict the best move for a FEN position using thinking inference.")
+             "Predict the best move for a FEN position using thinking inference.\n"
+             "WARNING: Not thread-safe. Do not call from multiple threads.")
         .def("last_token_ids", &decoder::ThinkingInferenceEngine::lastTokenIds,
              py::return_value_policy::reference_internal,
              "Get token IDs from the last predict_move() call.")

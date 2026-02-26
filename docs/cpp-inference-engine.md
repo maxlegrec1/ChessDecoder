@@ -72,17 +72,17 @@ export/
 ├── config.json          # Model dimensions (embed_dim, num_layers, etc.)
 ├── vocab.json           # Full 1968-token vocabulary
 └── weights/
-    ├── board_head_weight.bin    # [41, E] FP32
-    ├── board_head_bias.bin      # [41] FP32
-    ├── policy_head_weight.bin   # [1924, E] FP32
-    ├── policy_head_bias.bin     # [1924] FP32
+    ├── board_head_weight.bin    # [41, E] FP16
+    ├── board_head_bias.bin      # [41] FP16
+    ├── policy_head_weight.bin   # [1924, E] FP16
+    ├── policy_head_bias.bin     # [1924] FP16
     ├── thinking_policy_head_weight.bin
     ├── thinking_policy_head_bias.bin
-    ├── wl_w1_weight.bin         # [H, E] FP32
-    ├── wl_w1_bias.bin           # [H] FP32
-    ├── wl_w2_weight.bin         # [B, H] FP32
-    ├── wl_w2_bias.bin           # [B] FP32
-    ├── wl_bucket_centers.bin    # [B] FP32
+    ├── wl_w1_weight.bin         # [H, E] FP16
+    ├── wl_w1_bias.bin           # [H] FP16
+    ├── wl_w2_weight.bin         # [B, H] FP16
+    ├── wl_w2_bias.bin           # [B] FP16
+    ├── wl_bucket_centers.bin    # [B] FP32 (precision-sensitive)
     ├── d_w1_weight.bin
     ├── d_w1_bias.bin
     ├── d_w2_weight.bin
