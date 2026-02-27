@@ -544,16 +544,17 @@ def train():
                 ce_think = ce_think.view(move_target_ids.shape)
                 thinking_move_loss = (ce_think * thinking_move_mask.float()).sum() / (thinking_move_mask.sum() + 1e-8)
 
-                # --- 3. WL prediction at move token positions ---
-                stm_nonzero = move_mask.nonzero(as_tuple=False)
+                # --- 3. WL prediction at all move prediction positions (final + thinking) ---
+                any_move_mask = move_mask | thinking_move_mask
+                stm_nonzero = any_move_mask.nonzero(as_tuple=False)
                 if stm_nonzero.shape[0] > 0:
                     wl_pred_batch = stm_nonzero[:, 0]
                     wl_pred_seq = stm_nonzero[:, 1] + 1
                     wl_pred_seq = wl_pred_seq.clamp(max=h_prefix.shape[1] - 1)
                     h_at_move = h_prefix[wl_pred_batch, wl_pred_seq]
                     wl_logits_final = model.wl_head(h_at_move)
-                    wl_valid_flat = wdl_valid[move_mask]
-                    wl_gt_flat = wl_targets[move_mask]
+                    wl_valid_flat = wdl_valid[any_move_mask]
+                    wl_gt_flat = wl_targets[any_move_mask]
                     wl_loss = soft_bucket_loss(wl_logits_final, wl_gt_flat, model.wl_bucket_centers, wl_valid_flat)
                 else:
                     wl_loss = torch.tensor(0.0, device=device)

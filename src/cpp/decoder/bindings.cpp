@@ -38,6 +38,11 @@ PYBIND11_MODULE(_decoder_inference_cpp, m)
              py::arg("idx"),
              py::return_value_policy::reference_internal,
              "Convert a token ID to its string name.")
+        .def_readwrite("board_temperature", &decoder::ThinkingInferenceEngine::board_temperature)
+        .def_readwrite("think_temperature", &decoder::ThinkingInferenceEngine::think_temperature)
+        .def_readwrite("policy_temperature", &decoder::ThinkingInferenceEngine::policy_temperature)
+        .def_readwrite("wl_temperature", &decoder::ThinkingInferenceEngine::wl_temperature)
+        .def_readwrite("d_temperature", &decoder::ThinkingInferenceEngine::d_temperature)
         .def_readwrite("total_tokens", &decoder::ThinkingInferenceEngine::total_tokens)
         .def_readwrite("total_time", &decoder::ThinkingInferenceEngine::total_time)
         .def_readwrite("profiling", &decoder::ThinkingInferenceEngine::profiling)

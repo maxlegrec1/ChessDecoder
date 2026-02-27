@@ -285,7 +285,13 @@ std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float t
     backbone_->resetCache();
     backbone_->resetPrefixCache();
 
-    float think_temp = temperature;
+    // Resolve per-head temperatures.
+    // think/policy: -1.0 means "use the temperature arg". >= 0 overrides.
+    float think_temp = (think_temperature >= 0.0f) ? think_temperature : temperature;
+    float policy_temp = (policy_temperature >= 0.0f) ? policy_temperature : temperature;
+    float board_temp = board_temperature;
+    float wl_temp = wl_temperature;
+    float d_temp = d_temperature;
 
     auto isFull = [&]() { return static_cast<int>(token_ids_.size()) >= max_seq_len_; };
     auto orphan = [&]() { return ++orphan_ctr_; };
@@ -388,7 +394,7 @@ std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float t
             if (isFull()) goto exit_loop;
 
             double _t0 = pnow();
-            float wl = predictWlGpu();
+            float wl = predictWlGpu(wl_temp);
             if (profiling) { psync(); prof_head_eval += profNow() - _t0; }
             int wl_pos = static_cast<int>(token_ids_.size());
             append(vocab_->wlValueIdx(), orphan());
@@ -399,7 +405,7 @@ std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float t
             if (profiling) { psync(); prof_prefix_incr += profNow() - _t1; }
 
             double _t2 = pnow();
-            float d = predictDGpu();
+            float d = predictDGpu(d_temp);
             if (profiling) { psync(); prof_head_eval += profNow() - _t2; }
             int d_pos = static_cast<int>(token_ids_.size());
             append(vocab_->dValueIdx(), orphan());
@@ -582,7 +588,13 @@ std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float t
             auto logits_gpu = torch::mm(
                 h_gpu.view({1, embed_dim_}), board_head_w_gpu_t_
             ) + board_head_b_gpu_;
-            int board_sub_idx = torch::argmax(logits_gpu, 1).item<int>();
+            int board_sub_idx;
+            if (board_temp > 0.0f) {
+                auto probs = torch::softmax(logits_gpu / board_temp, 1);
+                board_sub_idx = torch::multinomial(probs, 1).item<int>();
+            } else {
+                board_sub_idx = torch::argmax(logits_gpu, 1).item<int>();
+            }
             if (profiling) { psync(); prof_head_eval += profNow() - _t1; }
 
             if (board_sub_idx == vocab_->boardEndVarIdx())
@@ -614,7 +626,13 @@ std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float t
             auto logits_gpu = torch::mm(
                 h_gpu.view({1, embed_dim_}), board_head_w_gpu_t_
             ) + board_head_b_gpu_;
-            int board_sub_idx = torch::argmax(logits_gpu, 1).item<int>();
+            int board_sub_idx;
+            if (board_temp > 0.0f) {
+                auto probs = torch::softmax(logits_gpu / board_temp, 1);
+                board_sub_idx = torch::multinomial(probs, 1).item<int>();
+            } else {
+                board_sub_idx = torch::argmax(logits_gpu, 1).item<int>();
+            }
             if (profiling) { psync(); prof_head_eval += profNow() - _t1; }
 
             if (board_sub_idx == vocab_->boardEndThinkIdx())
@@ -637,7 +655,7 @@ std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float t
             if (isFull()) goto exit_loop;
 
             auto legal_indices = vocab_->legalMoveIndices(fen);
-            int move_sub_idx = evalPolicyHeadGpu(temperature, legal_indices);
+            int move_sub_idx = evalPolicyHeadGpu(policy_temp, legal_indices);
             int full_idx = vocab_->moveIdxToFullIdx(move_sub_idx);
             return done(DecoderVocab::pseudoToStandardUci(vocab_->idxToToken(full_idx)));
         }
@@ -693,24 +711,36 @@ int ThinkingInferenceEngine::evalPolicyHeadGpu(float temperature, const std::vec
     return sampleToken(logits_ptr, mvs, temperature);
 }
 
-float ThinkingInferenceEngine::predictWlGpu()
+float ThinkingInferenceEngine::predictWlGpu(float temperature)
 {
     auto h = saved_prefix_hidden_gpu_.view({1, embed_dim_});
     auto hidden = torch::mm(h, wl_w1_gpu_t_) + wl_b1_gpu_;
     hidden = torch::mish(hidden);
     auto logits = torch::mm(hidden, wl_w2_gpu_t_) + wl_b2_gpu_;
-    int best = torch::argmax(logits, 1).item<int>();
-    return wl_centers_gpu_[best].item<float>();
+    int idx;
+    if (temperature > 0.0f) {
+        auto probs = torch::softmax(logits / temperature, 1);
+        idx = torch::multinomial(probs, 1).item<int>();
+    } else {
+        idx = torch::argmax(logits, 1).item<int>();
+    }
+    return wl_centers_gpu_[idx].item<float>();
 }
 
-float ThinkingInferenceEngine::predictDGpu()
+float ThinkingInferenceEngine::predictDGpu(float temperature)
 {
     auto h = saved_prefix_hidden_gpu_.view({1, embed_dim_});
     auto hidden = torch::mm(h, d_w1_gpu_t_) + d_b1_gpu_;
     hidden = torch::mish(hidden);
     auto logits = torch::mm(hidden, d_w2_gpu_t_) + d_b2_gpu_;
-    int best = torch::argmax(logits, 1).item<int>();
-    return d_centers_gpu_[best].item<float>();
+    int idx;
+    if (temperature > 0.0f) {
+        auto probs = torch::softmax(logits / temperature, 1);
+        idx = torch::multinomial(probs, 1).item<int>();
+    } else {
+        idx = torch::argmax(logits, 1).item<int>();
+    }
+    return d_centers_gpu_[idx].item<float>();
 }
 
 } // namespace decoder
