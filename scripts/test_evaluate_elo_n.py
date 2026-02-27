@@ -19,12 +19,12 @@ def migrate_state_dict(state_dict, new_vocab_size):
     return state_dict
 
 
-model = ChessDecoder(vocab_size=vocab_size, embed_dim=1024, num_heads=16, num_layers=12, max_seq_len=256, d_ff=1536)
+model = ChessDecoder(vocab_size=vocab_size, embed_dim=1024, num_heads=16, num_layers=12, max_seq_len=1024, d_ff=1536)
 # model.load_state_dict(migrate_state_dict(
 #     torch.load("checkpoints/run-1_20260128_231050/checkpoint_epoch_10.pt")["model_state_dict"],
 #     vocab_size
 # ))
-model.load_state_dict(torch.load("checkpoints/run-1_20260128_231050/checkpoint_epoch_13.pt")["model_state_dict"])
+model.load_state_dict(torch.load("checkpoint_597000.pt")["model_state_dict"])
 model.eval()
 
-model_vs_stockfish_n(model, model_name="decoder", num_games=100, temperature=0.0, elo=2000, max_n=1)
+model_vs_stockfish_n(model, model_name="decoder", num_games=100, temperature=0.0, elo=2000, max_n=10)

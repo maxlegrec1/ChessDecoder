@@ -19,3 +19,48 @@ wandb/
 pgns/
 
 stockfish-ubuntu-x86-64-avx2
+
+# Compiled extensions
+*.so
+
+# Export artifacts (top-level output dir, not src/export/)
+/export/
+
+# Model checkpoints (top-level)
+*.pt
+
+# TensorRT engines
+*.trt
+
+# ONNX models
+*.onnx
+*.onnx.data
+
+# uv lock files in subpackages
+src/cpp/decoder/uv.lock
+
+# IDE / editor settings
+.idea
+.vscode
+
+# Shell / environment dotfiles (leaked from home dir)
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.ripgreprc
+
+# Claude Code / MCP
+.mcp.json
+
+# Bare git refs (leaked into worktree)
+/HEAD
+/config
+/hooks
+/objects
+/refs
+
+# Verification cache
+scripts/.verify_cache/

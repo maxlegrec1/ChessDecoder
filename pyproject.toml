@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "bulletchess>=0.4.0",
     "chessrl-inference-cpp",
+    "decoder-inference-cpp",
     "numpy>=2.4.0",
     "pyarrow>=22.0.0",
     "pybind11>=3.0.1",
@@ -19,5 +20,9 @@ dependencies = [
     "wandb>=0.23.1",
 ]
 
+[tool.uv]
+no-build-isolation-package = ["decoder-inference-cpp"]
+
 [tool.uv.sources]
 chessrl-inference-cpp = { path = "src/cpp", editable = true }
+decoder-inference-cpp = { path = "src/cpp/decoder", editable = true }

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.13"
 resolution-markers = [
     "sys_platform == 'linux'",
@@ -283,6 +283,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "bulletchess" },
     { name = "chessrl-inference-cpp" },
+    { name = "decoder-inference-cpp" },
     { name = "numpy" },
     { name = "pyarrow" },
     { name = "pybind11" },
@@ -299,6 +300,7 @@ dependencies = [
 requires-dist = [
     { name = "bulletchess", specifier = ">=0.4.0" },
     { name = "chessrl-inference-cpp", editable = "src/cpp" },
+    { name = "decoder-inference-cpp", editable = "src/cpp/decoder" },
     { name = "numpy", specifier = ">=2.4.0" },
     { name = "pyarrow", specifier = ">=22.0.0" },
     { name = "pybind11", specifier = ">=3.0.1" },
@@ -310,6 +312,11 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "wandb", specifier = ">=0.23.1" },
 ]
+
+[[package]]
+name = "decoder-inference-cpp"
+version = "0.2.0"
+source = { editable = "src/cpp/decoder" }
 
 [[package]]
 name = "dill"

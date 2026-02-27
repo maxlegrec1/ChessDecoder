@@ -174,9 +174,13 @@ def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperatur
                 save_pgn_game(pgn_game, pgn_filename)
                 games_played += 1
                 
-                # Update progress bar description with current win rate
+                # Update progress bar description with current win rate and throughput
                 current_win_rate = (wins + 0.5 * draws) / (i + 1)
-                pbar.set_description(f"Model vs Stockfish Games (Win Rate: {current_win_rate * 100:.1f}%)")
+                desc = f"Win: {current_win_rate * 100:.1f}%"
+                if hasattr(model, 'total_time') and model.total_time > 0:
+                    tok_s = model.total_tokens / model.total_time
+                    desc += f" | {tok_s:.0f} tok/s"
+                pbar.set_description(desc)
 
     except Exception as e:
         print(f"An error occurred during game play: {e}")
@@ -191,6 +195,10 @@ def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperatur
         print(f"Estimated model ELO: {estimated_elo}")
     else:
         print("No games played.")
+
+    if hasattr(model, 'total_time') and model.total_time > 0:
+        tok_s = model.total_tokens / model.total_time
+        print(f"Throughput: {tok_s:.0f} tok/s ({model.total_tokens} tokens in {model.total_time:.1f}s)")
 
     print(f"All {games_played} games saved to {pgn_filename}")
     return win_rate, estimated_elo
