@@ -394,16 +394,13 @@ class FinetuneIterableDataset(IterableDataset):
                 d_positions[d_pos] = True
                 d_targets[d_pos] = d
                 wdl_valid[d_pos] = is_valid
-
-        # Store WL/D targets at the final move position for convenience
-        if final_move_data is not None:
-            end_think_pos, _ = final_move_data
-            if value_data:
-                last_wl_pos, last_d_pos, last_wl, last_d, last_valid = value_data[-1]
-                if 0 <= end_think_pos < self.max_seq_len:
-                    wl_targets[end_think_pos] = last_wl
-                    d_targets[end_think_pos] = last_d
-                    wdl_valid[end_think_pos] = last_valid
+            # Propagate WL/D targets to the move prediction position (wl_pos - 2)
+            # so the WL head can train on COT positions too (mirrors pretrain builder)
+            pred_pos = wl_pos - 2
+            if 0 <= pred_pos < self.max_seq_len:
+                wl_targets[pred_pos] = wl
+                d_targets[pred_pos] = d
+                wdl_valid[pred_pos] = is_valid
 
         # Block IDs
         max_block_num = len(block_boundaries)
