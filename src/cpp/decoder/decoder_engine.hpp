@@ -44,6 +44,16 @@ public:
     /// Convert a token ID to its string name.
     const std::string& idxToToken(int idx) const { return vocab_->idxToToken(idx); }
 
+    // Per-head temperature overrides.
+    // board: controls structural decisions (end_var, end_think). NOT board piece tokens.
+    // think/policy: -1.0 means "use the temperature arg to predictMove()". >= 0 overrides.
+    // wl/d: sample bucket instead of argmax when > 0.
+    float board_temperature{0.0f};
+    float think_temperature{-1.0f};
+    float policy_temperature{-1.0f};
+    float wl_temperature{0.0f};
+    float d_temperature{0.0f};
+
     // Stats
     int64_t total_tokens{0};
     double total_time{0.0};
@@ -85,8 +95,8 @@ private:
     /// GPU head evaluation
     int evalThinkingPolicyHeadGpu(float temperature);
     int evalPolicyHeadGpu(float temperature, const std::vector<int>& legal_indices);
-    float predictWlGpu();
-    float predictDGpu();
+    float predictWlGpu(float temperature);
+    float predictDGpu(float temperature);
 
     // Components
     std::unique_ptr<TorchCausalBackbone> backbone_;
