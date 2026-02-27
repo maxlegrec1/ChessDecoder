@@ -11,6 +11,10 @@ from src.models.model import ChessDecoder
 from src.models.vocab import (vocab_size, token_to_idx, board_vocab_size, move_vocab_size,
                               board_idx_to_full_idx, move_idx_to_full_idx)
 from src.dataloader.loader import get_dataloader
+from src.utils.distributed import (
+    setup_distributed, cleanup_distributed, is_main_process, get_device,
+    average_gradients, barrier, print_rank0,
+)
 
 
 def load_config(config_path):
@@ -50,8 +54,9 @@ def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
 def train():
     config = load_config("src/train/config.yaml")
 
-    device = torch.device(config["training"]["device"] if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    rank, local_rank, world_size = setup_distributed()
+    device = get_device(local_rank)
+    print_rank0(f"Using device: {device}, world_size: {world_size}")
 
     # Check if resuming from checkpoint
     resume_from = config["training"].get("resume_from")
@@ -82,6 +87,8 @@ def train():
         max_seq_len=config["data"]["max_seq_len"],
         skip_board_prob=config["data"].get("skip_board_prob", 0.0),
         seed=seed,
+        rank=rank,
+        world_size=world_size,
     )
 
     # Optimizer
@@ -99,7 +106,7 @@ def train():
     # Mixed precision training
     use_amp = config["training"].get("use_amp", False)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    print(f"Mixed precision training: {'enabled' if use_amp else 'disabled'}")
+    print_rank0(f"Mixed precision training: {'enabled' if use_amp else 'disabled'}")
 
     # Resume from checkpoint if specified
     if resume_from:
@@ -110,7 +117,7 @@ def train():
         checkpoint_files.sort(key=lambda x: int(x.split("_")[-1].replace(".pt", "")))
         latest_checkpoint = os.path.join(resume_from, checkpoint_files[-1])
 
-        print(f"Resuming from checkpoint: {latest_checkpoint}")
+        print_rank0(f"Resuming from checkpoint: {latest_checkpoint}")
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
 
         state_dict = checkpoint["model_state_dict"]
@@ -176,7 +183,7 @@ def train():
         opt_state = checkpoint["optimizer_state_dict"]
         old_n_params = len(opt_state["param_groups"][0]["params"])
         new_n_params = len(list(model.parameters()))
-        print(f"Migrating optimizer state: {old_n_params} -> {new_n_params} params")
+        print_rank0(f"Migrating optimizer state: {old_n_params} -> {new_n_params} params")
         # Update param_groups to match current optimizer
         opt_state["param_groups"] = optimizer.state_dict()["param_groups"]
         existing_step = next(iter(opt_state["state"].values()))["step"] if opt_state["state"] else torch.tensor(0)
@@ -212,7 +219,7 @@ def train():
         step = checkpoint["step"]
         resume_epoch_step = checkpoint.get("epoch_step", 0)
 
-        print(f"Resumed from epoch {start_epoch}, step {step}, epoch_step {resume_epoch_step}")
+        print_rank0(f"Resumed from epoch {start_epoch}, step {step}, epoch_step {resume_epoch_step}")
 
         run_checkpoint_dir = resume_from
     else:
@@ -221,29 +228,32 @@ def train():
             config["training"]["checkpoint_dir"],
             f"{config['run_name']}_{timestamp}"
         )
-        os.makedirs(run_checkpoint_dir, exist_ok=True)
+        if is_main_process():
+            os.makedirs(run_checkpoint_dir, exist_ok=True)
+        barrier()
 
-    print(f"Checkpoints will be saved to: {run_checkpoint_dir}")
+    print_rank0(f"Checkpoints will be saved to: {run_checkpoint_dir}")
 
     # Initialize wandb (resume existing run if ID file exists in checkpoint dir)
-    wandb_id_path = os.path.join(run_checkpoint_dir, "wandb_run_id.txt")
-    wandb_run_id = None
-    if os.path.exists(wandb_id_path):
-        wandb_run_id = open(wandb_id_path).read().strip()
-        print(f"Resuming wandb run: {wandb_run_id}")
+    if is_main_process():
+        wandb_id_path = os.path.join(run_checkpoint_dir, "wandb_run_id.txt")
+        wandb_run_id = None
+        if os.path.exists(wandb_id_path):
+            wandb_run_id = open(wandb_id_path).read().strip()
+            print(f"Resuming wandb run: {wandb_run_id}")
 
-    wandb.init(
-        project=config["project_name"],
-        name=config["run_name"],
-        config=config,
-        id=wandb_run_id,
-        resume="must" if wandb_run_id else None,
-    )
+        wandb.init(
+            project=config["project_name"],
+            name=config["run_name"],
+            config=config,
+            id=wandb_run_id,
+            resume="must" if wandb_run_id else None,
+        )
 
-    if not wandb_run_id:
-        with open(wandb_id_path, "w") as f:
-            f.write(wandb.run.id)
-        print(f"Saved wandb run ID to {wandb_id_path}")
+        if not wandb_run_id:
+            with open(wandb_id_path, "w") as f:
+                f.write(wandb.run.id)
+            print(f"Saved wandb run ID to {wandb_id_path}")
 
     model.train()
 
@@ -253,8 +263,10 @@ def train():
     wl_weight = config["loss"].get("wl_weight", 1.0)
     d_weight = config["loss"].get("d_weight", 1.0)
 
+    grad_accum = config["training"].get("gradient_accumulation_steps", 1)
+
     for epoch in range(start_epoch, config["training"]["num_epochs"]):
-        print(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
+        print_rank0(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
 
         # Set epoch on dataset for deterministic seeding (workers pick this up)
         dataloader.dataset.epoch = epoch
@@ -263,15 +275,15 @@ def train():
         skip_batches = resume_epoch_step
         resume_epoch_step = 0  # only skip on the first epoch after resume
         if skip_batches > 0:
-            print(f"Fast-forwarding dataloader by {skip_batches} batches...")
+            print_rank0(f"Fast-forwarding dataloader by {skip_batches} batches...")
 
         epoch_step = 0
 
-        for batch in tqdm(dataloader):
+        for batch in tqdm(dataloader, disable=not is_main_process()):
             epoch_step += 1
             if epoch_step <= skip_batches:
                 if epoch_step == skip_batches:
-                    print(f"Fast-forwarded {skip_batches} batches, resuming training...")
+                    print_rank0(f"Fast-forwarded {skip_batches} batches, resuming training...")
                 continue
 
             input_ids = batch["input_ids"].to(device)
@@ -370,11 +382,12 @@ def train():
                 )
 
             # Scale loss for gradient accumulation
-            loss = total_loss / config["training"].get("gradient_accumulation_steps", 1)
+            loss = total_loss / grad_accum
             scaler.scale(loss).backward()
 
-            if (step + 1) % config["training"].get("gradient_accumulation_steps", 1) == 0:
+            if (step + 1) % grad_accum == 0:
                 scaler.unscale_(optimizer)
+                average_gradients(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -493,7 +506,7 @@ def train():
                     move_acc_by_nth = torch.zeros(max_track_moves, device=device)
                     count_by_nth = torch.zeros(max_track_moves, device=device)
 
-            if step % config["training"]["log_every_n_steps"] == 0:
+            if step % config["training"]["log_every_n_steps"] == 0 and is_main_process():
                 print(f"Step {step}: Loss {total_loss.item():.4f} "
                       f"(Move: {move_loss.item():.4f}, Board: {board_loss.item():.4f}, "
                       f"WL: {wl_loss.item():.4f}, D: {d_loss.item():.4f})")
@@ -516,7 +529,7 @@ def train():
                     "train/d_mse": d_mse.item(),
                     "train/epoch": epoch,
                     "train/step": step,
-                    "train/grad_step": step / config["training"].get("gradient_accumulation_steps", 1)
+                    "train/grad_step": step / grad_accum,
                 }
 
                 for i in range(max_track_moves):
@@ -534,7 +547,7 @@ def train():
 
             # Save checkpoint every N steps
             save_every = config["training"].get("save_every_n_steps")
-            if save_every and step % save_every == 0:
+            if save_every and step % save_every == 0 and is_main_process():
                 checkpoint = {
                     "epoch": epoch,
                     "step": step,
@@ -547,20 +560,25 @@ def train():
                 checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_{step}.pt")
                 torch.save(checkpoint, checkpoint_path)
                 print(f"Saved checkpoint to {checkpoint_path}")
+                barrier()
 
         # Save checkpoint at end of epoch (epoch_step=0 so next epoch starts fresh)
-        checkpoint = {
-            "epoch": epoch + 1,
-            "step": step,
-            "epoch_step": 0,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "config": config,
-        }
-        checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Saved checkpoint to {checkpoint_path}")
+        if is_main_process():
+            checkpoint = {
+                "epoch": epoch + 1,
+                "step": step,
+                "epoch_step": 0,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "config": config,
+            }
+            checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
+            torch.save(checkpoint, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+        barrier()
+
+    cleanup_distributed()
 
 if __name__ == "__main__":
     train()

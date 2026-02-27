@@ -24,7 +24,7 @@ model = ChessDecoder(vocab_size=vocab_size, embed_dim=1024, num_heads=16, num_la
 #     torch.load("checkpoints/run-1_20260128_231050/checkpoint_epoch_10.pt")["model_state_dict"],
 #     vocab_size
 # ))
-model.load_state_dict(torch.load("checkpoint_597000.pt")["model_state_dict"])
+model.load_state_dict(torch.load("checkpoint_616000.pt")["model_state_dict"])
 model.eval()
 
-model_vs_stockfish(model, model1_name="decoder", num_games=100, temperature=0.0, elo=2000)
+model_vs_stockfish(model, model1_name="decoder", num_games=100, temperature=0.0, elo=1500)

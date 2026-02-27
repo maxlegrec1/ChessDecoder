@@ -37,6 +37,8 @@ class FinetuneIterableDataset(IterableDataset):
         pretrain_files=None,
         variation_files=None,
         seed=42,
+        rank=0,
+        world_size=1,
     ):
         self.max_seq_len = max_seq_len
         self.variation_ratio = variation_ratio
@@ -50,6 +52,8 @@ class FinetuneIterableDataset(IterableDataset):
         self.pad_id = token_to_idx["pad"]
         self.seed = seed
         self.epoch = 0  # set externally before each epoch for deterministic resumption
+        self.rank = rank
+        self.world_size = world_size
 
         if pretrain_files is not None:
             self.pretrain_files = pretrain_files
@@ -74,24 +78,26 @@ class FinetuneIterableDataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
 
-        # Deterministic seeding: same seed+epoch+worker → same shuffle order
-        epoch_seed = self.seed + self.epoch * 100003 + worker_id * 997
+        # Deterministic seeding: same seed+epoch+worker+rank → same shuffle order
+        epoch_seed = self.seed + self.epoch * 100003 + self.rank * 7919 + worker_id * 997
         random.seed(epoch_seed)
         np.random.seed(epoch_seed % (2**32))
 
-        # Split files among workers
+        # Stage 1: rank sharding (interleaved across ranks)
+        rank_pretrain_files = self.pretrain_files[self.rank::self.world_size]
+        rank_variation_files = self.variation_files[self.rank::self.world_size]
+
+        # Stage 2: worker sharding (contiguous within rank's files)
         if worker_info is None:
-            pretrain_files = list(self.pretrain_files)
-            variation_files = list(self.variation_files)
+            pretrain_files = list(rank_pretrain_files)
+            variation_files = list(rank_variation_files)
         else:
             nw = worker_info.num_workers
             wid = worker_info.id
-            # Shard pretrain files across workers
-            per_w = int(math.ceil(len(self.pretrain_files) / nw))
-            pretrain_files = self.pretrain_files[wid * per_w: min((wid + 1) * per_w, len(self.pretrain_files))]
-            # Shard variation files across workers
-            per_v = int(math.ceil(len(self.variation_files) / nw))
-            variation_files = self.variation_files[wid * per_v: min((wid + 1) * per_v, len(self.variation_files))]
+            per_w = int(math.ceil(len(rank_pretrain_files) / nw))
+            pretrain_files = rank_pretrain_files[wid * per_w: min((wid + 1) * per_w, len(rank_pretrain_files))]
+            per_v = int(math.ceil(len(rank_variation_files) / nw))
+            variation_files = rank_variation_files[wid * per_v: min((wid + 1) * per_v, len(rank_variation_files))]
 
         pretrain_iter = self._pretrain_iter(pretrain_files)
         variation_iter = self._variation_iter(variation_files)
@@ -453,6 +459,8 @@ def get_finetune_dataloader(
     tau_base=0.3,
     tau_alpha=1.0,
     seed=42,
+    rank=0,
+    world_size=1,
 ):
     dataset = FinetuneIterableDataset(
         pretrain_parquet_dir=pretrain_parquet_dir,
@@ -467,6 +475,8 @@ def get_finetune_dataloader(
         tau_base=tau_base,
         tau_alpha=tau_alpha,
         seed=seed,
+        rank=rank,
+        world_size=world_size,
     )
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
 
@@ -485,6 +495,8 @@ def get_finetune_train_val_dataloaders(
     tau_base=0.3,
     tau_alpha=1.0,
     seed=42,
+    rank=0,
+    world_size=1,
 ):
     """Create train and validation dataloaders by splitting files."""
     all_pretrain = sorted(glob.glob(os.path.join(pretrain_parquet_dir, "*.parquet")))
@@ -516,6 +528,8 @@ def get_finetune_train_val_dataloaders(
         tau_base=tau_base,
         tau_alpha=tau_alpha,
         seed=seed,
+        rank=rank,
+        world_size=world_size,
     )
 
     train_dataset = FinetuneIterableDataset(

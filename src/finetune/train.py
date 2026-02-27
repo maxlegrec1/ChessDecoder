@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
 import wandb
 from datetime import datetime
 from tqdm import tqdm
@@ -24,6 +25,10 @@ from src.models.model import ChessDecoder
 from src.models.vocab import (vocab_size, token_to_idx, board_vocab_size, move_vocab_size,
                               board_idx_to_full_idx, move_idx_to_full_idx, board_token_to_idx)
 from src.finetune.loader import get_finetune_dataloader, get_finetune_train_val_dataloaders
+from src.utils.distributed import (
+    setup_distributed, cleanup_distributed, is_main_process, get_device,
+    average_gradients, barrier, print_rank0,
+)
 
 
 def load_config(config_path):
@@ -288,18 +293,25 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
 
     model.train()
 
+    # All-reduce counts across ranks for proper multi-GPU validation
+    if dist.is_initialized():
+        for k in counts:
+            t = torch.tensor(counts[k], device=device, dtype=torch.float64)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            counts[k] = [t[0].item(), t[1].item()]
+
     # Compute final averaged metrics
     results = {}
     for k in metric_keys:
         correct, total = counts[k]
         results[k] = correct / (total + 1e-8)
 
-    print(f"  Validation ({n_batches} batches): "
-          f"board={results['board_acc']:.4f}, final_move={results['final_move_acc']:.4f}, "
-          f"think_move={results['thinking_move_acc']:.4f}, "
-          f"end_var={results['end_var_acc']:.4f}, continue_var={results['continue_var_acc']:.4f}, "
-          f"end_think={results['end_think_acc']:.4f}, new_var={results['new_variation_acc']:.4f}, "
-          f"end_var@maxd={results['end_var_max_depth_acc']:.4f}, end_think@maxv={results['end_think_max_var_acc']:.4f}")
+    print_rank0(f"  Validation ({n_batches} batches): "
+                f"board={results['board_acc']:.4f}, final_move={results['final_move_acc']:.4f}, "
+                f"think_move={results['thinking_move_acc']:.4f}, "
+                f"end_var={results['end_var_acc']:.4f}, continue_var={results['continue_var_acc']:.4f}, "
+                f"end_think={results['end_think_acc']:.4f}, new_var={results['new_variation_acc']:.4f}, "
+                f"end_var@maxd={results['end_var_max_depth_acc']:.4f}, end_think@maxv={results['end_think_max_var_acc']:.4f}")
 
     return results
 
@@ -307,8 +319,9 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
 def train():
     config = load_config("src/finetune/config.yaml")
 
-    device = torch.device(config["training"]["device"] if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    rank, local_rank, world_size = setup_distributed()
+    device = get_device(local_rank)
+    print_rank0(f"Using device: {device}, world_size: {world_size}")
 
     # Model
     model = ChessDecoder(
@@ -327,7 +340,7 @@ def train():
     # Load pretrained checkpoint
     pretrain_checkpoint = config["training"]["pretrain_checkpoint"]
     checkpoint = load_pretrained_checkpoint(model, pretrain_checkpoint, device)
-    print(f"Loaded pretrained checkpoint from {pretrain_checkpoint}")
+    print_rank0(f"Loaded pretrained checkpoint from {pretrain_checkpoint}")
 
     # Check if resuming from a finetune checkpoint
     resume_from = config["training"].get("resume_from")
@@ -344,13 +357,13 @@ def train():
         checkpoint_files.sort(key=lambda x: os.path.getmtime(os.path.join(resume_from, x)))
         latest_checkpoint = os.path.join(resume_from, checkpoint_files[-1])
 
-        print(f"Resuming finetune from checkpoint: {latest_checkpoint}")
+        print_rank0(f"Resuming finetune from checkpoint: {latest_checkpoint}")
         ft_checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(ft_checkpoint["model_state_dict"])
         start_epoch = ft_checkpoint["epoch"]
         step = ft_checkpoint["step"]
         resume_epoch_step = ft_checkpoint.get("epoch_step", 0)
-        print(f"Resumed from epoch {start_epoch}, step {step}, epoch_step {resume_epoch_step}")
+        print_rank0(f"Resumed from epoch {start_epoch}, step {step}, epoch_step {resume_epoch_step}")
 
     # Dataloaders (train/val split)
     val_batches = config["training"].get("val_batches", 100)
@@ -367,6 +380,8 @@ def train():
         tau_base=config["data"].get("tau_base", 0.3),
         tau_alpha=config["data"].get("tau_alpha", 1.0),
         seed=seed,
+        rank=rank,
+        world_size=world_size,
     )
 
     # Optimizer
@@ -413,32 +428,35 @@ def train():
             config["training"]["checkpoint_dir"],
             f"{config['run_name']}_{timestamp}"
         )
-        os.makedirs(run_checkpoint_dir, exist_ok=True)
+        if is_main_process():
+            os.makedirs(run_checkpoint_dir, exist_ok=True)
+        barrier()
 
-    print(f"Checkpoints will be saved to: {run_checkpoint_dir}")
-    print(f"Mixed precision training: {'enabled' if use_amp else 'disabled'}")
-    print(f"Gradient accumulation steps: {grad_accum}")
-    print(f"Warmup steps: {warmup_steps}")
+    print_rank0(f"Checkpoints will be saved to: {run_checkpoint_dir}")
+    print_rank0(f"Mixed precision training: {'enabled' if use_amp else 'disabled'}")
+    print_rank0(f"Gradient accumulation steps: {grad_accum}")
+    print_rank0(f"Warmup steps: {warmup_steps}")
 
     # Initialize wandb (resume existing run if ID file exists in checkpoint dir)
-    wandb_id_path = os.path.join(run_checkpoint_dir, "wandb_run_id.txt")
-    wandb_run_id = None
-    if os.path.exists(wandb_id_path):
-        wandb_run_id = open(wandb_id_path).read().strip()
-        print(f"Resuming wandb run: {wandb_run_id}")
+    if is_main_process():
+        wandb_id_path = os.path.join(run_checkpoint_dir, "wandb_run_id.txt")
+        wandb_run_id = None
+        if os.path.exists(wandb_id_path):
+            wandb_run_id = open(wandb_id_path).read().strip()
+            print(f"Resuming wandb run: {wandb_run_id}")
 
-    wandb.init(
-        project=config["project_name"],
-        name=config["run_name"],
-        config=config,
-        id=wandb_run_id,
-        resume="must" if wandb_run_id else None,
-    )
+        wandb.init(
+            project=config["project_name"],
+            name=config["run_name"],
+            config=config,
+            id=wandb_run_id,
+            resume="must" if wandb_run_id else None,
+        )
 
-    if not wandb_run_id:
-        with open(wandb_id_path, "w") as f:
-            f.write(wandb.run.id)
-        print(f"Saved wandb run ID to {wandb_id_path}")
+        if not wandb_run_id:
+            with open(wandb_id_path, "w") as f:
+                f.write(wandb.run.id)
+            print(f"Saved wandb run ID to {wandb_id_path}")
 
     model.train()
 
@@ -450,7 +468,7 @@ def train():
     d_weight = config["loss"].get("d_weight", 1.0)
 
     for epoch in range(start_epoch, config["training"]["num_epochs"]):
-        print(f"Epoch {epoch + 1}/{config['training']['num_epochs']}")
+        print_rank0(f"Epoch {epoch + 1}/{config['training']['num_epochs']}")
 
         # Set epoch on dataset for deterministic seeding (workers pick this up)
         dataloader.dataset.epoch = epoch
@@ -459,15 +477,15 @@ def train():
         skip_batches = resume_epoch_step
         resume_epoch_step = 0  # only skip on the first epoch after resume
         if skip_batches > 0:
-            print(f"Fast-forwarding dataloader by {skip_batches} batches...")
+            print_rank0(f"Fast-forwarding dataloader by {skip_batches} batches...")
 
         epoch_step = 0
 
-        for batch in tqdm(dataloader):
+        for batch in tqdm(dataloader, disable=not is_main_process()):
             epoch_step += 1
             if epoch_step <= skip_batches:
                 if epoch_step == skip_batches:
-                    print(f"Fast-forwarded {skip_batches} batches, resuming training...")
+                    print_rank0(f"Fast-forwarded {skip_batches} batches, resuming training...")
                 continue
             input_ids = batch["input_ids"].to(device)
             board_target_ids = batch["board_target_ids"].to(device)
@@ -586,6 +604,7 @@ def train():
 
             if (step + 1) % grad_accum == 0:
                 scaler.unscale_(optimizer)
+                average_gradients(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -730,7 +749,7 @@ def train():
                 batch_has_thinking = thinking_move_mask.any(dim=1).sum().item()
                 batch_has_normal = (move_mask.any(dim=1) & ~thinking_move_mask.any(dim=1)).sum().item()
 
-            if step % config["training"]["log_every_n_steps"] == 0:
+            if step % config["training"]["log_every_n_steps"] == 0 and is_main_process():
                 print(f"Step {step}: Loss {total_loss.item():.4f} "
                       f"(FinalMove: {final_move_loss.item():.4f}, ThinkMove: {thinking_move_loss.item():.4f}, "
                       f"Board: {board_loss.item():.4f}, "
@@ -776,7 +795,7 @@ def train():
             step += 1
 
             # Save checkpoint every N steps
-            if save_every_n_steps and step % save_every_n_steps == 0:
+            if save_every_n_steps and step % save_every_n_steps == 0 and is_main_process():
                 ckpt = {
                     "epoch": epoch,
                     "step": step,
@@ -789,37 +808,43 @@ def train():
                 checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_step_{step}.pt")
                 torch.save(ckpt, checkpoint_path)
                 print(f"Saved checkpoint to {checkpoint_path}")
+                barrier()
 
         # Validation at end of epoch
-        print(f"Running validation for epoch {epoch + 1}...")
+        print_rank0(f"Running validation for epoch {epoch + 1}...")
         val_results = validate(model, val_dataloader, val_batches, device, use_amp, config)
-        wandb.log({
-            "accuracies/val_end_var_acc": val_results["end_var_acc"],
-            "accuracies/val_continue_var_acc": val_results["continue_var_acc"],
-            "accuracies/val_end_think_acc": val_results["end_think_acc"],
-            "accuracies/val_new_variation_acc": val_results["new_variation_acc"],
-            "accuracies/val_board_acc": val_results["board_acc"],
-            "accuracies/val_final_move_acc": val_results["final_move_acc"],
-            "accuracies/val_thinking_move_acc": val_results["thinking_move_acc"],
-            "accuracies/val_end_var_max_depth_acc": val_results["end_var_max_depth_acc"],
-            "accuracies/val_end_think_max_var_acc": val_results["end_think_max_var_acc"],
-            "train/epoch": epoch,
-            "train/step": step,
-        })
+        if is_main_process():
+            wandb.log({
+                "accuracies/val_end_var_acc": val_results["end_var_acc"],
+                "accuracies/val_continue_var_acc": val_results["continue_var_acc"],
+                "accuracies/val_end_think_acc": val_results["end_think_acc"],
+                "accuracies/val_new_variation_acc": val_results["new_variation_acc"],
+                "accuracies/val_board_acc": val_results["board_acc"],
+                "accuracies/val_final_move_acc": val_results["final_move_acc"],
+                "accuracies/val_thinking_move_acc": val_results["thinking_move_acc"],
+                "accuracies/val_end_var_max_depth_acc": val_results["end_var_max_depth_acc"],
+                "accuracies/val_end_think_max_var_acc": val_results["end_think_max_var_acc"],
+                "train/epoch": epoch,
+                "train/step": step,
+            })
 
         # Save checkpoint at end of epoch (epoch_step=0 so next epoch starts fresh)
-        ckpt = {
-            "epoch": epoch + 1,
-            "step": step,
-            "epoch_step": 0,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "config": config,
-        }
-        checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt")
-        torch.save(ckpt, checkpoint_path)
-        print(f"Saved checkpoint to {checkpoint_path}")
+        if is_main_process():
+            ckpt = {
+                "epoch": epoch + 1,
+                "step": step,
+                "epoch_step": 0,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "config": config,
+            }
+            checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt")
+            torch.save(ckpt, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+        barrier()
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
