@@ -11,19 +11,24 @@ and expands embedding/heads for the new end_var token (vocab_size += 1).
 """
 
 import os
+import random
 import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
+import chess
+import pandas as pd
 import wandb
 from datetime import datetime
 from tqdm import tqdm
 
 from src.models.model import ChessDecoder
-from src.models.vocab import (vocab_size, token_to_idx, board_vocab_size, move_vocab_size,
-                              board_idx_to_full_idx, move_idx_to_full_idx, board_token_to_idx)
+from src.models.vocab import (vocab_size, token_to_idx, idx_to_token, board_vocab_size, move_vocab_size,
+                              board_idx_to_full_idx, move_idx_to_full_idx, board_token_to_idx,
+                              move_token_to_idx)
+from src.dataloader.data import fen_to_position_tokens
 from src.finetune.loader import get_finetune_dataloader, get_finetune_train_val_dataloaders
 from src.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
@@ -159,6 +164,263 @@ def compute_accuracies(board_target_ids, board_logits, board_mask, preds_board,
     accs["new_variation_acc"] = (preds_board[new_variation_mask] == new_variation_board_idx).float().mean().item() if new_variation_mask.any() else 0.0
 
     return accs
+
+
+def load_eval_positions(data_dir, n=20, seed=42):
+    """Load fixed (fen, best_move) pairs for self-play evaluation."""
+    files = sorted(f for f in os.listdir(data_dir) if f.endswith(".parquet"))
+    rng = random.Random(seed)
+    fname = rng.choice(files)
+    df = pd.read_parquet(os.path.join(data_dir, fname), columns=["fen", "best_move"])
+    indices = rng.sample(range(len(df)), min(n * 3, len(df)))
+    seen = set()
+    pairs = []
+    for i in indices:
+        fen = df.iloc[i]["fen"]
+        if fen not in seen:
+            seen.add(fen)
+            pairs.append((fen, df.iloc[i]["best_move"]))
+        if len(pairs) >= n:
+            break
+    return pairs[:n]
+
+
+# Board sub-vocab indices for structural tokens
+_BOARD_END_VAR_IDX = board_token_to_idx["end_var"]
+_BOARD_END_THINK_IDX = board_token_to_idx["end_think"]
+
+
+@torch.no_grad()
+def run_selfplay_inference(model, fen, device, max_seq_len=4096, use_amp=True):
+    """Run full autoregressive thinking inference, return final move or None."""
+    token_ids = []
+    block_ids = []
+    wl_entries = []
+    d_entries = []
+    next_block = [0]
+    orphan_ctr = [10000]
+
+    def orphan():
+        orphan_ctr[0] += 1
+        return orphan_ctr[0]
+
+    def append(tok_id, bid):
+        token_ids.append(tok_id)
+        block_ids.append(bid)
+
+    def full():
+        return len(token_ids) >= max_seq_len
+
+    def prefix_forward():
+        S = len(token_ids)
+        inp = torch.tensor([token_ids], dtype=torch.long, device=device)
+        blk = torch.tensor([block_ids], dtype=torch.long, device=device)
+        wl_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
+        d_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
+        wl_val = torch.zeros(1, S, device=device)
+        d_val = torch.zeros(1, S, device=device)
+        for p, v in wl_entries:
+            wl_pos[0, p] = True; wl_val[0, p] = v
+        for p, v in d_entries:
+            d_pos[0, p] = True; d_val[0, p] = v
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            return model(inp, mask_type="prefix", block_id=blk,
+                         wl_values=wl_val, d_values=d_val,
+                         wl_positions=wl_pos, d_positions=d_pos)
+
+    def causal_forward():
+        S = len(token_ids)
+        inp = torch.tensor([token_ids], dtype=torch.long, device=device)
+        wl_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
+        d_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
+        wl_val = torch.zeros(1, S, device=device)
+        d_val = torch.zeros(1, S, device=device)
+        for p, v in wl_entries:
+            wl_pos[0, p] = True; wl_val[0, p] = v
+        for p, v in d_entries:
+            d_pos[0, p] = True; d_val[0, p] = v
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            return model(inp, mask_type="causal",
+                         wl_values=wl_val, d_values=d_val,
+                         wl_positions=wl_pos, d_positions=d_pos)
+
+    # Root board
+    root_tokens = fen_to_position_tokens(fen)
+    bid = next_block[0]; next_block[0] += 1
+    for t in root_tokens:
+        append(token_to_idx[t], bid)
+    if full():
+        return None
+
+    # start_think
+    append(token_to_idx["start_think"], orphan())
+
+    state = "MOVE"
+
+    while not full():
+        if state == "MOVE":
+            pos = len(token_ids) - 1
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                h = prefix_forward()
+                logits = model.thinking_policy_head(h)[0, pos, :]
+            move_sub_idx = torch.argmax(logits).item()
+            full_idx = move_idx_to_full_idx[move_sub_idx]
+            append(full_idx, orphan())
+            state = "WL_D"
+
+        elif state == "WL_D":
+            if full():
+                break
+            move_pos = len(token_ids) - 1
+            # WL
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                h = prefix_forward()
+                wl_logits = model.wl_head(h[0, move_pos:move_pos+1, :])
+            wl_idx = torch.argmax(wl_logits, dim=-1)
+            wl = model.wl_bucket_centers[wl_idx].item()
+            wl_pos_idx = len(token_ids)
+            append(token_to_idx["wl_value"], orphan())
+            wl_entries.append((wl_pos_idx, wl))
+            # D
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                h = prefix_forward()
+                d_logits = model.d_head(h[0, wl_pos_idx:wl_pos_idx+1, :])
+            d_idx = torch.argmax(d_logits, dim=-1)
+            d = model.d_bucket_centers[d_idx].item()
+            d_pos_idx = len(token_ids)
+            append(token_to_idx["d_value"], orphan())
+            d_entries.append((d_pos_idx, d))
+            state = "BOARD"
+
+        elif state == "BOARD":
+            if full():
+                break
+            bid = next_block[0]; next_block[0] += 1
+            for _ in range(68):
+                if full():
+                    break
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                    h = causal_forward()
+                    logits = model.board_head(h)[0, -1, :]
+                board_sub_idx = torch.argmax(logits).item()
+                append(board_idx_to_full_idx[board_sub_idx], bid)
+            state = "AFTER_BOARD"
+
+        elif state == "AFTER_BOARD":
+            if full():
+                break
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                h = causal_forward()
+                logits = model.board_head(h)[0, -1, :]
+            board_sub_idx = torch.argmax(logits).item()
+            if board_sub_idx == _BOARD_END_VAR_IDX:
+                append(board_idx_to_full_idx[board_sub_idx], orphan())
+                state = "AFTER_END_VAR"
+            else:
+                state = "MOVE"
+
+        elif state == "AFTER_END_VAR":
+            if full():
+                break
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                h = causal_forward()
+                logits = model.board_head(h)[0, -1, :]
+            board_sub_idx = torch.argmax(logits).item()
+            if board_sub_idx == _BOARD_END_THINK_IDX:
+                append(board_idx_to_full_idx[board_sub_idx], orphan())
+                state = "FINAL"
+            else:
+                state = "MOVE"
+
+        elif state == "FINAL":
+            if full():
+                break
+            pos = len(token_ids) - 1
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                h = prefix_forward()
+                logits = model.policy_head(h)[0, pos, :]
+
+            # Legal move filtering
+            board = chess.Board(fen)
+            legal_mask = torch.full_like(logits, float('-inf'))
+            for m in board.legal_moves:
+                uci = m.uci()
+                if board.is_castling(m):
+                    uci = {'e1g1': 'e1h1', 'e1c1': 'e1a1',
+                            'e8g8': 'e8h8', 'e8c8': 'e8a8'}.get(uci, uci)
+                if uci in move_token_to_idx:
+                    legal_mask[move_token_to_idx[uci]] = 0
+            logits = logits + legal_mask
+
+            move_sub_idx = torch.argmax(logits).item()
+            full_idx = move_idx_to_full_idx[move_sub_idx]
+            move_str = idx_to_token[full_idx]
+            move_str = {'e1h1': 'e1g1', 'e1a1': 'e1c1',
+                        'e8h8': 'e8g8', 'e8a8': 'e8c8'}.get(move_str, move_str)
+            return move_str
+
+    return None  # sequence ran out before FINAL
+
+
+@torch.no_grad()
+def validate_selfplay(model, eval_positions, device, max_seq_len, use_amp):
+    """Run self-play thinking + root policy evaluation. Returns dict with metrics."""
+    model.eval()
+
+    selfplay_correct = 0
+    selfplay_total = 0
+    root_correct = 0
+
+    for fen, best_move in eval_positions:
+        # Self-play: full thinking inference
+        move = run_selfplay_inference(model, fen, device, max_seq_len, use_amp)
+        if move is not None:
+            selfplay_total += 1
+            if move == best_move:
+                selfplay_correct += 1
+
+        # Root policy: no thinking, single forward pass
+        tokens = fen_to_position_tokens(fen)
+        input_ids = torch.tensor([[token_to_idx[t] for t in tokens]], dtype=torch.long, device=device)
+        block_id = torch.zeros(1, len(tokens), dtype=torch.long, device=device)
+
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            h = model(input_ids, mask_type="prefix", block_id=block_id)
+            logits = model.policy_head(h)[0, -1, :]
+
+        # Legal move filtering
+        board = chess.Board(fen)
+        legal_mask = torch.full_like(logits, float('-inf'))
+        for m in board.legal_moves:
+            uci = m.uci()
+            if board.is_castling(m):
+                uci = {'e1g1': 'e1h1', 'e1c1': 'e1a1',
+                        'e8g8': 'e8h8', 'e8c8': 'e8a8'}.get(uci, uci)
+            if uci in move_token_to_idx:
+                legal_mask[move_token_to_idx[uci]] = 0
+        logits = logits + legal_mask
+
+        move_sub_idx = torch.argmax(logits).item()
+        full_idx = move_idx_to_full_idx[move_sub_idx]
+        move_str = idx_to_token[full_idx]
+        move_str = {'e1h1': 'e1g1', 'e1a1': 'e1c1',
+                    'e8h8': 'e8g8', 'e8a8': 'e8c8'}.get(move_str, move_str)
+        if move_str == best_move:
+            root_correct += 1
+
+    n = len(eval_positions)
+    results = {
+        "selfplay_acc": selfplay_correct / (selfplay_total + 1e-8),
+        "selfplay_completed": selfplay_total,
+        "root_policy_acc": root_correct / n if n > 0 else 0.0,
+    }
+
+    print_rank0(f"  Self-play eval ({n} positions): "
+                f"selfplay_acc={results['selfplay_acc']:.1%} ({selfplay_correct}/{selfplay_total}), "
+                f"root_policy_acc={results['root_policy_acc']:.1%} ({root_correct}/{n})")
+
+    model.train()
+    return results
 
 
 def validate(model, val_dataloader, val_batches, device, use_amp, config):
@@ -316,6 +578,44 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
     return results
 
 
+def run_full_validation(model, val_dataloader, val_batches, device, use_amp,
+                        config, eval_positions, epoch, step):
+    """Run GT-context validation, self-play evaluation, and log everything."""
+    print_rank0(f"Running validation at step {step}...")
+    val_results = validate(model, val_dataloader, val_batches, device, use_amp, config)
+
+    # Self-play evaluation (rank 0 only, expensive)
+    selfplay_results = {}
+    if is_main_process() and eval_positions:
+        print_rank0(f"Running self-play evaluation ({len(eval_positions)} positions)...")
+        selfplay_results = validate_selfplay(
+            model, eval_positions, device,
+            max_seq_len=config["model"]["max_seq_len"], use_amp=use_amp)
+
+    if is_main_process():
+        log_dict = {
+            "accuracies/val_end_var_acc": val_results["end_var_acc"],
+            "accuracies/val_continue_var_acc": val_results["continue_var_acc"],
+            "accuracies/val_end_think_acc": val_results["end_think_acc"],
+            "accuracies/val_new_variation_acc": val_results["new_variation_acc"],
+            "accuracies/val_board_acc": val_results["board_acc"],
+            "accuracies/val_final_move_acc": val_results["final_move_acc"],
+            "accuracies/val_thinking_move_acc": val_results["thinking_move_acc"],
+            "accuracies/val_end_var_max_depth_acc": val_results["end_var_max_depth_acc"],
+            "accuracies/val_end_think_max_var_acc": val_results["end_think_max_var_acc"],
+            "train/epoch": epoch,
+            "train/step": step,
+        }
+        if selfplay_results:
+            log_dict.update({
+                "accuracies/selfplay_acc": selfplay_results["selfplay_acc"],
+                "accuracies/root_policy_acc": selfplay_results["root_policy_acc"],
+                "accuracies/exposure_bias_gap": (
+                    val_results["final_move_acc"] - selfplay_results["selfplay_acc"]),
+            })
+        wandb.log(log_dict)
+
+
 def train():
     config = load_config("src/finetune/config.yaml")
 
@@ -384,6 +684,14 @@ def train():
         world_size=world_size,
     )
 
+    # Load fixed eval positions for self-play evaluation (rank 0 only)
+    selfplay_n = config["training"].get("selfplay_eval_positions", 20)
+    eval_positions = []
+    if is_main_process() and selfplay_n > 0:
+        eval_positions = load_eval_positions(
+            config["data"]["pretrain_parquet_dir"], n=selfplay_n, seed=seed)
+        print_rank0(f"Loaded {len(eval_positions)} positions for self-play evaluation")
+
     # Optimizer
     optimizer = optim.AdamW(
         model.parameters(),
@@ -399,6 +707,7 @@ def train():
     warmup_steps = config["training"].get("warmup_steps", 500)
     grad_accum = config["training"].get("gradient_accumulation_steps", 1)
     save_every_n_steps = config["training"].get("save_every_n_steps", 0)
+    validate_every_n_steps = config["training"].get("validate_every_n_steps", 0)
 
     def lr_lambda(current_step):
         if current_step < warmup_steps:
@@ -810,23 +1119,14 @@ def train():
                 print(f"Saved checkpoint to {checkpoint_path}")
                 barrier()
 
+            # Mid-epoch validation every N steps
+            if validate_every_n_steps and step % validate_every_n_steps == 0:
+                run_full_validation(model, val_dataloader, val_batches, device, use_amp,
+                                    config, eval_positions, epoch, step)
+
         # Validation at end of epoch
-        print_rank0(f"Running validation for epoch {epoch + 1}...")
-        val_results = validate(model, val_dataloader, val_batches, device, use_amp, config)
-        if is_main_process():
-            wandb.log({
-                "accuracies/val_end_var_acc": val_results["end_var_acc"],
-                "accuracies/val_continue_var_acc": val_results["continue_var_acc"],
-                "accuracies/val_end_think_acc": val_results["end_think_acc"],
-                "accuracies/val_new_variation_acc": val_results["new_variation_acc"],
-                "accuracies/val_board_acc": val_results["board_acc"],
-                "accuracies/val_final_move_acc": val_results["final_move_acc"],
-                "accuracies/val_thinking_move_acc": val_results["thinking_move_acc"],
-                "accuracies/val_end_var_max_depth_acc": val_results["end_var_max_depth_acc"],
-                "accuracies/val_end_think_max_var_acc": val_results["end_think_max_var_acc"],
-                "train/epoch": epoch,
-                "train/step": step,
-            })
+        run_full_validation(model, val_dataloader, val_batches, device, use_amp,
+                            config, eval_positions, epoch, step)
 
         # Save checkpoint at end of epoch (epoch_step=0 so next epoch starts fresh)
         if is_main_process():
