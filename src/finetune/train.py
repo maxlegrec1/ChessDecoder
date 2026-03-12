@@ -10,8 +10,11 @@ Loads pretrained checkpoint, clones policy_head -> thinking_policy_head,
 and expands embedding/heads for the new end_var token (vocab_size += 1).
 """
 
+import glob
 import os
 import random
+import shutil
+import tempfile
 import yaml
 import torch
 import torch.nn as nn
@@ -22,6 +25,7 @@ import chess
 import pandas as pd
 import wandb
 from datetime import datetime
+from pathlib import Path
 from tqdm import tqdm
 
 from src.models.model import ChessDecoder
@@ -578,6 +582,197 @@ def validate(model, val_dataloader, val_batches, device, use_amp, config):
     return results
 
 
+# ──────────────────────────────────────────────────────────
+#  C++ selfplay eval helpers
+# ──────────────────────────────────────────────────────────
+
+_PSEUDO_TO_STANDARD = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
+
+
+def _normalize_castling(move):
+    return _PSEUDO_TO_STANDARD.get(move, move)
+
+
+def load_cpp_pretrain_positions(data_dir, n, seed):
+    """Load fixed (fen, best_move) pairs from pretrain parquets for C++ eval."""
+    files = sorted(f for f in os.listdir(data_dir) if f.endswith(".parquet"))
+    rng = random.Random(seed)
+    fname = rng.choice(files)
+    df = pd.read_parquet(os.path.join(data_dir, fname), columns=["fen", "best_move"])
+    indices = rng.sample(range(len(df)), min(n * 3, len(df)))
+    seen = set()
+    pairs = []
+    for i in indices:
+        fen = df.iloc[i]["fen"]
+        if fen not in seen:
+            seen.add(fen)
+            pairs.append({"fen": fen, "best_move": _normalize_castling(df.iloc[i]["best_move"])})
+        if len(pairs) >= n:
+            break
+    return pairs
+
+
+def load_cpp_variation_positions(data_dir, n, seed):
+    """Load fixed (fen, best_move, mcts_action) from variation parquets for C++ eval."""
+    files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
+    rng = random.Random(seed)
+    chosen_files = rng.sample(files, min(3, len(files)))
+    rows = []
+    for f in chosen_files:
+        df = pd.read_parquet(f, columns=["fen", "best_move", "mcts_action"])
+        rows.extend(df.to_dict("records"))
+    rng.shuffle(rows)
+    valid = [r for r in rows if r.get("mcts_action")]
+    seen = set()
+    unique = []
+    for r in valid:
+        if r["fen"] not in seen:
+            seen.add(r["fen"])
+            r["mcts_action"] = _normalize_castling(r["mcts_action"])
+            r["best_move"] = _normalize_castling(r["best_move"])
+            unique.append(r)
+        if len(unique) >= n:
+            break
+    return unique
+
+
+def _cpp_eval_subprocess(tmp_dir, var_positions_json, pt_positions_json, results_path):
+    """Run C++ inference in a subprocess to isolate GPU memory. Called via multiprocessing."""
+    import json
+    import _decoder_inference_cpp as cpp
+
+    var_eval_positions = json.loads(var_positions_json)
+    pt_eval_positions = json.loads(pt_positions_json)
+
+    engine = cpp.ThinkingInferenceEngine(
+        str(Path(tmp_dir) / "backbone.pt"),
+        str(Path(tmp_dir) / "weights"),
+        str(Path(tmp_dir) / "vocab.json"),
+        str(Path(tmp_dir) / "config.json"),
+    )
+
+    # A+B) Variation positions
+    var_mcts_correct = 0
+    var_best_correct = 0
+    var_completed = 0
+    n_var = len(var_eval_positions)
+    for i, pos in enumerate(var_eval_positions):
+        sp_move = engine.predict_move(pos["fen"], 0.0)
+        if sp_move:
+            sp_move = _normalize_castling(sp_move)
+            var_completed += 1
+            if sp_move == pos["mcts_action"]:
+                var_mcts_correct += 1
+            if sp_move == pos["best_move"]:
+                var_best_correct += 1
+        if (i + 1) % 20 == 0:
+            print(f"  [cpp_eval] Variation: {i+1}/{n_var}", flush=True)
+
+    # C) Pretrain positions
+    pt_best_correct = 0
+    pt_best_total = 0
+    n_pt = len(pt_eval_positions)
+    for i, pos in enumerate(pt_eval_positions):
+        sp_move = engine.predict_move(pos["fen"], 0.0)
+        if sp_move:
+            pt_best_total += 1
+            if _normalize_castling(sp_move) == pos["best_move"]:
+                pt_best_correct += 1
+        if (i + 1) % 20 == 0:
+            print(f"  [cpp_eval] Pretrain: {i+1}/{n_pt}", flush=True)
+
+    results = {
+        "var_mcts_acc": var_mcts_correct / (var_completed + 1e-8),
+        "var_best_acc": var_best_correct / (var_completed + 1e-8),
+        "pt_best_acc": pt_best_correct / (pt_best_total + 1e-8),
+        "var_mcts_correct": var_mcts_correct,
+        "var_best_correct": var_best_correct,
+        "var_completed": var_completed,
+        "pt_best_correct": pt_best_correct,
+        "pt_best_total": pt_best_total,
+    }
+
+    import json as json_mod
+    with open(results_path, "w") as f:
+        json_mod.dump(results, f)
+
+
+def validate_cpp_selfplay(model, config, var_eval_positions, pt_eval_positions, step):
+    """Export model to TorchScript, run C++ selfplay inference in subprocess, return accuracy metrics."""
+    import json
+    import subprocess
+    import sys
+    from src.export.common import export_head_weights, export_vocab, export_config
+    from src.export.backbone_causal import from_chess_decoder
+    from src.export.export_torchscript import export_torchscript
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="cpp_eval_"))
+    try:
+        print(f"  [cpp_eval] Exporting model to {tmp_dir} ...")
+        raw_model = model.module if hasattr(model, 'module') else model
+        was_training = raw_model.training
+        raw_model.eval()
+
+        export_vocab(tmp_dir)
+        export_config(config, raw_model, tmp_dir)
+        export_head_weights(raw_model, tmp_dir / "weights")
+
+        causal_backbone = from_chess_decoder(raw_model)
+        export_torchscript(causal_backbone, tmp_dir, config)
+        del causal_backbone
+        torch.cuda.empty_cache()
+
+        # Restore training mode
+        if was_training:
+            raw_model.train()
+
+        # Save positions to temp files for subprocess
+        var_json_path = tmp_dir / "var_positions.json"
+        pt_json_path = tmp_dir / "pt_positions.json"
+        results_path = tmp_dir / "results.json"
+        with open(var_json_path, "w") as f:
+            json.dump(var_eval_positions, f)
+        with open(pt_json_path, "w") as f:
+            json.dump(pt_eval_positions, f)
+
+        # Run inference in subprocess to fully isolate GPU memory
+        print(f"  [cpp_eval] Running inference in subprocess ...")
+        subprocess_script = f"""
+import sys, json
+sys.path.insert(0, '.')
+from pathlib import Path
+from src.finetune.train import _cpp_eval_subprocess
+_cpp_eval_subprocess('{tmp_dir}', open('{var_json_path}').read(), open('{pt_json_path}').read(), '{results_path}')
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", subprocess_script],
+            capture_output=False,
+            timeout=600,
+        )
+
+        if proc.returncode != 0:
+            print(f"  [cpp_eval] Subprocess exited with code {proc.returncode}")
+            return None
+
+        with open(results_path) as f:
+            results = json.load(f)
+
+        print(f"  [cpp_eval] Step {step}: "
+              f"var_mcts={results['var_mcts_correct']}/{results['var_completed']} ({results['var_mcts_acc']:.1%}), "
+              f"var_best={results['var_best_correct']}/{results['var_completed']} ({results['var_best_acc']:.1%}), "
+              f"pt_best={results['pt_best_correct']}/{results['pt_best_total']} ({results['pt_best_acc']:.1%})")
+
+        return results
+
+    except Exception as e:
+        print(f"  [cpp_eval] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def run_full_validation(model, val_dataloader, val_batches, device, use_amp,
                         config, eval_positions, epoch, step):
     """Run GT-context validation, self-play evaluation, and log everything."""
@@ -691,6 +886,19 @@ def train():
         eval_positions = load_eval_positions(
             config["data"]["pretrain_parquet_dir"], n=selfplay_n, seed=seed)
         print_rank0(f"Loaded {len(eval_positions)} positions for self-play evaluation")
+
+    # Load fixed eval positions for C++ selfplay evaluation (rank 0 only)
+    cpp_eval_n = config["training"].get("cpp_eval_n_positions", 0)
+    cpp_eval_seed = config["training"].get("cpp_eval_seed", 42)
+    cpp_var_eval_positions = []
+    cpp_pt_eval_positions = []
+    if is_main_process() and cpp_eval_n > 0:
+        cpp_var_eval_positions = load_cpp_variation_positions(
+            config["data"]["variation_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed)
+        cpp_pt_eval_positions = load_cpp_pretrain_positions(
+            config["data"]["pretrain_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed)
+        print_rank0(f"Loaded {len(cpp_var_eval_positions)} variation + "
+                    f"{len(cpp_pt_eval_positions)} pretrain positions for C++ selfplay eval")
 
     # Optimizer
     optimizer = optim.AdamW(
@@ -1117,6 +1325,19 @@ def train():
                 checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_step_{step}.pt")
                 torch.save(ckpt, checkpoint_path)
                 print(f"Saved checkpoint to {checkpoint_path}")
+
+                # C++ selfplay evaluation (inline on rank 0)
+                if cpp_eval_n > 0 and cpp_var_eval_positions:
+                    cpp_results = validate_cpp_selfplay(
+                        model, config, cpp_var_eval_positions, cpp_pt_eval_positions, step)
+                    if cpp_results:
+                        wandb.log({
+                            "accuracies/cpp_var_mcts_acc": cpp_results["var_mcts_acc"],
+                            "accuracies/cpp_var_best_acc": cpp_results["var_best_acc"],
+                            "accuracies/cpp_pt_best_acc": cpp_results["pt_best_acc"],
+                            "train/step": step,
+                        })
+
                 barrier()
 
             # Mid-epoch validation every N steps

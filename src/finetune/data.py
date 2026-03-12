@@ -151,9 +151,8 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
         for node_idx, node in enumerate(nodes):
             node_fen = node["fen"]
             node_wdl = node.get("wdl", [0.0, 0.0, 0.0])
-            # wdl is [win, draw, loss] from MCTS (from perspective of side-to-move at root)
-            # For nodes at even depth (opponent's move), wdl is flipped
-            # The MCTS already stores wdl from the perspective of the node's parent
+            # wdl is [win, draw, loss] from the side-to-move at this node.
+            # Alternates sign with depth: negative WL at opponent nodes, positive at root-player nodes.
             # We store wl = win - loss, d = draw
             node_win, node_draw, node_loss = node_wdl
             node_wl = node_win - node_loss
