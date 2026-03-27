@@ -32,6 +32,9 @@ public:
     /// Predict the best move for a FEN position using thinking inference.
     std::string predictMove(const std::string& fen, float temperature = 0.0f);
 
+    /// Predict move using only the root board (no thinking). Fast single forward pass.
+    std::string predictMoveRoot(const std::string& fen, float temperature = 0.0f);
+
     /// Get token IDs from the last predictMove() call.
     const std::vector<int>& lastTokenIds() const { return last_token_ids_; }
 

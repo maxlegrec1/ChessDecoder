@@ -25,6 +25,11 @@ PYBIND11_MODULE(_decoder_inference_cpp, m)
              py::call_guard<py::gil_scoped_release>(),
              "Predict the best move for a FEN position using thinking inference.\n"
              "WARNING: Not thread-safe. Do not call from multiple threads.")
+        .def("predict_move_root", &decoder::ThinkingInferenceEngine::predictMoveRoot,
+             py::arg("fen"),
+             py::arg("temperature") = 0.0f,
+             py::call_guard<py::gil_scoped_release>(),
+             "Predict move using only root board (no thinking). Single forward pass.")
         .def("last_token_ids", &decoder::ThinkingInferenceEngine::lastTokenIds,
              py::return_value_policy::reference_internal,
              "Get token IDs from the last predict_move() call.")

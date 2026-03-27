@@ -110,8 +110,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--positions-per-game",
         type=int,
-        default=8,
-        help="Number of positions to sample per game (0 = all).",
+        default=0,
+        help="Fixed number of positions to sample per game (0 = use --sample-rate).",
+    )
+    parser.add_argument(
+        "--sample-rate",
+        type=float,
+        default=0.1,
+        help="Per-position sampling probability (used when --positions-per-game=0). "
+             "Preserves natural ply distribution (longer games contribute more).",
     )
     parser.add_argument(
         "--games-limit",
@@ -217,10 +224,15 @@ def process_file(
                 continue
 
             n = len(game_df)
-            if args.positions_per_game > 0 and args.positions_per_game < n:
-                sampled = sorted(random.sample(range(n), args.positions_per_game))
+            if args.positions_per_game > 0:
+                # Fixed count per game (old behavior, biases toward short games)
+                sampled = sorted(random.sample(range(n), min(args.positions_per_game, n)))
             else:
-                sampled = list(range(n))
+                # Per-position sampling: preserves natural ply distribution
+                sampled = [i for i in range(n) if random.random() < args.sample_rate]
+                if not sampled:
+                    # Always include at least one position per game
+                    sampled = [random.randrange(n)]
 
             for idx in sampled:
                 row = game_df.iloc[idx].to_dict()
@@ -259,7 +271,10 @@ def main() -> None:
     print(f"Simulations: {args.simulations}")
     print(f"Max variations: {args.max_variations}")
     print(f"Max variation depth: {args.max_variation_depth}")
-    print(f"Positions per game: {args.positions_per_game or 'all'}")
+    if args.positions_per_game > 0:
+        print(f"Positions per game: {args.positions_per_game} (fixed)")
+    else:
+        print(f"Sampling rate: {args.sample_rate:.1%} per position (natural distribution)")
     print(f"Engine: {args.engine_path}")
     print(f"Parallel trees: {args.parallel_trees}")
     print(f"Max GPU batch: {args.max_gpu_batch}")

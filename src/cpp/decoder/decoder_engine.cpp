@@ -267,6 +267,11 @@ std::string ThinkingInferenceEngine::fallbackMove(const std::string& fen, float 
     return DecoderVocab::pseudoToStandardUci(vocab_->idxToToken(full_idx));
 }
 
+std::string ThinkingInferenceEngine::predictMoveRoot(const std::string& fen, float temperature)
+{
+    return fallbackMove(fen, temperature);
+}
+
 // ============================================================================
 // Main inference: predictMove
 // ============================================================================
