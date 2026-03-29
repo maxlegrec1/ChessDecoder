@@ -1,0 +1,87 @@
+"""GRPO reinforcement learning configuration."""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import yaml
+
+
+@dataclass
+class GRPOConfig:
+    # --- Project ---
+    project_name: str = "chess-decoder-grpo"
+    run_name: str = "grpo-v1"
+
+    # --- GRPO hyperparams ---
+    group_size: int = 10
+    clip_epsilon: float = 0.2
+    kl_coeff: float = 0.05
+    ppo_epochs: int = 1
+    max_kl: float = 0.05
+
+    # --- Rollout ---
+    rollout_batch_size: int = 64
+    num_workers: int = 4
+    think_temperature: float = 0.8
+    policy_temperature: float = 0.8
+    board_temperature: float = 0.0
+
+    # --- Training ---
+    learning_rate: float = 1e-6
+    weight_decay: float = 0.1
+    warmup_steps: int = 20
+    grad_accum_steps: int = 4
+    max_grad_norm: float = 1.0
+    use_amp: bool = True
+    mini_batch_size: int = 4
+
+    # --- Rewards ---
+    reward_move_quality_weight: float = 1.0
+    reward_format_weight: float = 0.5
+    reward_coherence_weight: float = 0.3
+
+    # --- Data ---
+    variation_parquet_dir: str = "./parquets_variations/"
+    pretrain_parquet_dir: str = "/home/maxime/parquet_files_decoder/"
+    num_eval_positions: int = 200
+    eval_seed: int = 42
+
+    # --- Checkpointing ---
+    pretrain_checkpoint: str = ""
+    checkpoint_dir: str = "checkpoints_rl/"
+    save_every: int = 50
+    eval_every: int = 50
+    log_every: int = 1
+    num_outer_steps: int = 1000
+
+    # --- Model (same structure as finetune config) ---
+    model: dict = field(default_factory=lambda: {
+        "embed_dim": 1024,
+        "num_heads": 16,
+        "num_layers": 12,
+        "max_seq_len": 4096,
+        "d_ff": 1536,
+        "n_buckets": 100,
+        "wl_sigma": 0.4,
+        "value_hidden_size": 256,
+        "num_fourier_freq": 128,
+    })
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "GRPOConfig":
+        with open(path) as f:
+            raw = yaml.safe_load(f)
+
+        kwargs = {}
+        # Flatten nested sections into dataclass fields
+        for section_key, section in raw.items():
+            if section_key == "model":
+                kwargs["model"] = section
+            elif isinstance(section, dict):
+                kwargs.update(section)
+            else:
+                kwargs[section_key] = section
+
+        # Only pass fields that exist in the dataclass
+        valid = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in kwargs.items() if k in valid})

@@ -1,0 +1,53 @@
+project_name: chess-decoder-grpo
+run_name: grpo-v1
+
+model:
+  embed_dim: 1024
+  num_heads: 16
+  num_layers: 12
+  max_seq_len: 4096
+  d_ff: 1536
+  n_buckets: 100
+  wl_sigma: 0.4
+  value_hidden_size: 256
+  num_fourier_freq: 128
+
+grpo:
+  group_size: 10
+  clip_epsilon: 0.2
+  kl_coeff: 0.05
+  ppo_epochs: 1
+  max_kl: 0.05
+
+rollout:
+  rollout_batch_size: 64
+  num_workers: 4
+  think_temperature: 0.8
+  policy_temperature: 0.8
+  board_temperature: 0.0
+
+training:
+  learning_rate: 1.0e-6
+  weight_decay: 0.1
+  warmup_steps: 20
+  grad_accum_steps: 4
+  max_grad_norm: 1.0
+  use_amp: true
+  mini_batch_size: 4
+  pretrain_checkpoint: ""
+  checkpoint_dir: checkpoints_rl/
+  save_every: 50
+  eval_every: 50
+  log_every: 1
+  num_outer_steps: 500
+
+rewards:
+  reward_move_quality_weight: 1.0
+  reward_format_weight: 0.5
+  reward_coherence_weight: 0.3
+
+data:
+  variation_parquet_dir: ./parquets_variations/
+  pretrain_parquet_dir: /home/maxime/parquet_files_decoder/
+  num_eval_positions: 200
+  eval_seed: 42
