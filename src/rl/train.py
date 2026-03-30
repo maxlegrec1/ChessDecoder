@@ -270,17 +270,7 @@ def train():
             fens = [p["fen"] for p in batch_positions]
             B = len(fens)
 
-            # 2. Offload ALL models to CPU to give full GPU to rollout engine
-            model.cpu()
-            ref_model.cpu()
-            # Move optimizer state to CPU too (AdamW stores momentum on same device as params)
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.cpu()
-            torch.cuda.empty_cache()
-
-            # 3. Generate rollouts (engine created, used, destroyed inside)
+            # 2. Generate rollouts in subprocess (complete GPU memory isolation)
             print_rank0(f"Step {outer_step}: generating {B}x{G} rollouts (batch={config.inference_batch_size}) ...")
             t0 = time.time()
             grouped_rollouts = generate_rollouts(str(export_dir), fens, config)
@@ -288,14 +278,6 @@ def train():
             total_rollout_tok = sum(r.num_tokens for group in grouped_rollouts for r in group)
             print_rank0(f"  Rollouts: {rollout_time:.1f}s, {total_rollout_tok} tok, "
                         f"{total_rollout_tok/rollout_time:.0f} tok/s")
-
-            # 4. Reload models + optimizer state to GPU for training
-            model.to(device)
-            ref_model.to(device)
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(device)
 
             # 5. Compute rewards
             grouped_rewards: list[list[tuple[float, dict[str, float]]]] = []
