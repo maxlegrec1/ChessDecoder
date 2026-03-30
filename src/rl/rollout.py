@@ -107,12 +107,16 @@ class RolloutEngine:
         self.export_dir = export_dir
         self.num_workers = config.num_workers
 
-        self._task_queue: mp.Queue = mp.Queue()
-        self._result_queue: mp.Queue = mp.Queue()
+        # Use "spawn" context to avoid inheriting parent's CUDA state.
+        # Fork (default on Linux) would cause "CUDA initialization error"
+        # because CUDA contexts cannot cross fork boundaries.
+        ctx = mp.get_context("spawn")
+        self._task_queue = ctx.Queue()
+        self._result_queue = ctx.Queue()
         self._workers: list[mp.Process] = []
 
         for i in range(self.num_workers):
-            p = mp.Process(
+            p = ctx.Process(
                 target=_worker_loop,
                 args=(
                     i, export_dir, self._task_queue, self._result_queue,

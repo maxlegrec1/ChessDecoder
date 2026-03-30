@@ -22,8 +22,8 @@ grpo:
 rollout:
   rollout_batch_size: 64
   num_workers: 4
-  think_temperature: 0.8
-  policy_temperature: 0.8
+  think_temperature: 1.5
+  policy_temperature: 1.5
   board_temperature: 0.0
 
 training:
@@ -34,7 +34,7 @@ training:
   max_grad_norm: 1.0
   use_amp: true
   mini_batch_size: 4
-  pretrain_checkpoint: ""
+  finetuned_checkpoint: "checkpoints/finetune-thinking-v1_20260320_205453/checkpoint_step_282000.pt"
   checkpoint_dir: checkpoints_rl/
   save_every: 50
   eval_every: 50
@@ -49,5 +49,6 @@ rewards:
 data:
   variation_parquet_dir: ./parquets_variations/
   pretrain_parquet_dir: /home/maxime/parquet_files_decoder/
+  num_train_positions: 50000
   num_eval_positions: 200
   eval_seed: 42

@@ -52,14 +52,38 @@ def _load_position_pool(config: GRPOConfig) -> list[dict]:
 
     Uses pretrain data (Stockfish best_move) for a large, diverse pool
     that the model hasn't been directly finetuned on.
+    Loads from multiple parquet files to reach the target count.
     """
-    positions = load_pretrain_positions(
-        config.pretrain_parquet_dir,
-        n=50000,
-        seed=config.eval_seed,
+    import glob
+    import pandas as pd
+    from src.finetune.cpp_eval import (
+        _normalize_castling, _filter_standard_games, _sample_one_per_game,
     )
-    print_rank0(f"Loaded {len(positions)} pretrain positions for RL training")
-    return positions
+
+    files = sorted(glob.glob(os.path.join(config.pretrain_parquet_dir, "*.parquet")))
+    rng = random.Random(config.eval_seed)
+    rng.shuffle(files)
+    n = config.num_train_positions
+
+    seen: set[str] = set()
+    pairs: list[dict] = []
+    for fname in files:
+        if len(pairs) >= n:
+            break
+        df = pd.read_parquet(fname, columns=["fen", "best_move", "game_id", "ply"])
+        df = _filter_standard_games(df)
+        sampled = _sample_one_per_game(df, config.eval_seed)
+        sampled = sampled.sample(frac=1, random_state=config.eval_seed).reset_index(drop=True)
+        for _, row in sampled.iterrows():
+            fen = row["fen"]
+            if fen not in seen:
+                seen.add(fen)
+                pairs.append({"fen": fen, "best_move": _normalize_castling(row["best_move"])})
+            if len(pairs) >= n:
+                break
+
+    print_rank0(f"Loaded {len(pairs)} pretrain positions for RL training (from {len(files)} files)")
+    return pairs
 
 
 def _sample_batch(pool: list[dict], batch_size: int, rng: random.Random) -> list[dict]:
@@ -117,10 +141,11 @@ def train():
         ).to(device)
 
     model = _build_model()
-    load_pretrained_checkpoint(model, config.pretrain_checkpoint, device)
-    print_rank0(f"Loaded checkpoint: {config.pretrain_checkpoint}")
+    load_pretrained_checkpoint(model, config.finetuned_checkpoint, device)
+    print_rank0(f"Loaded finetuned checkpoint: {config.finetuned_checkpoint}")
 
-    # Reference model (frozen copy)
+    # Reference model (frozen copy — always from the finetuned checkpoint,
+    # NOT from a resumed RL checkpoint, so KL is measured against the original)
     ref_model = _build_model()
     raw_model = model.module if hasattr(model, "module") else model
     ref_model.load_state_dict(raw_model.state_dict())
@@ -137,6 +162,32 @@ def train():
     )
     scheduler = _make_scheduler(optimizer, config.warmup_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp)
+
+    # ── Resume from RL checkpoint ─────────────────────────────────────────
+    start_step = 0
+    if config.resume_from:
+        rl_ckpts = sorted(
+            [f for f in os.listdir(config.resume_from)
+             if f.startswith("checkpoint_rl_step_") and f.endswith(".pt")],
+            key=lambda x: os.path.getmtime(os.path.join(config.resume_from, x)),
+        )
+        if rl_ckpts:
+            latest = os.path.join(config.resume_from, rl_ckpts[-1])
+            print_rank0(f"Resuming from RL checkpoint: {latest}")
+            rl_checkpoint = torch.load(latest, map_location=device, weights_only=False)
+            model.load_state_dict(rl_checkpoint["model_state_dict"])
+            optimizer.load_state_dict(rl_checkpoint["optimizer_state_dict"])
+            scaler.load_state_dict(rl_checkpoint["scaler_state_dict"])
+            start_step = rl_checkpoint["step"]
+            # Advance scheduler to match
+            for _ in range(start_step):
+                scheduler.step()
+            # Override LR in case config changed
+            for pg in optimizer.param_groups:
+                pg["lr"] = config.learning_rate
+            print_rank0(f"  Resumed at step {start_step}")
+        else:
+            print_rank0(f"WARNING: resume_from={config.resume_from} but no checkpoints found")
 
     # ── Data ──────────────────────────────────────────────────────────────
     position_pool = _load_position_pool(config)
@@ -208,7 +259,7 @@ def train():
     G = config.group_size
 
     try:
-        for outer_step in range(1, config.num_outer_steps + 1):
+        for outer_step in range(start_step + 1, config.num_outer_steps + 1):
             step_start = time.time()
             metrics.reset()
 
@@ -242,7 +293,11 @@ def train():
             advantages = compute_group_advantages(reward_tensor)  # [B, G]
             advantages_flat = advantages.reshape(-1).to(device)   # [B*G]
 
-            # 5. Parse rollouts into tensors
+            # 5. Kill C++ workers to free GPU memory for training
+            rollout_engine.shutdown()
+            torch.cuda.empty_cache()
+
+            # 6. Parse rollouts into tensors
             parsed = []
             for group in grouped_rollouts:
                 for rollout in group:
@@ -251,69 +306,61 @@ def train():
                         rollout.d_entries, max_seq_len,
                     ))
             all_batch = collate_rollouts(parsed, device)
-
-            # 6. Compute reference log-probs (once)
-            ref_lp = compute_ref_log_probs(ref_model, all_batch, config.use_amp)  # [B*G]
-
-            # 7. Compute old policy log-probs (once, detached)
-            with torch.no_grad():
-                old_lp = compute_current_log_probs(model, all_batch, config.use_amp).detach()
-
-            # 8. PPO inner loop
             N = B * G
+
+            # 7. Single-pass PPO: compute ref_lp, old_lp, and current_lp
+            #    per mini-batch in one loop. With ppo_epochs=1, old_lp equals
+            #    current_lp (ratio=1, clipping inactive) — this is effectively
+            #    policy gradient with group-relative advantages + KL penalty.
+            #    NOTE: if ppo_epochs > 1, old_lp must be precomputed before
+            #    any updates. Revisit this if changing ppo_epochs.
             model.train()
             inner_step_count = 0
+            perm = torch.randperm(N, device=device)
 
             kl_exceeded = False
-            for ppo_epoch in range(config.ppo_epochs):
-                # Shuffle indices for mini-batching
-                perm = torch.randperm(N, device=device)
+            for mb_start in range(0, N, config.mini_batch_size):
+                mb_end = min(mb_start + config.mini_batch_size, N)
+                mb_idx = perm[mb_start:mb_end]
 
-                for mb_start in range(0, N, config.mini_batch_size):
-                    mb_end = min(mb_start + config.mini_batch_size, N)
-                    mb_idx = perm[mb_start:mb_end]
+                mb_batch = {k: v[mb_idx] for k, v in all_batch.items()
+                            if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N}
+                mb_advantages = advantages_flat[mb_idx]
 
-                    # Slice mini-batch
-                    mb_batch = {}
-                    for k, v in all_batch.items():
-                        if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N:
-                            mb_batch[k] = v[mb_idx]
-                        else:
-                            mb_batch[k] = v
-                    mb_advantages = advantages_flat[mb_idx]
-                    mb_old_lp = old_lp[mb_idx]
-                    mb_ref_lp = ref_lp[mb_idx]
+                # Ref log-probs (frozen model, no grad)
+                with torch.no_grad():
+                    mb_ref_lp = compute_ref_log_probs(ref_model, mb_batch, config.use_amp)
 
-                    # Forward with gradients
-                    mb_lp = compute_current_log_probs(model, mb_batch, config.use_amp)
+                # Old log-probs = current model before this step's gradient
+                with torch.no_grad():
+                    mb_old_lp = compute_current_log_probs(model, mb_batch, config.use_amp).detach()
 
-                    loss, info = grpo_loss(
-                        mb_lp, mb_old_lp, mb_ref_lp, mb_advantages,
-                        config.clip_epsilon, config.kl_coeff,
-                    )
+                # Current log-probs (with gradients)
+                mb_lp = compute_current_log_probs(model, mb_batch, config.use_amp)
 
-                    scaled_loss = loss / config.grad_accum_steps
-                    scaler.scale(scaled_loss).backward()
+                loss, info = grpo_loss(
+                    mb_lp, mb_old_lp, mb_ref_lp, mb_advantages,
+                    config.clip_epsilon, config.kl_coeff,
+                )
 
-                    inner_step_count += 1
-                    if inner_step_count % config.grad_accum_steps == 0:
-                        scaler.unscale_(optimizer)
-                        average_gradients(model)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad(set_to_none=True)
-                        scheduler.step()
+                scaled_loss = loss / config.grad_accum_steps
+                scaler.scale(scaled_loss).backward()
 
-                    metrics.log_training_step(info)
+                inner_step_count += 1
+                if inner_step_count % config.grad_accum_steps == 0:
+                    scaler.unscale_(optimizer)
+                    average_gradients(model)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
 
-                    # Early stop if KL too high (checked per mini-batch)
-                    if info["kl"] > config.max_kl:
-                        print_rank0(f"  Early stop PPO at epoch {ppo_epoch+1}: KL={info['kl']:.4f} > {config.max_kl}")
-                        kl_exceeded = True
-                        break
+                metrics.log_training_step(info)
 
-                if kl_exceeded:
+                if info["kl"] > config.max_kl:
+                    print_rank0(f"  Early stop: KL={info['kl']:.4f} > {config.max_kl}")
+                    kl_exceeded = True
                     break
 
             # Flush any remaining gradients
@@ -331,11 +378,19 @@ def train():
             current_lr = optimizer.param_groups[0]["lr"]
 
             if is_main_process() and outer_step % config.log_every == 0:
-                # Entropy is expensive (full prefix forward on all rollouts)
-                # Only compute every eval_every steps
                 if outer_step % config.eval_every == 0:
+                    # Entropy: mini-batched to avoid OOM
+                    think_ents, final_ents = [], []
                     with torch.no_grad():
-                        entropy = compute_policy_entropy(model, all_batch, config.use_amp)
+                        for mb_start in range(0, N, config.mini_batch_size):
+                            mb_end = min(mb_start + config.mini_batch_size, N)
+                            mb_batch = {k: v[mb_start:mb_end] for k, v in all_batch.items()
+                                        if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N}
+                            te, fe = compute_policy_entropy(model, mb_batch, config.use_amp)
+                            think_ents.append(te)
+                            final_ents.append(fe)
+                    entropy = (sum(think_ents) / len(think_ents),
+                               sum(final_ents) / len(final_ents))
                     metrics.log_entropy(entropy)
                 metrics.to_wandb(outer_step, lr=current_lr)
                 print_rank0(
@@ -360,13 +415,12 @@ def train():
                 if eval_results:
                     metrics.to_wandb(outer_step, lr=current_lr, eval_results=eval_results)
 
-            # ── Re-export model for next rollout batch ────────────────────
+            # ── Re-export model and restart workers for next rollout ──────
             new_export_dir = Path(tempfile.mkdtemp(prefix="grpo_export_"))
             export_model(model, {"model": config.model}, new_export_dir)
-            rollout_engine.reload(str(new_export_dir))
-            # Clean up old export
             shutil.rmtree(export_dir, ignore_errors=True)
             export_dir = new_export_dir
+            rollout_engine = RolloutEngine(str(export_dir), config)
 
             barrier()
 

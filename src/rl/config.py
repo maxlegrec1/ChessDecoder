@@ -43,16 +43,18 @@ class GRPOConfig:
     # --- Data ---
     variation_parquet_dir: str = "./parquets_variations/"
     pretrain_parquet_dir: str = "/home/maxime/parquet_files_decoder/"
+    num_train_positions: int = 50000
     num_eval_positions: int = 200
     eval_seed: int = 42
 
     # --- Checkpointing ---
-    pretrain_checkpoint: str = ""
+    finetuned_checkpoint: str = ""
+    resume_from: str = ""
     checkpoint_dir: str = "checkpoints_rl/"
     save_every: int = 50
     eval_every: int = 50
     log_every: int = 1
-    num_outer_steps: int = 1000
+    num_outer_steps: int = 500
 
     # --- Model (same structure as finetune config) ---
     model: dict = field(default_factory=lambda: {
