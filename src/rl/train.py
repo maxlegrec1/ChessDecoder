@@ -270,7 +270,12 @@ def train():
             fens = [p["fen"] for p in batch_positions]
             B = len(fens)
 
-            # 2. Generate rollouts in subprocess (complete GPU memory isolation)
+            # 2. Offload models to CPU so subprocess gets full GPU
+            model.cpu()
+            ref_model.cpu()
+            torch.cuda.empty_cache()
+
+            # 3. Generate rollouts in subprocess (complete GPU memory isolation)
             print_rank0(f"Step {outer_step}: generating {B}x{G} rollouts (batch={config.inference_batch_size}) ...")
             t0 = time.time()
             grouped_rollouts = generate_rollouts(str(export_dir), fens, config)
@@ -278,6 +283,10 @@ def train():
             total_rollout_tok = sum(r.num_tokens for group in grouped_rollouts for r in group)
             print_rank0(f"  Rollouts: {rollout_time:.1f}s, {total_rollout_tok} tok, "
                         f"{total_rollout_tok/rollout_time:.0f} tok/s")
+
+            # 4. Reload models to GPU for training
+            model.to(device)
+            ref_model.to(device)
 
             # 5. Compute rewards
             grouped_rewards: list[list[tuple[float, dict[str, float]]]] = []

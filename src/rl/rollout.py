@@ -85,6 +85,7 @@ def generate_rollouts(
         Nested list [B][G] of RolloutResults.
     """
     import json
+    import os
     import subprocess
     import sys
     import tempfile
@@ -108,7 +109,10 @@ def generate_rollouts(
             "board_temperature": config.board_temperature,
         }, f)
 
-    # Run in subprocess (complete GPU memory isolation)
+    # Run in subprocess with expandable_segments to avoid CUDA fragmentation.
+    # Inherits CUDA_VISIBLE_DEVICES from parent so subprocess uses the same GPU.
+    env = os.environ.copy()
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     proc = subprocess.run(
         [sys.executable, "-c",
          f"import sys; sys.path.insert(0, '.'); "
@@ -116,6 +120,7 @@ def generate_rollouts(
          f"_run_rollouts_subprocess('{export_dir}', '{fens_path}', '', '{results_path}')"],
         capture_output=False,
         timeout=1800,
+        env=env,
     )
 
     if proc.returncode != 0:
