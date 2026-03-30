@@ -125,11 +125,15 @@ BatchedInferenceEngine::BatchedInferenceEngine(
 
 torch::Tensor BatchedInferenceEngine::sampleBatched(torch::Tensor logits, float temp)
 {
-    // logits: [B, V] FP16 on CUDA
-    if (temp <= 0.0f)
-        return torch::argmax(logits, /*dim=*/1);  // [B]
+    // logits: [B, V] FP16 on CUDA — cast to FP32 to avoid Inf/NaN from FP16 overflow
+    auto logits_f32 = logits.to(torch::kFloat32);
 
-    auto probs = torch::softmax(logits.to(torch::kFloat32) / temp, /*dim=*/1);
+    if (temp <= 0.0f)
+        return torch::argmax(logits_f32, /*dim=*/1);  // [B]
+
+    // Clamp to prevent NaN in softmax (FP16 matmul can produce ±Inf)
+    logits_f32 = logits_f32.clamp(-1e4f, 1e4f);
+    auto probs = torch::softmax(logits_f32 / temp, /*dim=*/1);
     return torch::multinomial(probs, /*num_samples=*/1).squeeze(1);  // [B]
 }
 

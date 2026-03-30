@@ -60,7 +60,7 @@ ext_modules = [
 
 setup(
     name="decoder_inference_cpp",
-    version="0.8.0",
+    version="0.8.1",
     description="Pybind11 bindings for the ChessDecoder libtorch thinking inference engine",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
