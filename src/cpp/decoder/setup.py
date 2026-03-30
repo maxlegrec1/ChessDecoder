@@ -31,6 +31,8 @@ ext_modules = [
             str(ROOT / "torch_backbone.cpp"),
             str(ROOT / "heads.cpp"),
             str(ROOT / "decoder_engine.cpp"),
+            str(ROOT / "batched_backbone.cpp"),
+            str(ROOT / "batched_engine.cpp"),
         ],
         include_dirs=[
             str(CPP_ROOT / "chess-library/include"),
@@ -58,7 +60,7 @@ ext_modules = [
 
 setup(
     name="decoder_inference_cpp",
-    version="0.2.0",
+    version="0.4.0",
     description="Pybind11 bindings for the ChessDecoder libtorch thinking inference engine",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
