@@ -3,21 +3,34 @@
 #include <ATen/cuda/CUDAGraph.h>
 #include <torch/script.h>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace decoder
 {
 
-/// Batched TorchScript backbone wrapper with B>1 KV cache management
-/// and CUDA graph acceleration for 1-token incremental forwards.
+/// Per-tier CUDA graph for batched causal board generation.
+struct BatchedBoardTier
+{
+    int max_len;
+    torch::Tensor mask;        // [B, 1, 1, max_len + 1]
+    torch::Tensor buf_k;       // [NL, B, NH, max_len, HD]
+    torch::Tensor buf_v;
+    torch::Tensor out_h;       // [B, 1, E]
+    torch::Tensor out_pk;      // [NL, B, NH, max_len+1, HD]
+    torch::Tensor out_pv;
+    at::cuda::CUDAGraph graph;
+    int len{0};
+};
+
+/// Batched backbone with tiered CUDA graphs for causal incremental
+/// and a single CUDA graph for prefix incremental.
 ///
-/// Manages two independent batched KV caches:
-/// 1. Causal  — for autoregressive board generation (causal attention)
-/// 2. Prefix  — for block-bidirectional attention (move/value prediction)
-///
-/// CUDA graphs are captured for causalIncremental and prefixIncremental
-/// (the hot paths called 67× and 3× per variation respectively).
-/// Multi-token forwards (prefill, catch-up, block) use dynamic dispatch.
+/// Tiered causal graphs (128, 256, 512, 1024) reduce memory bandwidth
+/// by using the smallest buffer that fits the current sequence position.
+/// At batch=32 with 4 tiers, total graph memory is ~5GB (vs ~12GB for
+/// a single 4096-buffer graph).
 class BatchedBackbone
 {
 public:
@@ -26,26 +39,21 @@ public:
 
     // ==================== Causal mode ====================
 
-    /// Batched causal forward (prefill/catch-up). Dynamic dispatch.
-    /// Returns hidden states [B, S, E] FP16 on CUDA.
-    torch::Tensor causalForward(torch::Tensor input_ids,
-                                torch::Tensor input_pos,
-                                torch::Tensor override_values,
-                                torch::Tensor override_mask);
+    /// Multi-token causal forward (prefill/catch-up). Dynamic dispatch.
+    torch::Tensor causalForward(torch::Tensor input_ids, torch::Tensor input_pos,
+                                torch::Tensor override_values, torch::Tensor override_mask);
 
-    /// Batched 1-token causal incremental via CUDA graph.
-    /// Returns hidden states [B, 1, E] FP16 on CUDA.
-    torch::Tensor causalIncremental(torch::Tensor input_ids,
-                                    torch::Tensor input_pos,
-                                    torch::Tensor override_values,
-                                    torch::Tensor override_mask);
+    /// 1-token causal incremental via tiered CUDA graph.
+    /// Automatically selects the smallest tier that fits.
+    /// Falls back to dynamic dispatch if no tier fits.
+    torch::Tensor causalIncremental(torch::Tensor input_ids, torch::Tensor input_pos,
+                                    torch::Tensor override_values, torch::Tensor override_mask);
 
-    /// Sync dynamic causal cache → graph buffer.
-    /// Call after causalForward() to switch to graph-accelerated mode.
+    /// Sync dynamic causal cache → graph buffer for the appropriate tier.
+    /// Call after causalForward() before starting graph-accelerated board gen.
     void syncCausalToGraph();
 
     /// Sync graph buffer → dynamic causal cache.
-    /// Call before causalForward() when switching from graph to dynamic mode.
     void syncGraphToCausal();
 
     void resetCausal();
@@ -53,34 +61,18 @@ public:
 
     // ==================== Prefix mode ====================
 
-    /// Batched prefix forward with custom mask. Dynamic dispatch.
-    /// Returns hidden states [B, S, E] FP16 on CUDA.
-    torch::Tensor prefixForward(torch::Tensor input_ids,
-                                torch::Tensor input_pos,
+    torch::Tensor prefixForward(torch::Tensor input_ids, torch::Tensor input_pos,
                                 torch::Tensor attention_mask,
-                                torch::Tensor override_values,
-                                torch::Tensor override_mask);
+                                torch::Tensor override_values, torch::Tensor override_mask);
 
-    /// Batched 1-token prefix incremental via CUDA graph.
-    /// Returns hidden states [B, 1, E] FP16 on CUDA.
-    torch::Tensor prefixIncremental(torch::Tensor input_ids,
-                                    torch::Tensor input_pos,
-                                    torch::Tensor override_values,
-                                    torch::Tensor override_mask);
+    /// 1-token prefix incremental via CUDA graph (buffer size = prefix_graph_len_).
+    torch::Tensor prefixIncremental(torch::Tensor input_ids, torch::Tensor input_pos,
+                                    torch::Tensor override_values, torch::Tensor override_mask);
 
-    /// Batched block prefix forward (bidirectional). Dynamic dispatch.
-    /// Returns hidden states [B, S, E] FP16 on CUDA.
-    torch::Tensor prefixBlockForward(torch::Tensor input_ids,
-                                     torch::Tensor input_pos,
-                                     torch::Tensor override_values,
-                                     torch::Tensor override_mask);
+    torch::Tensor prefixBlockForward(torch::Tensor input_ids, torch::Tensor input_pos,
+                                     torch::Tensor override_values, torch::Tensor override_mask);
 
-    /// Sync dynamic prefix cache → graph buffer.
-    /// Call after prefixForward()/prefixBlockForward() to switch to graph mode.
     void syncPrefixToGraph();
-
-    /// Sync graph buffer → dynamic prefix cache.
-    /// Call before prefixForward()/prefixBlockForward() when switching from graph to dynamic.
     void syncGraphToPrefix();
 
     void resetPrefix();
@@ -90,32 +82,42 @@ public:
     int batchSize() const { return B_; }
 
 private:
-    /// Dynamic forward (no graph). Updates specified cache.
     torch::Tensor forwardImpl(torch::Tensor ids, torch::Tensor pos,
                               torch::Tensor mask,
                               torch::Tensor past_k, torch::Tensor past_v,
                               torch::Tensor ov, torch::Tensor om,
                               bool update_causal, bool update_prefix);
 
+    /// Dynamic 1-token causal incremental (fallback when no tier fits).
+    torch::Tensor causalIncrementalDynamic(torch::Tensor ids, torch::Tensor pos,
+                                           torch::Tensor ov, torch::Tensor om);
+
     void captureGraphs();
+
+    /// Select smallest causal tier whose buffer fits max_needed_pos.
+    /// Returns tier index, or -1 if none fits.
+    int selectCausalTier(int max_needed_pos) const;
 
     torch::jit::Module model_;
     int B_, num_layers_, num_heads_, head_dim_, embed_dim_, max_seq_len_;
 
-    // ---- Dynamic caches (for multi-token forwards) ----
-    torch::Tensor causal_k_, causal_v_;   // [NL, B, NH, causal_len, HD]
+    // Dynamic caches
+    torch::Tensor causal_k_, causal_v_;
     int causal_len_;
-    torch::Tensor prefix_k_, prefix_v_;   // [NL, B, NH, prefix_len, HD]
+    torch::Tensor prefix_k_, prefix_v_;
     int prefix_len_;
 
-    // ---- CUDA Graph: causal incremental ----
-    torch::Tensor cg_ids_, cg_pos_, cg_mask_, cg_ov_, cg_om_;  // Inputs [B, 1]
-    torch::Tensor cg_buf_k_, cg_buf_v_;                         // [NL, B, NH, MAX_LEN, HD]
-    torch::Tensor cg_out_h_, cg_out_pk_, cg_out_pv_;           // Outputs
-    at::cuda::CUDAGraph causal_graph_;
-    int cg_len_;
+    // Shared input tensors for causal tier graphs
+    torch::Tensor cg_ids_, cg_pos_, cg_ov_, cg_om_;
 
-    // ---- CUDA Graph: prefix incremental ----
+    // Tiered causal graphs
+    static constexpr int kCausalTierSizes[] = {128, 256, 512, 1024};
+    static constexpr int kNumCausalTiers = 4;
+    std::vector<std::unique_ptr<BatchedBoardTier>> causal_tiers_;
+    int active_tier_;  // currently synced tier (-1 = none)
+
+    // Prefix graph (single, moderate buffer)
+    static constexpr int kPrefixGraphLen = 512;
     torch::Tensor pg_ids_, pg_pos_, pg_mask_, pg_ov_, pg_om_;
     torch::Tensor pg_buf_k_, pg_buf_v_;
     torch::Tensor pg_out_h_, pg_out_pk_, pg_out_pv_;

@@ -518,6 +518,10 @@ BatchedInferenceEngine::predictMoves(
                 cur_len++;
             }
 
+            // Sync graph tier back to dynamic causal cache
+            // (needed before any subsequent dynamic causal forwards or tier switches)
+            backbone_->syncGraphToCausal();
+
             // ONE sync: copy board tokens to CPU
             auto board_cpu = board_output.cpu();
             auto board_acc = board_cpu.accessor<int64_t, 2>();
