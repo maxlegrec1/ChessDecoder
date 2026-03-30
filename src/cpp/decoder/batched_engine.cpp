@@ -288,10 +288,11 @@ BatchedInferenceEngine::predictMoves(
     auto init_ov = torch::zeros({B, init_len}, opts_fp16);
     auto init_om = torch::zeros({B, init_len}, opts_bool);
 
-    // Causal prefill
+    // Causal prefill, then sync to graph buffers for incremental mode
     backbone_->resetCausal();
     backbone_->resetPrefix();
     backbone_->causalForward(init_ids, init_pos, init_ov, init_om);
+    backbone_->syncCausalToGraph();
 
     // Prefix init with block-aware mask
     // Build block_ids tensor [B, init_len]
@@ -310,6 +311,7 @@ BatchedInferenceEngine::predictMoves(
     prefix_mask = prefix_mask.unsqueeze(1);  // [B, 1, S, S]
 
     auto h_init = backbone_->prefixForward(init_ids, init_pos, prefix_mask, init_ov, init_om);
+    backbone_->syncPrefixToGraph();
     // Extract hidden at last position (start_think) → [B, E]
     auto saved_h = h_init.index({torch::indexing::Slice(), init_len - 1}).contiguous();  // [B, E]
 
@@ -424,6 +426,8 @@ BatchedInferenceEngine::predictMoves(
 
             if (new_tokens > 0)
             {
+                // Sync graph → dynamic cache before dynamic forward
+                backbone_->syncGraphToCausal();
                 // Build catch-up input from token_ids
                 auto catch_ids = torch::zeros({B, new_tokens}, opts_int);
                 auto catch_pos = torch::zeros({B, new_tokens}, opts_int);
@@ -471,6 +475,7 @@ BatchedInferenceEngine::predictMoves(
                 }
 
                 backbone_->causalForward(catch_ids, catch_pos, catch_ov, catch_om);
+                backbone_->syncCausalToGraph();
             }
 
             // Get first board token from board head on last causal hidden
@@ -546,8 +551,10 @@ BatchedInferenceEngine::predictMoves(
                 }
             }
 
+            backbone_->syncGraphToPrefix();
             auto h_block = backbone_->prefixBlockForward(
                 board_ids_t, board_pos_t, board_ov_t, board_om_t);
+            backbone_->syncPrefixToGraph();
             // Extract hidden at last board token (position 67 within block)
             saved_h = h_block.index({torch::indexing::Slice(), 67}).contiguous();  // [B, E]
         }
