@@ -21,7 +21,7 @@ class GRPOConfig:
 
     # --- Rollout ---
     rollout_batch_size: int = 64
-    num_workers: int = 4
+    inference_batch_size: int = 128
     think_temperature: float = 0.8
     policy_temperature: float = 0.8
     board_temperature: float = 0.0

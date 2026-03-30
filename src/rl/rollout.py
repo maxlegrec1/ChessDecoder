@@ -1,11 +1,10 @@
-"""Rollout generation using the C++ inference engine in subprocess workers.
+"""Rollout generation using the batched C++ inference engine.
 
-Each worker owns one ThinkingInferenceEngine instance in a separate process
-for GPU memory isolation. Workers stay alive across rollout batches to
-avoid the ~2s engine initialization cost.
+The batched engine runs in the main process — no subprocess workers needed.
+Before rollouts, training models are offloaded to CPU to free GPU memory.
+After rollouts, the engine is destroyed and GPU memory is reclaimed for training.
 """
 
-import multiprocessing as mp
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,170 +23,73 @@ class RolloutResult:
     num_tokens: int
 
 
-# ---------------------------------------------------------------------------
-# Worker process
-# ---------------------------------------------------------------------------
-
-_RELOAD = "__RELOAD__"  # Signals worker to reload engine
-
-
-def _worker_loop(
-    worker_id: int,
+def generate_rollouts(
     export_dir: str,
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    think_temperature: float,
-    policy_temperature: float,
-    board_temperature: float,
-):
-    """Worker process entry point. Owns one C++ engine instance."""
+    fens: list[str],
+    config: GRPOConfig,
+) -> list[list[RolloutResult]]:
+    """Generate G rollouts per FEN using the batched C++ engine.
+
+    Creates the engine, runs all rollouts, destroys the engine.
+    The engine owns ~2-14GB GPU memory depending on batch size,
+    so it must not coexist with training models on GPU.
+
+    Args:
+        export_dir: path to exported TorchScript model.
+        fens: list of B FEN strings.
+        config: GRPO config (uses group_size, inference_batch_size, temperatures).
+
+    Returns:
+        Nested list [B][G] of RolloutResults.
+    """
     import _decoder_inference_cpp as cpp
 
-    def _create_engine(edir: str):
-        return cpp.ThinkingInferenceEngine(
-            str(Path(edir) / "backbone.pt"),
-            str(Path(edir) / "weights"),
-            str(Path(edir) / "vocab.json"),
-            str(Path(edir) / "config.json"),
-        )
+    G = config.group_size
+    B = len(fens)
+    ibs = config.inference_batch_size
 
-    engine = _create_engine(export_dir)
-    engine.think_temperature = think_temperature
-    engine.policy_temperature = policy_temperature
-    engine.board_temperature = board_temperature
+    engine = cpp.BatchedInferenceEngine(
+        str(Path(export_dir) / "backbone.pt"),
+        str(Path(export_dir) / "weights"),
+        str(Path(export_dir) / "vocab.json"),
+        str(Path(export_dir) / "config.json"),
+        ibs,
+    )
+    engine.think_temperature = config.think_temperature
+    engine.policy_temperature = config.policy_temperature
+    engine.board_temperature = config.board_temperature
 
-    while True:
-        item = task_queue.get()
+    # Flatten all FEN×G combinations
+    all_fens = [fen for fen in fens for _ in range(G)]
+    total = len(all_fens)
 
-        if item is None:
-            break
+    # Process in chunks of inference_batch_size
+    all_results: list[RolloutResult] = []
+    for start in range(0, total, ibs):
+        chunk = all_fens[start:start + ibs]
+        raw = engine.predict_moves(chunk, config.think_temperature)
+        for i, r in enumerate(raw):
+            fen_idx = (start + i) // G
+            all_results.append(RolloutResult(
+                fen=fens[fen_idx],
+                final_move=r.move,
+                token_ids=list(r.token_ids),
+                wl_entries=list(r.wl_entries),
+                d_entries=list(r.d_entries),
+                num_tokens=len(r.token_ids),
+            ))
 
-        if isinstance(item, str) and item.startswith(_RELOAD):
-            new_dir = item.split("|", 1)[1]
-            del engine
-            engine = _create_engine(new_dir)
-            engine.think_temperature = think_temperature
-            engine.policy_temperature = policy_temperature
-            engine.board_temperature = board_temperature
-            result_queue.put(("__RELOADED__", worker_id))
-            continue
+    # Destroy engine, free GPU
+    del engine
+    torch.cuda.empty_cache()
 
-        task_id, fen = item
-        try:
-            move = engine.predict_move(fen, think_temperature)
-            token_ids = list(engine.last_token_ids())
-            wl_entries = list(engine.last_wl_entries())
-            d_entries = list(engine.last_d_entries())
-            result = RolloutResult(
-                fen=fen,
-                final_move=move or "",
-                token_ids=token_ids,
-                wl_entries=wl_entries,
-                d_entries=d_entries,
-                num_tokens=len(token_ids),
-            )
-            result_queue.put((task_id, result))
-        except Exception as e:
-            # Return empty result on failure
-            result_queue.put((task_id, RolloutResult(
-                fen=fen, final_move="", token_ids=[], wl_entries=[],
-                d_entries=[], num_tokens=0,
-            )))
+    # Reshape into [B][G]
+    grouped: list[list[RolloutResult]] = []
+    for fen_idx in range(B):
+        group = all_results[fen_idx * G:(fen_idx + 1) * G]
+        grouped.append(group)
 
-
-# ---------------------------------------------------------------------------
-# Rollout engine (orchestrator)
-# ---------------------------------------------------------------------------
-
-class RolloutEngine:
-    """Multi-process rollout generation using C++ inference engines."""
-
-    def __init__(self, export_dir: str, config: GRPOConfig):
-        self.config = config
-        self.export_dir = export_dir
-        self.num_workers = config.num_workers
-
-        # Use "spawn" context to avoid inheriting parent's CUDA state.
-        # Fork (default on Linux) would cause "CUDA initialization error"
-        # because CUDA contexts cannot cross fork boundaries.
-        ctx = mp.get_context("spawn")
-        self._task_queue = ctx.Queue()
-        self._result_queue = ctx.Queue()
-        self._workers: list[mp.Process] = []
-
-        for i in range(self.num_workers):
-            p = ctx.Process(
-                target=_worker_loop,
-                args=(
-                    i, export_dir, self._task_queue, self._result_queue,
-                    config.think_temperature, config.policy_temperature,
-                    config.board_temperature,
-                ),
-                daemon=True,
-            )
-            p.start()
-            self._workers.append(p)
-
-    def generate(self, fens: list[str]) -> list[list[RolloutResult]]:
-        """Generate G rollouts per FEN.
-
-        Args:
-            fens: list of B FEN strings.
-
-        Returns:
-            Nested list [B][G] of RolloutResults.
-        """
-        G = self.config.group_size
-        B = len(fens)
-        total = B * G
-
-        # Submit all tasks: (task_id, fen)
-        # task_id encodes (fen_idx, sample_idx)
-        for fen_idx, fen in enumerate(fens):
-            for sample_idx in range(G):
-                task_id = fen_idx * G + sample_idx
-                self._task_queue.put((task_id, fen))
-
-        # Collect results
-        results_flat: dict[int, RolloutResult] = {}
-        collected = 0
-        while collected < total:
-            task_id, result = self._result_queue.get()
-            results_flat[task_id] = result
-            collected += 1
-
-        # Reshape into [B][G]
-        grouped: list[list[RolloutResult]] = []
-        for fen_idx in range(B):
-            group = []
-            for sample_idx in range(G):
-                task_id = fen_idx * G + sample_idx
-                group.append(results_flat[task_id])
-            grouped.append(group)
-
-        return grouped
-
-    def reload(self, export_dir: str):
-        """Signal all workers to reload from a new export directory."""
-        self.export_dir = export_dir
-        for _ in self._workers:
-            self._task_queue.put(f"{_RELOAD}|{export_dir}")
-        # Wait for all workers to confirm reload
-        reloaded = 0
-        while reloaded < self.num_workers:
-            item = self._result_queue.get()
-            if isinstance(item, tuple) and item[0] == "__RELOADED__":
-                reloaded += 1
-
-    def shutdown(self):
-        """Cleanly terminate all workers."""
-        for _ in self._workers:
-            self._task_queue.put(None)
-        for p in self._workers:
-            p.join(timeout=10)
-            if p.is_alive():
-                p.terminate()
-        self._workers.clear()
+    return grouped
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +98,6 @@ class RolloutEngine:
 
 def export_model(model: torch.nn.Module, config: dict, export_dir: str | Path):
     """Export current model weights for C++ engine consumption.
-
-    Follows the pattern from src/finetune/cpp_eval.py:167-187.
 
     Args:
         model: ChessDecoder (possibly wrapped in DDP).

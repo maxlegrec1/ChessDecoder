@@ -31,7 +31,7 @@ from src.utils.distributed import (
 )
 
 from src.rl.config import GRPOConfig
-from src.rl.rollout import RolloutEngine, RolloutResult, export_model
+from src.rl.rollout import generate_rollouts, RolloutResult, export_model
 from src.rl.sequence import parse_rollout, collate_rollouts
 from src.rl.log_probs import compute_ref_log_probs, compute_current_log_probs, compute_policy_entropy
 from src.rl.rewards import CompositeReward
@@ -250,11 +250,13 @@ def train():
     export_model(model, {"model": config.model}, export_dir)
     print_rank0("Initial export complete")
 
-    # ── Rollout engine ────────────────────────────────────────────────────
-    rollout_engine = RolloutEngine(str(export_dir), config)
-    print_rank0(f"Rollout engine started ({config.num_workers} workers)")
-
     # ── Training loop ─────────────────────────────────────────────────────
+    # GPU memory lifecycle per outer step:
+    #   1. Offload training models to CPU
+    #   2. Run batched C++ rollouts (engine owns full GPU)
+    #   3. Destroy engine, free GPU
+    #   4. Reload models to GPU, run training
+    #   5. Export updated model, repeat
     max_seq_len = mc["max_seq_len"]
     G = config.group_size
 
@@ -268,14 +270,25 @@ def train():
             fens = [p["fen"] for p in batch_positions]
             B = len(fens)
 
-            # 2. Generate rollouts
-            print_rank0(f"Step {outer_step}: generating {B}x{G} rollouts ...")
-            t0 = time.time()
-            grouped_rollouts = rollout_engine.generate(fens)
-            rollout_time = time.time() - t0
-            print_rank0(f"  Rollouts done in {rollout_time:.1f}s")
+            # 2. Offload training models to CPU to free GPU for rollouts
+            model.cpu()
+            ref_model.cpu()
+            torch.cuda.empty_cache()
 
-            # 3. Compute rewards
+            # 3. Generate rollouts (engine created, used, destroyed inside)
+            print_rank0(f"Step {outer_step}: generating {B}x{G} rollouts (batch={config.inference_batch_size}) ...")
+            t0 = time.time()
+            grouped_rollouts = generate_rollouts(str(export_dir), fens, config)
+            rollout_time = time.time() - t0
+            total_rollout_tok = sum(r.num_tokens for group in grouped_rollouts for r in group)
+            print_rank0(f"  Rollouts: {rollout_time:.1f}s, {total_rollout_tok} tok, "
+                        f"{total_rollout_tok/rollout_time:.0f} tok/s")
+
+            # 4. Reload models to GPU for training
+            model.to(device)
+            ref_model.to(device)
+
+            # 5. Compute rewards
             grouped_rewards: list[list[tuple[float, dict[str, float]]]] = []
             reward_tensor = torch.zeros(B, G)
             for fen_idx, (group, gt) in enumerate(zip(grouped_rollouts, batch_positions)):
@@ -286,18 +299,13 @@ def train():
                     reward_tensor[fen_idx, sample_idx] = total_r
                 grouped_rewards.append(fen_rewards)
 
-            # Log rollout metrics
             metrics.log_rollout_batch(grouped_rollouts, grouped_rewards, batch_positions, rollout_time)
 
-            # 4. Compute group-relative advantages
-            advantages = compute_group_advantages(reward_tensor)  # [B, G]
-            advantages_flat = advantages.reshape(-1).to(device)   # [B*G]
+            # 6. Compute group-relative advantages
+            advantages = compute_group_advantages(reward_tensor)
+            advantages_flat = advantages.reshape(-1).to(device)
 
-            # 5. Kill C++ workers to free GPU memory for training
-            rollout_engine.shutdown()
-            torch.cuda.empty_cache()
-
-            # 6. Parse rollouts into tensors
+            # 7. Parse rollouts into tensors
             parsed = []
             for group in grouped_rollouts:
                 for rollout in group:
@@ -308,12 +316,9 @@ def train():
             all_batch = collate_rollouts(parsed, device)
             N = B * G
 
-            # 7. Single-pass PPO: compute ref_lp, old_lp, and current_lp
-            #    per mini-batch in one loop. With ppo_epochs=1, old_lp equals
-            #    current_lp (ratio=1, clipping inactive) — this is effectively
-            #    policy gradient with group-relative advantages + KL penalty.
-            #    NOTE: if ppo_epochs > 1, old_lp must be precomputed before
-            #    any updates. Revisit this if changing ppo_epochs.
+            # 8. Single-pass PPO
+            #    With ppo_epochs=1, old_lp == current_lp (ratio=1, no clipping).
+            #    NOTE: if ppo_epochs > 1, old_lp must be precomputed.
             model.train()
             inner_step_count = 0
             perm = torch.randperm(N, device=device)
@@ -327,15 +332,11 @@ def train():
                             if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N}
                 mb_advantages = advantages_flat[mb_idx]
 
-                # Ref log-probs (frozen model, no grad)
                 with torch.no_grad():
                     mb_ref_lp = compute_ref_log_probs(ref_model, mb_batch, config.use_amp)
-
-                # Old log-probs = current model before this step's gradient
                 with torch.no_grad():
                     mb_old_lp = compute_current_log_probs(model, mb_batch, config.use_amp).detach()
 
-                # Current log-probs (with gradients)
                 mb_lp = compute_current_log_probs(model, mb_batch, config.use_amp)
 
                 loss, info = grpo_loss(
@@ -363,7 +364,7 @@ def train():
                     kl_exceeded = True
                     break
 
-            # Flush any remaining gradients
+            # Flush remaining gradients
             if inner_step_count % config.grad_accum_steps != 0:
                 scaler.unscale_(optimizer)
                 average_gradients(model)
@@ -379,19 +380,17 @@ def train():
 
             if is_main_process() and outer_step % config.log_every == 0:
                 if outer_step % config.eval_every == 0:
-                    # Entropy: mini-batched to avoid OOM
                     think_ents, final_ents = [], []
                     with torch.no_grad():
-                        for mb_start in range(0, N, config.mini_batch_size):
-                            mb_end = min(mb_start + config.mini_batch_size, N)
-                            mb_batch = {k: v[mb_start:mb_end] for k, v in all_batch.items()
-                                        if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N}
-                            te, fe = compute_policy_entropy(model, mb_batch, config.use_amp)
+                        for mb_s in range(0, N, config.mini_batch_size):
+                            mb_e = min(mb_s + config.mini_batch_size, N)
+                            mb_b = {k: v[mb_s:mb_e] for k, v in all_batch.items()
+                                    if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N}
+                            te, fe = compute_policy_entropy(model, mb_b, config.use_amp)
                             think_ents.append(te)
                             final_ents.append(fe)
-                    entropy = (sum(think_ents) / len(think_ents),
-                               sum(final_ents) / len(final_ents))
-                    metrics.log_entropy(entropy)
+                    metrics.log_entropy((sum(think_ents) / len(think_ents),
+                                         sum(final_ents) / len(final_ents)))
                 metrics.to_wandb(outer_step, lr=current_lr)
                 print_rank0(
                     f"Step {outer_step} | "
@@ -406,7 +405,6 @@ def train():
                 _save_checkpoint(model, ref_model, optimizer, scaler, config, outer_step, checkpoint_dir)
 
             # ── C++ evaluation ────────────────────────────────────────────
-            eval_results = None
             if is_main_process() and outer_step % config.eval_every == 0:
                 print_rank0(f"  Running C++ evaluation ...")
                 eval_results = evaluate_cpp_selfplay(
@@ -415,12 +413,11 @@ def train():
                 if eval_results:
                     metrics.to_wandb(outer_step, lr=current_lr, eval_results=eval_results)
 
-            # ── Re-export model and restart workers for next rollout ──────
+            # ── Export model for next rollout ──────────────────────────────
             new_export_dir = Path(tempfile.mkdtemp(prefix="grpo_export_"))
             export_model(model, {"model": config.model}, new_export_dir)
             shutil.rmtree(export_dir, ignore_errors=True)
             export_dir = new_export_dir
-            rollout_engine = RolloutEngine(str(export_dir), config)
 
             barrier()
 
@@ -430,7 +427,6 @@ def train():
             _save_checkpoint(model, ref_model, optimizer, scaler, config, outer_step, checkpoint_dir)
 
     finally:
-        rollout_engine.shutdown()
         shutil.rmtree(export_dir, ignore_errors=True)
         if is_main_process():
             wandb.finish()

@@ -21,7 +21,7 @@ grpo:
 
 rollout:
   rollout_batch_size: 64
-  num_workers: 4
+  inference_batch_size: 128
   think_temperature: 1.5
   policy_temperature: 1.5
   board_temperature: 0.0
