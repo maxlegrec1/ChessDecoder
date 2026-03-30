@@ -119,7 +119,13 @@ class GRPOMetrics:
             d["rl/reward_move_quality"] = _mean(r.reward_move_quality)
             d["rl/reward_format"] = _mean(r.reward_format)
             d["rl/reward_coherence"] = _mean(r.reward_coherence)
-            d["rl/mean_rollout_tokens"] = _mean(r.rollout_lengths)
+            d["rl/mean_seq_len"] = _mean(r.rollout_lengths)
+            d["rl/min_seq_len"] = min(r.rollout_lengths)
+            d["rl/max_seq_len"] = max(r.rollout_lengths)
+            if len(r.rollout_lengths) > 1:
+                mean = _mean(r.rollout_lengths)
+                d["rl/std_seq_len"] = (sum((x - mean) ** 2 for x in r.rollout_lengths)
+                                       / len(r.rollout_lengths)) ** 0.5
             total_tokens = sum(r.rollout_lengths)
             d["rl/rollout_tok_per_sec"] = total_tokens / r.rollout_time if r.rollout_time > 0 else 0.0
 
