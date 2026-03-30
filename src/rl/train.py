@@ -252,11 +252,11 @@ def train():
 
     # ── Training loop ─────────────────────────────────────────────────────
     # GPU memory lifecycle per outer step:
-    #   1. Offload training models to CPU
+    #   1. Offload training models to CPU, free all GPU memory
     #   2. Run batched C++ rollouts (engine owns full GPU)
     #   3. Destroy engine, free GPU
     #   4. Reload models to GPU, run training
-    #   5. Export updated model, repeat
+    #   5. Export updated model (while models on GPU), repeat
     max_seq_len = mc["max_seq_len"]
     G = config.group_size
 
@@ -270,9 +270,14 @@ def train():
             fens = [p["fen"] for p in batch_positions]
             B = len(fens)
 
-            # 2. Offload training models to CPU to free GPU for rollouts
+            # 2. Offload ALL models to CPU to give full GPU to rollout engine
             model.cpu()
             ref_model.cpu()
+            # Move optimizer state to CPU too (AdamW stores momentum on same device as params)
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.cpu()
             torch.cuda.empty_cache()
 
             # 3. Generate rollouts (engine created, used, destroyed inside)
@@ -284,9 +289,13 @@ def train():
             print_rank0(f"  Rollouts: {rollout_time:.1f}s, {total_rollout_tok} tok, "
                         f"{total_rollout_tok/rollout_time:.0f} tok/s")
 
-            # 4. Reload models to GPU for training
+            # 4. Reload models + optimizer state to GPU for training
             model.to(device)
             ref_model.to(device)
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
 
             # 5. Compute rewards
             grouped_rewards: list[list[tuple[float, dict[str, float]]]] = []
