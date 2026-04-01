@@ -20,17 +20,17 @@ class GRPOConfig:
     max_kl: float = 0.05
 
     # --- Rollout ---
-    rollout_batch_size: int = 64
+    rollout_batch_size: int = 640
     inference_batch_size: int = 64
-    think_temperature: float = 0.8
-    policy_temperature: float = 0.8
+    think_temperature: float = 1.5
+    policy_temperature: float = 1.5
     board_temperature: float = 0.0
 
     # --- Training ---
     learning_rate: float = 1e-6
     weight_decay: float = 0.1
     warmup_steps: int = 20
-    grad_accum_steps: int = 4
+    grad_accum_steps: int = 16
     max_grad_norm: float = 1.0
     use_amp: bool = True
     mini_batch_size: int = 4
