@@ -15,7 +15,7 @@
 set -euo pipefail
 
 NUM_FILES="${1:-5}"
-OUTPUT_DIR="${2:-parquets}"
+OUTPUT_DIR="${2:-${PARQUET_DIR:-parquets}}"
 TAR_DIR="lc0_tars"
 BASE_URL="https://storage.lczero.org/files/training_data/test91/"
 
