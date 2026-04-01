@@ -104,7 +104,8 @@ def _save_checkpoint(model, ref_model, optimizer, scaler, config, step, checkpoi
             "model": config.model,
             "grpo": {
                 "group_size": config.group_size,
-                "clip_epsilon": config.clip_epsilon,
+                "clip_epsilon_low": config.clip_epsilon_low,
+                "clip_epsilon_high": config.clip_epsilon_high,
                 "kl_coeff": config.kl_coeff,
             },
         },
@@ -222,7 +223,8 @@ def train():
             config={
                 "grpo": {
                     "group_size": config.group_size,
-                    "clip_epsilon": config.clip_epsilon,
+                    "clip_epsilon_low": config.clip_epsilon_low,
+                "clip_epsilon_high": config.clip_epsilon_high,
                     "kl_coeff": config.kl_coeff,
                     "ppo_epochs": config.ppo_epochs,
                     "max_kl": config.max_kl,
