@@ -2,6 +2,24 @@
 
 A decoder-only transformer (~116M parameters) that learns to play chess by generating board representations autoregressively, predicting moves, and evaluating positions. The model uses a two-pass forward architecture — a causal pass for board token generation and a prefix (bidirectional-within-block) pass for move and value prediction — and can be finetuned with thinking variations that teach it to reason through candidate moves before selecting a final move.
 
+## Quick Start
+
+```bash
+# Clone, install, download data, run inference — all in one go
+git clone --recursive https://github.com/maxlegrec1/ChessDecoder.git
+cd ChessDecoder
+curl -LsSf https://astral.sh/uv/install.sh | sh   # install uv (skip if already installed)
+uv sync                                             # install deps + build C++ engine
+
+# Download a few pretraining parquets
+./scripts/download_and_convert_pretraining_data.sh 2
+
+# Run thinking inference on the starting position (requires a checkpoint)
+uv run python -m src.inference.think \
+    --checkpoint checkpoints/your_model.pt \
+    --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+```
+
 ## Key Ideas
 
 - **Fixed-length board encoding.** Every chess position is exactly 68 tokens: `start_pos` + 64 squares + `end_pos` + castling + side-to-move.
@@ -15,166 +33,136 @@ A decoder-only transformer (~116M parameters) that learns to play chess by gener
 ```
 ChessDecoder/
 ├── src/
-│   ├── models/          # Transformer model, vocabulary, encoder
+│   ├── models/          # Transformer model, vocabulary
 │   ├── dataloader/      # Pretraining data pipeline (Parquet → token sequences)
-│   ├── train/           # Pretraining loop and config
-│   ├── finetune/        # Finetuning with thinking variations
-│   ├── rl/              # GRPO reinforcement learning
-│   ├── eval/            # ELO evaluation against engines
+│   ├── train/           # Pretraining loop + config
+│   ├── finetune/        # Finetuning with thinking variations + config
+│   ├── rl/              # GRPO reinforcement learning + config
+│   ├── eval/            # ELO evaluation against Stockfish
+│   ├── inference/       # Thinking inference (autoregressive generation)
 │   ├── export/          # TorchScript export for C++ engine
-│   ├── mcts/            # Monte Carlo Tree Search (C++ via pybind11)
-│   └── cpp/             # C++ inference engines (decoder + MCTS)
-├── scripts/             # Inference, evaluation, and utility scripts
-├── tests/               # Pytest test suite
-├── markdowns/           # In-depth technical documentation
-├── exports/             # Exported TorchScript models and head weights
-├── checkpoints/         # Saved model weights
-├── bin/                 # External binaries (Stockfish)
-└── trt/                 # TensorRT engine files (for MCTS)
+│   ├── cpp/decoder/     # C++ decoder inference engine (pybind11)
+│   └── cpp/             # C++ MCTS/TensorRT engine (optional)
+├── scripts/             # Evaluation and utility scripts
+├── tests/               # Pytest test suite (77 tests)
+├── markdowns/           # Technical documentation (10 guides)
+├── exports/             # Exported TorchScript models (gitignored)
+├── checkpoints/         # Model checkpoints (gitignored)
+├── bin/                 # External binaries — Stockfish (gitignored)
+└── trt/                 # TensorRT engines for MCTS (gitignored)
 ```
-
-## Prerequisites
-
-- **Python >= 3.13**
-- **[uv](https://github.com/astral-sh/uv)** — fast Python package manager (required)
-- **CUDA toolkit** — NVIDIA GPU with CUDA support
-- **[TensorRT](https://developer.nvidia.com/tensorrt)** — only needed for MCTS-based variation generation (optional)
-- **[Stockfish](https://stockfishchess.org/)** — for ELO evaluation (optional)
 
 ## Installation
 
-### 1. Clone the repository and submodules
+### 1. Clone and install
 
 ```bash
-git clone https://github.com/maxlegrec1/ChessDecoder.git
+git clone --recursive https://github.com/maxlegrec1/ChessDecoder.git
 cd ChessDecoder
-git submodule init
-git submodule update
-```
-
-This pulls the [chess-library](https://github.com/disservin/chess-library) C++ dependency used by the inference engine.
-
-### 2. Install uv (if not already installed)
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-### 3. Install dependencies and build the C++ decoder engine
-
-```bash
 uv sync
 ```
 
-This single command:
-- Creates a virtual environment with Python 3.13
-- Installs all Python dependencies (PyTorch, python-chess, PyArrow, etc.)
-- Builds the C++ pybind11 decoder inference engine (`decoder-inference-cpp`) against libtorch and CUDA
+This creates a virtualenv, installs all Python dependencies, and builds the C++ decoder inference engine against libtorch and CUDA.
 
-To also build the MCTS/TensorRT engine (needed for variation generation):
+> **Need [uv](https://github.com/astral-sh/uv)?** `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+### 2. (Optional) Build the MCTS engine
+
+Only needed if you want to generate finetuning variation data via MCTS:
 
 ```bash
 uv sync --extra mcts
 ```
 
-> **Note:** The MCTS build expects TensorRT at `/usr/local/TensorRT-10.14.1.48` and CUDA at `/usr/local/cuda`. If your paths differ, edit `src/cpp/setup.py`.
+Requires TensorRT at `/usr/local/TensorRT-10.14.1.48` and CUDA at `/usr/local/cuda`. Edit `src/cpp/setup.py` if your paths differ.
 
-### 4. Verify the installation
+### 3. (Optional) Install Stockfish
 
-```bash
-# Check that the Python package works
-uv run python -c "from src.models.model import ChessDecoder; print('Model OK')"
-
-# Check that the C++ decoder engine loaded
-uv run python -c "import _decoder_inference_cpp; print('C++ decoder engine OK')"
-
-# (Optional) Check MCTS engine
-uv run python -c "import _inference_cpp; print('C++ MCTS engine OK')"
-```
-
-## Installing Stockfish
-
-Stockfish is needed for ELO evaluation. Download the binary for your platform from <https://stockfishchess.org/download/> and place it at `bin/stockfish`:
+Only needed for ELO evaluation. Download from <https://stockfishchess.org/download/>:
 
 ```bash
 mkdir -p bin
-# Download and extract Stockfish, then:
 mv stockfish-ubuntu-x86-64-avx2 bin/stockfish
 chmod +x bin/stockfish
 ```
 
-The eval scripts automatically look for `bin/stockfish` before falling back to `PATH`.
+The eval scripts look for `bin/stockfish` automatically, falling back to `PATH`.
+
+### 4. Verify
+
+```bash
+uv run python -c "from src.models.model import ChessDecoder; print('OK')"
+uv run python -c "import _decoder_inference_cpp; print('C++ decoder engine OK')"
+```
 
 ## Data Preparation
 
 ### Pretraining Data
 
-Pretraining data comes from [Leela Chess Zero](https://lczero.org/) V6 training archives. The download script fetches tar files from https://storage.lczero.org/files/training_data/test91/ and converts them to Parquet.
+Pretraining data comes from [Leela Chess Zero](https://lczero.org/) V6 training archives:
 
 ```bash
-# Download 5 tar files and convert to parquets/
+# Download 5 tar files, convert to Parquet (default: parquets/)
 ./scripts/download_and_convert_pretraining_data.sh 5
 
-# Or specify a custom output directory via env var:
+# Or specify a custom output directory:
 PARQUET_DIR=/path/to/data ./scripts/download_and_convert_pretraining_data.sh 10
 ```
 
-Then point `src/train/config.yaml` → `data.parquet_dir` at your parquets directory.
+Then set `parquet_dir` in `src/train/config.yaml` to point at your parquets directory.
 
-### Finetuning Data
-
-Finetuning data is generated by running MCTS variations on the pretraining parquets. This requires a TensorRT engine file from a trained model and the MCTS extension (`uv sync --extra mcts`).
+**Manual conversion** of a single tar file:
 
 ```bash
-# Generate finetuning parquets with MCTS variations
+uv run python -m src.dataloader.reconstitute_games lc0_tars/training.2411.tar
+```
+
+### Finetuning Data (requires MCTS)
+
+Generate MCTS variation data from pretraining parquets:
+
+```bash
 ./scripts/generate_finetuning_data.sh trt/model_dynamic_leela.trt parquets parquets_variations
 ```
 
-Then point `src/finetune/config.yaml` → `data.variation_parquet_dir` at the output directory.
+Then set `variation_parquet_dir` in `src/finetune/config.yaml`.
 
 ## Training
 
 ```bash
-# Pretraining on game sequences
-uv run python -m src.train.train           # uses src/train/config.yaml
-
-# Finetuning with thinking variations (requires a pretrained checkpoint)
-uv run python -m src.finetune.train        # uses src/finetune/config.yaml
-
-# RL training with GRPO (requires a finetuned checkpoint)
-uv run python -m src.rl.train              # uses src/rl/config.yaml
+uv run python -m src.train.train        # Pretraining          (src/train/config.yaml)
+uv run python -m src.finetune.train     # Finetuning           (src/finetune/config.yaml)
+uv run python -m src.rl.train           # RL with GRPO         (src/rl/config.yaml)
 ```
-
-Training configuration (batch size, learning rate, data paths, etc.) lives in the respective `config.yaml` files.
 
 ## Inference
 
 ```bash
-# Run thinking inference (generate variations, then choose a move)
 uv run python -m src.inference.think \
     --checkpoint checkpoints/model.pt \
     --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" \
-    --temperature 0.0 --device cuda
+    --temperature 0.0
 ```
 
 ## Testing
 
 ```bash
-# Run all CPU tests (~2s)
-uv run pytest tests/ -m "not gpu and not cpp" -v
-
-# Run all tests including GPU and C++ engine (~90s)
-uv run pytest tests/ -v
+uv run pytest tests/ -m "not gpu and not cpp" -v   # CPU-only (~2s)
+uv run pytest tests/ -v                              # All tests (~90s, needs GPU + exports/base/)
 ```
 
 ## Evaluation
 
 ```bash
-uv run python src/eval/elo_eval.py       # single-game ELO evaluation
-uv run python src/eval/elo_eval_n.py     # multi-game ELO evaluation
-```
+# Thinking model vs Stockfish
+uv run python scripts/eval_elo_thinking.py --export-dir exports/base --num-games 200 --elo 2000
 
-These scripts play the model against Stockfish and compute an ELO estimate. Make sure Stockfish is installed (see above).
+# Root policy (no thinking) vs Stockfish
+uv run python scripts/eval_elo_root.py --export-dir exports/base --num-games 200 --elo 2000
+
+# Pass@k accuracy
+uv run python scripts/pass_at_k.py --export-dir exports/base --num-fens 100 --k 10
+```
 
 ## Model at a Glance
 
@@ -201,21 +189,15 @@ These scripts play the model against Stockfish and compute an ELO estimate. Make
 
 ## Documentation
 
-Detailed technical documentation is organized into topic-specific guides in the [`markdowns/`](markdowns/) directory:
-
 | # | Document | Description |
 |---|---|---|
-| 01 | [Architecture Overview](markdowns/01-architecture-overview.md) | Two-pass forward design, sequence formats, attention masks, and output heads |
-| 02 | [Vocabulary & Tokenization](markdowns/02-vocabulary-and-tokenization.md) | The 1968-token vocabulary, sub-vocabularies, and FEN-to-token conversion |
-| 03 | [Data Pipeline](markdowns/03-data-pipeline.md) | Pretraining and finetuning data loading, Parquet format, batch construction |
-| 04 | [Decoder Training](markdowns/04-decoder-training.md) | Pretraining loop, two-pass training strategy, loss functions and weights |
-| 05 | [Model Architecture](markdowns/05-model-architecture.md) | Layer-by-layer model components, parameter counts, Fourier encoder details |
-| 06 | [Evaluation & Inference](markdowns/06-evaluation-and-inference.md) | Single-position, multi-position, and thinking inference modes |
-| 07 | [Known Issues & Improvements](markdowns/07-known-issues-and-improvements.md) | Current limitations and planned improvements |
-| 08 | [Quick Reference](markdowns/08-quick-reference.md) | File locations, key constants, token layouts, and training commands |
-| 09 | [Finetuning Thinking Variations](markdowns/09-finetuning-thinking-variations.md) | Thinking sequences, Plackett-Luce ordering, dual policy heads |
-| 10 | [RL GRPO Training](markdowns/10-rl-grpo-training.md) | Reinforcement learning with GRPO: rollouts, rewards, policy optimization |
-
-## Dependencies
-
-Core libraries: **PyTorch**, **TorchTune**, **python-chess**, **PyArrow**, **NumPy**, **Weights & Biases**. See [`pyproject.toml`](pyproject.toml) for the full list and version constraints.
+| 01 | [Architecture Overview](markdowns/01-architecture-overview.md) | Two-pass forward, sequence formats, attention masks |
+| 02 | [Vocabulary & Tokenization](markdowns/02-vocabulary-and-tokenization.md) | 1968-token vocabulary, sub-vocabularies, FEN conversion |
+| 03 | [Data Pipeline](markdowns/03-data-pipeline.md) | Data loading, Parquet format, batch construction |
+| 04 | [Decoder Training](markdowns/04-decoder-training.md) | Pretraining loop, loss functions and weights |
+| 05 | [Model Architecture](markdowns/05-model-architecture.md) | Layer-by-layer components, Fourier encoder |
+| 06 | [Evaluation & Inference](markdowns/06-evaluation-and-inference.md) | Inference modes (single, multi-position, thinking) |
+| 07 | [Known Issues](markdowns/07-known-issues-and-improvements.md) | Limitations and planned improvements |
+| 08 | [Quick Reference](markdowns/08-quick-reference.md) | Key constants, token layouts, commands |
+| 09 | [Finetuning Variations](markdowns/09-finetuning-thinking-variations.md) | Thinking sequences, Plackett-Luce, dual policy heads |
+| 10 | [RL GRPO Training](markdowns/10-rl-grpo-training.md) | Rollouts, rewards, policy optimization |
