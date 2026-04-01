@@ -13,9 +13,10 @@ import shutil
 
 pgn_dir = "./pgns"
 os.makedirs(pgn_dir,exist_ok=True)
-STOCKFISH_PATH = shutil.which("stockfish")
+_PROJECT_STOCKFISH = os.path.join(os.path.dirname(__file__), "..", "..", "bin", "stockfish")
+STOCKFISH_PATH = _PROJECT_STOCKFISH if os.path.isfile(_PROJECT_STOCKFISH) else shutil.which("stockfish")
 if STOCKFISH_PATH is None:
-    raise RuntimeError("stockfish not found on PATH – download it from https://stockfishchess.org/download/")
+    raise RuntimeError("stockfish not found in bin/ or on PATH – download it from https://stockfishchess.org/download/")
 STOCKFISH_ELO = 2500  # Set the desired ELO rating
 N_GAMES = 200 # Reduced for faster testing, change back to 100 if needed
 

@@ -18,7 +18,8 @@ wandb/
 
 pgns/
 
-stockfish-ubuntu-x86-64-avx2
+# Binaries
+/bin/
 
 # Compiled extensions
 *.so

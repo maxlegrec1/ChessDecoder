@@ -9,9 +9,10 @@ from math import log10
 import os
 import shutil
 
-STOCKFISH_PATH = shutil.which("stockfish")
+_PROJECT_STOCKFISH = os.path.join(os.path.dirname(__file__), "..", "..", "bin", "stockfish")
+STOCKFISH_PATH = _PROJECT_STOCKFISH if os.path.isfile(_PROJECT_STOCKFISH) else shutil.which("stockfish")
 if STOCKFISH_PATH is None:
-    raise RuntimeError("stockfish not found on PATH – download it from https://stockfishchess.org/download/")
+    raise RuntimeError("stockfish not found in bin/ or on PATH – download it from https://stockfishchess.org/download/")
 
 def get_stockfish_move(engine_obj, bullet_board):
     # Use python-chess board for Stockfish, then convert back to bulletchess.Move
