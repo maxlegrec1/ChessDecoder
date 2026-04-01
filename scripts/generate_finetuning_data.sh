@@ -9,7 +9,7 @@
 #   PARQUET_DIR  Directory with pretraining parquets (default: parquets/)
 #   OUTPUT_DIR   Directory for enriched parquets (default: parquets_variations/)
 #
-# This script wraps scripts/generate_variations.py, which reads existing parquets,
+# This script wraps src/finetune/generate_variations.py, which reads existing parquets,
 # runs Leela MCTS on each position, and writes enriched parquets with variation data.
 #
 # Prerequisites:
@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-ENGINE_PATH="${1:-model_dynamic_leela.trt}"
+ENGINE_PATH="${1:-trt/model_dynamic_leela.trt}"
 PARQUET_DIR="${2:-parquets}"
 OUTPUT_DIR="${3:-parquets_variations}"
 
@@ -49,7 +49,7 @@ fi
 echo "Found $PARQUET_COUNT parquet file(s) to process."
 echo ""
 
-uv run python scripts/generate_variations.py \
+uv run python -m src.finetune.generate_variations \
     --parquet-dir "$PARQUET_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --simulations 600 \

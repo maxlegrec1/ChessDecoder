@@ -7,11 +7,11 @@ reconstructs move history per game, runs Leela MCTS with variation
 extraction on each position, and writes enriched parquets.
 
 Usage:
-    uv run python scripts/generate_variations.py \
+    uv run python -m src.finetune.generate_variations \
         --parquet-dir parquets \
         --output-dir parquets_variations \
         --simulations 600 \
-        --engine-path model_dynamic_leela.trt \
+        --engine-path trt/model_dynamic_leela.trt \
         --parallel-trees 128
 """
 

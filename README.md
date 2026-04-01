@@ -151,7 +151,7 @@ Training configuration (batch size, learning rate, data paths, etc.) lives in th
 
 ```bash
 # Run thinking inference (generate variations, then choose a move)
-uv run python scripts/think.py \
+uv run python -m src.inference.think \
     --checkpoint checkpoints/model.pt \
     --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" \
     --temperature 0.0 --device cuda
