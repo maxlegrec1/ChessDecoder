@@ -14,7 +14,8 @@ class GRPOConfig:
 
     # --- GRPO hyperparams ---
     group_size: int = 10
-    clip_epsilon: float = 0.2
+    clip_epsilon_low: float = 0.2
+    clip_epsilon_high: float = 0.28
     kl_coeff: float = 0.05
     ppo_epochs: int = 1
     max_kl: float = 0.05

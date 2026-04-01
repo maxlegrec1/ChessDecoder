@@ -35,7 +35,7 @@ from src.rl.rollout import generate_rollouts, RolloutResult, export_model
 from src.rl.sequence import parse_rollout, collate_rollouts
 from src.rl.log_probs import compute_ref_log_probs, compute_current_log_probs, compute_policy_entropy
 from src.rl.rewards import CompositeReward
-from src.rl.grpo import compute_group_advantages, grpo_loss
+from src.rl.grpo import compute_group_advantages, normalize_advantages_minibatch, grpo_loss
 from src.rl.metrics import GRPOMetrics
 
 
@@ -301,24 +301,35 @@ def train():
 
             metrics.log_rollout_batch(grouped_rollouts, grouped_rewards, batch_positions, rollout_time)
 
-            # 6. Compute group-relative advantages
-            advantages = compute_group_advantages(reward_tensor)
-            advantages_flat = advantages.reshape(-1).to(device)
+            # 6. Compute group-relative advantages and filter non-diverse groups
+            advantages, diverse_mask = compute_group_advantages(reward_tensor)
+            # diverse_mask: [B] bool — True for groups with varying rewards
 
-            # 7. Parse rollouts into tensors
+            # 7. Parse rollouts into tensors, filtering out non-diverse groups
             parsed = []
-            for group in grouped_rollouts:
-                for rollout in group:
+            advantages_kept = []
+            for fen_idx, group in enumerate(grouped_rollouts):
+                if not diverse_mask[fen_idx]:
+                    continue  # skip groups where all rewards are identical
+                for sample_idx, rollout in enumerate(group):
                     parsed.append(parse_rollout(
                         rollout.token_ids, rollout.wl_entries,
                         rollout.d_entries, max_seq_len,
                     ))
-            all_batch = collate_rollouts(parsed, device)
-            N = B * G
+                    advantages_kept.append(advantages[fen_idx, sample_idx].item())
 
-            # 8. Single-pass PPO
-            #    With ppo_epochs=1, old_lp == current_lp (ratio=1, no clipping).
-            #    NOTE: if ppo_epochs > 1, old_lp must be precomputed.
+            if len(parsed) == 0:
+                print_rank0("  All groups non-diverse, skipping training step")
+                continue
+
+            all_batch = collate_rollouts(parsed, device)
+            advantages_flat = torch.tensor(advantages_kept, device=device)
+            N = len(parsed)
+            n_diverse = diverse_mask.sum().item()
+            print_rank0(f"  Diverse groups: {n_diverse}/{B} "
+                        f"({n_diverse * G} sequences for training)")
+
+            # 8. Single-pass GRPO update
             model.train()
             inner_step_count = 0
             perm = torch.randperm(N, device=device)
@@ -330,7 +341,8 @@ def train():
 
                 mb_batch = {k: v[mb_idx] for k, v in all_batch.items()
                             if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N}
-                mb_advantages = advantages_flat[mb_idx]
+                # Mini-batch advantage normalization
+                mb_advantages = normalize_advantages_minibatch(advantages_flat[mb_idx])
 
                 with torch.no_grad():
                     mb_ref_lp, mb_move_mask = compute_ref_log_probs(ref_model, mb_batch, config.use_amp)
@@ -342,7 +354,8 @@ def train():
 
                 loss, info = grpo_loss(
                     mb_lp, mb_old_lp, mb_ref_lp, mb_move_mask,
-                    mb_advantages, config.clip_epsilon, config.kl_coeff,
+                    mb_advantages, config.clip_epsilon_low,
+                    config.clip_epsilon_high, config.kl_coeff, G,
                 )
 
                 scaled_loss = loss / config.grad_accum_steps
