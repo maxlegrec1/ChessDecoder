@@ -23,8 +23,7 @@ stockfish-ubuntu-x86-64-avx2
 # Compiled extensions
 *.so
 
-# Export artifacts (top-level output dir, not src/export/)
-/export/
+# Export artifacts
 /exports/
 
 # Model checkpoints (top-level)
@@ -66,16 +65,6 @@ src/cpp/decoder/uv.lock
 # Verification cache
 scripts/.verify_cache/
 
-export_new/
-export_new2/
-export_new3/
-export_new4/
-export_eval_mid/
-export_local/
-export_local2/
-export_local3/
-export_eval_end/
-export_*/
 
 parquet_variations2/
 single_parquet/
