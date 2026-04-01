@@ -33,7 +33,7 @@ def load_fen_bestmove_pairs(n, seed, data_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--export-dir", default="exports")
+    parser.add_argument("--export-dir", default="exports/base")
     parser.add_argument("--data-dir", default="/home/maxime/parquet_files_decoder/")
     parser.add_argument("--num-fens", type=int, default=50)
     parser.add_argument("--k", type=int, default=10)

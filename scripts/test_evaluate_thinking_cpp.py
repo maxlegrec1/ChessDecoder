@@ -18,7 +18,7 @@ from src.eval.elo_eval import model_vs_stockfish
 
 def main():
     parser = argparse.ArgumentParser(description="Elo evaluation with C++ thinking engine")
-    parser.add_argument("--export-dir", default="exports")
+    parser.add_argument("--export-dir", default="exports/base")
     parser.add_argument("--num-games", type=int, default=100)
     parser.add_argument("--elo", type=int, default=2000)
     parser.add_argument("--temperature", type=float, default=0.0)

@@ -1,21 +1,32 @@
 """
-Evaluate pass@k: generate k COTs per FEN, check if any final move matches best_move.
+Evaluate pass@k for the pretrained (non-thinking) model.
+Single forward pass per FEN: encode board -> policy head -> sample move.
 
 Usage:
-    uv run python scripts/pass_at_k.py \
-        --export-dir export \
-        --num-fens 200 --k 10 \
-        --think-temp 0.8 --policy-temp 0.5
+    uv run python scripts/pass_at_k_pretrained.py \
+        --checkpoint checkpoint_616000.pt \
+        --num-fens 100 --k 10 --temperature 0.5
+
+Baseline (argmax):
+    uv run python scripts/pass_at_k_pretrained.py \
+        --checkpoint checkpoint_616000.pt \
+        --num-fens 100 --k 1
 """
 
 import argparse
 import os
 import random
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pyarrow.parquet as pq
+import torch
 
-import _decoder_inference_cpp as cpp
+from src.models.model import ChessDecoder
+from src.models.vocab import vocab_size
 
 
 def load_fen_bestmove_pairs(n, seed, data_dir):
@@ -38,57 +49,50 @@ def load_fen_bestmove_pairs(n, seed, data_dir):
     return pairs[:n]
 
 
-def evaluate_pass_at_k(engine, pairs, k):
+def evaluate_pass_at_k(model, pairs, k, temperature):
     """Returns pass@k accuracy."""
     correct = 0
     for fen, best_move in pairs:
         moves = set()
         for _ in range(k):
-            moves.add(engine.predict_move(fen))
+            moves.add(model.predict_move(fen, temperature=temperature))
         if best_move in moves:
             correct += 1
     return correct / len(pairs)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate pass@k with per-head temperatures")
-    parser.add_argument("--export-dir", default="exports/base")
+    parser = argparse.ArgumentParser(description="Evaluate pass@k for pretrained (non-thinking) model")
+    parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--data-dir", default="/home/maxime/parquet_files_decoder/")
-    parser.add_argument("--num-fens", type=int, default=200)
+    parser.add_argument("--num-fens", type=int, default=100)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--board-temp", type=float, default=0.0)
-    parser.add_argument("--think-temp", type=float, default=0.0)
-    parser.add_argument("--policy-temp", type=float, default=0.0)
-    parser.add_argument("--wl-temp", type=float, default=0.0)
-    parser.add_argument("--d-temp", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    engine = cpp.ThinkingInferenceEngine(
-        f"{args.export_dir}/backbone.pt",
-        f"{args.export_dir}/weights",
-        f"{args.export_dir}/vocab.json",
-        f"{args.export_dir}/config.json",
+    model = ChessDecoder(
+        vocab_size=vocab_size, embed_dim=1024, num_heads=16,
+        num_layers=12, max_seq_len=256, d_ff=1536,
     )
-
-    engine.board_temperature = args.board_temp
-    engine.think_temperature = args.think_temp
-    engine.policy_temperature = args.policy_temp
-    engine.wl_temperature = args.wl_temp
-    engine.d_temperature = args.d_temp
+    state = torch.load(args.checkpoint, map_location="cpu")
+    model.load_state_dict(state["model_state_dict"])
+    model.eval()
+    model.to(args.device)
 
     pairs = load_fen_bestmove_pairs(args.num_fens, args.seed, args.data_dir)
     print(f"Loaded {len(pairs)} FEN/best_move pairs")
-    print(f"Temps: board={args.board_temp} think={args.think_temp} "
-          f"policy={args.policy_temp} wl={args.wl_temp} d={args.d_temp}")
+    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Temperature: {args.temperature}, k={args.k}")
     print(f"Evaluating pass@{args.k} ...")
 
     t0 = time.time()
-    score = evaluate_pass_at_k(engine, pairs, args.k)
+    score = evaluate_pass_at_k(model, pairs, args.k, args.temperature)
     elapsed = time.time() - t0
 
     print(f"\npass@{args.k}: {score:.1%} ({int(score * len(pairs))}/{len(pairs)})")
-    print(f"Time: {elapsed:.0f}s, {engine.total_tokens / elapsed:.0f} tok/s")
+    print(f"Time: {elapsed:.0f}s")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ import os, random
 import pyarrow.parquet as pq
 import _decoder_inference_cpp as cpp
 
-EXPORT = "exports"
+EXPORT = "exports/base"
 
 # Use one of the disagreeing FENs from the 5-FEN test
 # FEN4 had different seq lengths (427 vs 712)

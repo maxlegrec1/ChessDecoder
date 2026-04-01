@@ -8,7 +8,7 @@ import time
 import pyarrow.parquet as pq
 import _decoder_inference_cpp as cpp
 
-EXPORT = "exports"
+EXPORT = "exports/base"
 DATA_DIR = "/home/maxime/parquet_files_decoder/"
 NUM_FENS = 20
 K = 5

@@ -8,7 +8,7 @@ sys.path.insert(0, ".")
 
 import _decoder_inference_cpp as cpp
 
-EXPORT = "exports"
+EXPORT = "exports/base"
 
 def make_single():
     e = cpp.ThinkingInferenceEngine(

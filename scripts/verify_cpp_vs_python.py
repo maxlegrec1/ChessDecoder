@@ -201,7 +201,7 @@ def compare_values(py_entries, cpp_entries, label):
 def main():
     parser = argparse.ArgumentParser(description="Verify C++ libtorch vs Python PyTorch thinking inference")
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--export-dir", default="exports")
+    parser.add_argument("--export-dir", default="exports/base")
     parser.add_argument("--num-fens", type=int, default=100)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)

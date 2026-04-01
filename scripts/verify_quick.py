@@ -115,7 +115,7 @@ def run_cpp(fens, export_dir):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--export-dir", default="exports")
+    parser.add_argument("--export-dir", default="exports/base")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 

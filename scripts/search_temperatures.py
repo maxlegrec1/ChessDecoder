@@ -25,7 +25,7 @@ from pass_at_k import load_fen_bestmove_pairs, evaluate_pass_at_k
 
 def main():
     parser = argparse.ArgumentParser(description="Grid search per-head temperatures for pass@k")
-    parser.add_argument("--export-dir", default="exports")
+    parser.add_argument("--export-dir", default="exports/base")
     parser.add_argument("--data-dir", default="/home/maxime/parquet_files_decoder/")
     parser.add_argument("--num-fens", type=int, default=200)
     parser.add_argument("--k", type=int, default=10)

@@ -3,7 +3,7 @@ import os, random, time
 import pyarrow.parquet as pq
 import _decoder_inference_cpp as cpp
 
-EXPORT = "exports"
+EXPORT = "exports/base"
 DATA_DIR = "/home/maxime/parquet_files_decoder/"
 
 files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet"))

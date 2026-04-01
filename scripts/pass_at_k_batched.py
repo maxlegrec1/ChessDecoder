@@ -60,7 +60,7 @@ def evaluate_pass_at_k_batched(engine, pairs, k):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--export-dir", default="exports")
+    parser.add_argument("--export-dir", default="exports/base")
     parser.add_argument("--data-dir", default="/home/maxime/parquet_files_decoder/")
     parser.add_argument("--num-fens", type=int, default=30)
     parser.add_argument("--k", type=int, default=5)
