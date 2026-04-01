@@ -10,7 +10,7 @@ import time
 import os
 from multiprocessing import Pool, cpu_count
 from concurrent.futures import ThreadPoolExecutor
-from policy_index import policy_index
+from src.dataloader.policy_index import policy_index
 
 
 class Timer:
