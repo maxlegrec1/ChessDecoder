@@ -65,7 +65,6 @@ BatchedInferenceEngine::BatchedInferenceEngine(
         embed_dim_, max_seq_len_, max_batch_size);
 
     // Upload head weights to GPU as FP16 (transposed for matmul)
-    // Same pattern as decoder_engine.cpp constructor
     auto uploadWeightT = [](const float* data, int out_dim, int in_dim) {
         auto w = torch::from_blob(const_cast<float*>(data),
             {out_dim, in_dim}, torch::kFloat32).to(torch::kFloat16).to(torch::kCUDA);
@@ -254,6 +253,9 @@ BatchedInferenceEngine::predictMoves(
     int board_end_var_sub = vocab_->boardEndVarIdx();
     int board_end_think_sub = vocab_->boardEndThinkIdx();
 
+    // All-true mask (all elements active at init)
+    auto all_active = torch::ones({B}, opts_bool);
+
     // ================================================================
     // Phase 1: Root boards + start_think
     // ================================================================
@@ -292,20 +294,20 @@ BatchedInferenceEngine::predictMoves(
     auto init_ov = torch::zeros({B, init_len}, opts_fp16);
     auto init_om = torch::zeros({B, init_len}, opts_bool);
 
-    // Causal prefill, then sync to graph buffers for incremental mode
+    // Causal prefill — all tokens are real for all elements
     backbone_->resetCausal();
     backbone_->resetPrefix();
-    backbone_->causalForward(init_ids, init_pos, init_ov, init_om);
+    auto num_real_init = torch::full({B}, init_len, opts_int);
+    backbone_->causalForward(init_ids, init_pos, init_ov, init_om,
+                             all_active, num_real_init);
     backbone_->syncCausalToGraph();
 
     // Prefix init with block-aware mask
-    // Build block_ids tensor [B, init_len]
     auto block_ids_t = torch::zeros({B, init_len}, opts_int);
     for (int b = 0; b < B; b++)
         for (int j = 0; j < init_len; j++)
             block_ids_t[b][j] = block_ids[b][j];
 
-    // Build prefix mask [B, 1, init_len, init_len]
     auto same_block = block_ids_t.unsqueeze(2) == block_ids_t.unsqueeze(1);  // [B, S, S]
     auto causal_mask = torch::tril(torch::ones({init_len, init_len}, opts_bool));
     auto prefix_mask = torch::where(
@@ -314,19 +316,24 @@ BatchedInferenceEngine::predictMoves(
         torch::tensor(-1e9f, torch::kCUDA));
     prefix_mask = prefix_mask.unsqueeze(1);  // [B, 1, S, S]
 
-    auto h_init = backbone_->prefixForward(init_ids, init_pos, prefix_mask, init_ov, init_om);
+    auto h_init = backbone_->prefixForward(init_ids, init_pos, prefix_mask,
+                                           init_ov, init_om, all_active);
     backbone_->syncPrefixToGraph();
-    // Extract hidden at last position (start_think) → [B, E]
-    auto saved_h = h_init.index({torch::indexing::Slice(), init_len - 1}).contiguous();  // [B, E]
+    auto saved_h = h_init.index({torch::indexing::Slice(), init_len - 1}).contiguous();
 
-    int cur_len = init_len;  // All sequences at same length after init
+    // Per-sequence position tracking
+    std::vector<int> seq_pos(B, init_len);
+    int cur_len = init_len;
+
+    // Causal hidden state saved at end of board gen loop
+    torch::Tensor h_board_after_loop;
 
     // ================================================================
     // Phase 2: Variation loop
     // ================================================================
 
     auto active = torch::ones({B}, opts_bool);
-    auto in_variation = torch::ones({B}, opts_bool);  // Start: all entering first variation
+    auto in_variation = torch::ones({B}, opts_bool);
 
     for (int iter = 0; iter < max_seq_len_; iter++)
     {
@@ -336,24 +343,31 @@ BatchedInferenceEngine::predictMoves(
         auto need_move = active & in_variation;  // [B]
 
         if (!need_move.any().item<bool>())
-        {
-            // All active sequences are between variations (AFTER_END_VAR)
-            // This shouldn't normally happen on the first iteration, but handle it
             break;
-        }
+
+        // Sync cur_len from per-sequence positions
+        cur_len = 0;
+        for (int b = 0; b < B; b++)
+            if (need_move[b].item<bool>() && seq_pos[b] > cur_len)
+                cur_len = seq_pos[b];
+
+        // Helper: build per-sequence position tensor from seq_pos + offset
+        auto makePosT = [&](int off = 0) {
+            auto p = torch::zeros({B, 1}, opts_int);
+            for (int b = 0; b < B; b++)
+                p[b][0] = seq_pos[b] + off;
+            return p;
+        };
 
         // ── Step 2a: MOVE ──────────────────────────────────────────────
         {
-            auto logits = torch::mm(saved_h, think_w_t_) + think_b_;  // [B, move_vocab]
-            // Mask inactive sequences
-            // Mask inactive: cast logits to FP32 for masking, then back
+            auto logits = torch::mm(saved_h, think_w_t_) + think_b_;
             auto logits_f32 = logits.to(torch::kFloat32);
             logits_f32.index_put_({~need_move}, torch::tensor(-1e9f, torch::kCUDA));
             logits = logits_f32.to(torch::kFloat16);
-            auto sub_idx = sampleBatched(logits, think_temp);  // [B]
-            auto full_idx = move_lut.index({sub_idx});          // [B] full vocab
+            auto sub_idx = sampleBatched(logits, think_temp);
+            auto full_idx = move_lut.index({sub_idx});
 
-            // Record tokens (CPU)
             auto full_idx_cpu = full_idx.cpu();
             auto full_idx_a = full_idx_cpu.accessor<int64_t, 1>();
             for (int b = 0; b < B; b++)
@@ -366,28 +380,32 @@ BatchedInferenceEngine::predictMoves(
                     first_root_move[b] = vocab_->idxToToken(tok);
             }
 
-            // Prefix incremental
-            auto move_ids_t = full_idx.unsqueeze(1);  // [B, 1]
-            auto move_pos = torch::full({B, 1}, cur_len, opts_int);
+            // Prefix incremental with active mask
+            auto move_ids_t = full_idx.unsqueeze(1);
+            auto move_pos = makePosT();
             auto move_ov = torch::zeros({B, 1}, opts_fp16);
             auto move_om = torch::zeros({B, 1}, opts_bool);
-            auto h_move = backbone_->prefixIncremental(move_ids_t, move_pos, move_ov, move_om);
-            saved_h = h_move.squeeze(1);  // [B, E]
-            cur_len++;
+            auto h_move = backbone_->prefixIncremental(move_ids_t, move_pos,
+                                                       move_ov, move_om, need_move);
+            saved_h = h_move.squeeze(1);
+            for (int b = 0; b < B; b++)
+                if (need_move[b].item<bool>()) seq_pos[b]++;
+            cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
         }
 
         // ── Step 2b: WL_D ──────────────────────────────────────────────
         {
             // WL
-            auto wl_vals = evalWlHead(saved_h, wl_temp);  // [B] float
+            auto wl_vals = evalWlHead(saved_h, wl_temp);
             auto wl_cpu = wl_vals.cpu();
             auto wl_a = wl_cpu.accessor<float, 1>();
 
             auto wl_ids_t = torch::full({B, 1}, wl_value_idx, opts_int);
-            auto wl_pos = torch::full({B, 1}, cur_len, opts_int);
-            auto wl_ov = wl_vals.to(torch::kFloat16).unsqueeze(1);  // [B, 1]
-            auto wl_om = need_move.unsqueeze(1);  // override only for active sequences
-            auto h_wl = backbone_->prefixIncremental(wl_ids_t, wl_pos, wl_ov, wl_om);
+            auto wl_pos = makePosT();
+            auto wl_ov = wl_vals.to(torch::kFloat16).unsqueeze(1);
+            auto wl_om = need_move.unsqueeze(1);
+            auto h_wl = backbone_->prefixIncremental(wl_ids_t, wl_pos,
+                                                     wl_ov, wl_om, need_move);
             saved_h = h_wl.squeeze(1);
 
             for (int b = 0; b < B; b++)
@@ -395,20 +413,22 @@ BatchedInferenceEngine::predictMoves(
                 if (!need_move[b].item<bool>()) continue;
                 token_ids[b].push_back(wl_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
-                wl_entries[b].push_back({cur_len, wl_a[b]});
+                wl_entries[b].push_back({seq_pos[b], wl_a[b]});
+                seq_pos[b]++;
             }
-            cur_len++;
+            cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
 
             // D
-            auto d_vals = evalDHead(saved_h, d_temp);  // [B] float
+            auto d_vals = evalDHead(saved_h, d_temp);
             auto d_cpu = d_vals.cpu();
             auto d_a = d_cpu.accessor<float, 1>();
 
             auto d_ids_t = torch::full({B, 1}, d_value_idx, opts_int);
-            auto d_pos = torch::full({B, 1}, cur_len, opts_int);
+            auto d_pos = makePosT();
             auto d_ov = d_vals.to(torch::kFloat16).unsqueeze(1);
             auto d_om = need_move.unsqueeze(1);
-            auto h_d = backbone_->prefixIncremental(d_ids_t, d_pos, d_ov, d_om);
+            auto h_d = backbone_->prefixIncremental(d_ids_t, d_pos,
+                                                    d_ov, d_om, need_move);
             saved_h = h_d.squeeze(1);
 
             for (int b = 0; b < B; b++)
@@ -416,51 +436,66 @@ BatchedInferenceEngine::predictMoves(
                 if (!need_move[b].item<bool>()) continue;
                 token_ids[b].push_back(d_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
-                d_entries[b].push_back({cur_len, d_a[b]});
+                d_entries[b].push_back({seq_pos[b], d_a[b]});
+                seq_pos[b]++;
             }
-            cur_len++;
+            cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
         }
 
         // ── Step 2c: BOARD (67 autoregressive steps) ────────────────────
         {
-            // Causal catch-up: forward orphan tokens (move + wl + d = 3 tokens)
-            // since last causal update. All sequences have same number of new tokens.
+            // Causal catch-up: forward orphan tokens since last causal
+            // update.  Sequences may have different numbers of new tokens.
             int causal_start = backbone_->causalLen();
-            int new_tokens = cur_len - causal_start;
-
-            if (new_tokens > 0)
+            int max_new = 0;
+            for (int b = 0; b < B; b++)
             {
-                // Sync graph → dynamic cache before dynamic forward
+                int my = seq_pos[b] - causal_start;
+                if (my > max_new) max_new = my;
+            }
+
+            if (max_new > 0)
+            {
                 backbone_->syncGraphToCausal();
-                // Build catch-up input from token_ids
-                auto catch_ids = torch::zeros({B, new_tokens}, opts_int);
-                auto catch_pos = torch::zeros({B, new_tokens}, opts_int);
-                auto catch_ov = torch::zeros({B, new_tokens}, opts_fp16);
-                auto catch_om = torch::zeros({B, new_tokens}, opts_bool);
+                auto catch_ids = torch::zeros({B, max_new}, opts_int);
+                auto catch_pos = torch::zeros({B, max_new}, opts_int);
+                auto catch_ov = torch::zeros({B, max_new}, opts_fp16);
+                auto catch_om = torch::zeros({B, max_new}, opts_bool);
+
+                // Build num_real tensor for per-element masking
+                auto num_real = torch::zeros({B}, opts_int);
 
                 for (int b = 0; b < B; b++)
                 {
-                    for (int j = 0; j < new_tokens; j++)
+                    int my_new = seq_pos[b] - causal_start;
+                    num_real[b] = my_new;
+                    for (int j = 0; j < max_new; j++)
                     {
                         int pos = causal_start + j;
-                        catch_ids[b][j] = (pos < (int)token_ids[b].size())
-                                          ? token_ids[b][pos] : 0;
-                        catch_pos[b][j] = pos;
+                        if (j < my_new && pos < (int)token_ids[b].size())
+                        {
+                            catch_ids[b][j] = token_ids[b][pos];
+                            catch_pos[b][j] = pos;
+                        }
+                        else
+                        {
+                            // Pad: repeat last real token at same position
+                            // (masked out by valid bitmap, so content doesn't matter)
+                            catch_ids[b][j] = token_ids[b].back();
+                            catch_pos[b][j] = seq_pos[b] - 1;
+                        }
                     }
                 }
 
                 // Set override for WL/D positions
-                // WL is at position cur_len-3 (relative: new_tokens-3), D at cur_len-2 (rel: new_tokens-2)
-                // relative to causal_start
                 for (int b = 0; b < B; b++)
                 {
                     if (!need_move[b].item<bool>()) continue;
-                    // WL override
                     if (!wl_entries[b].empty())
                     {
                         auto& wl_e = wl_entries[b].back();
                         int rel = wl_e.first - causal_start;
-                        if (rel >= 0 && rel < new_tokens)
+                        if (rel >= 0 && rel < max_new)
                         {
                             catch_ov[b][rel] = static_cast<at::Half>(wl_e.second);
                             catch_om[b][rel] = true;
@@ -470,7 +505,7 @@ BatchedInferenceEngine::predictMoves(
                     {
                         auto& d_e = d_entries[b].back();
                         int rel = d_e.first - causal_start;
-                        if (rel >= 0 && rel < new_tokens)
+                        if (rel >= 0 && rel < max_new)
                         {
                             catch_ov[b][rel] = static_cast<at::Half>(d_e.second);
                             catch_om[b][rel] = true;
@@ -478,61 +513,68 @@ BatchedInferenceEngine::predictMoves(
                     }
                 }
 
-                backbone_->causalForward(catch_ids, catch_pos, catch_ov, catch_om);
+                // Per-element masking: num_real tells backbone how many tokens
+                // are real per element, so padded positions get -inf in mask
+                backbone_->causalForward(catch_ids, catch_pos, catch_ov, catch_om,
+                                         need_move, num_real);
+
                 backbone_->syncCausalToGraph();
             }
 
-            // Get first board token from board head on last causal hidden
-            // For simplicity, do one causal incremental to get the hidden for the
-            // first board token (start_pos)
+            // Board gen with per-sequence positions
             int start_pos_idx = vocab_->startPosIdx();
             auto first_tok = torch::full({B, 1}, start_pos_idx, opts_int);
-            auto first_pos = torch::full({B, 1}, cur_len, opts_int);
+            auto first_pos = makePosT();
             auto first_ov = torch::zeros({B, 1}, opts_fp16);
             auto first_om = torch::zeros({B, 1}, opts_bool);
 
-            // Record start_pos
             for (int b = 0; b < B; b++)
             {
                 if (!need_move[b].item<bool>()) continue;
                 int bid = next_block[b]++;
                 token_ids[b].push_back(start_pos_idx);
                 block_ids[b].push_back(bid);
+                seq_pos[b]++;
             }
 
-            auto h_board = backbone_->causalIncremental(first_tok, first_pos, first_ov, first_om);
-            cur_len++;
+            // Pre-mark all 68 board positions as valid in one kernel launch,
+            // so the 68 causalIncremental calls below skip redundant marking.
+            int board_cache_start = backbone_->causalLen();
+            backbone_->markCausalValidRange(board_cache_start, 68, need_move);
+
+            auto h_board = backbone_->causalIncremental(first_tok, first_pos,
+                                                        first_ov, first_om, need_move);
 
             // Board gen: 67 autoregressive steps
             auto board_output = torch::zeros({B, 67}, opts_int);
 
             for (int step = 0; step < 67; step++)
             {
-                // Eval board head
-                auto h_last = h_board.squeeze(1);  // [B, E]
-                auto board_logits = torch::mm(h_last, board_w_t_) + board_b_;  // [B, board_vocab]
-                auto sub_idx = sampleBatched(board_logits, 0.0f);  // always argmax for board tokens
-                auto full_idx = board_lut_.index({sub_idx});  // [B]
+                auto h_last = h_board.squeeze(1);
+                auto board_logits = torch::mm(h_last, board_w_t_) + board_b_;
+                auto sub_idx = sampleBatched(board_logits, 0.0f);
+                auto full_idx = board_lut_.index({sub_idx});
                 board_output.index_put_({torch::indexing::Slice(), step}, full_idx);
 
-                // Next step: causal incremental
-                auto next_ids = full_idx.unsqueeze(1);  // [B, 1]
-                auto next_pos = torch::full({B, 1}, cur_len, opts_int);
-                h_board = backbone_->causalIncremental(next_ids, next_pos, first_ov, first_om);
-                cur_len++;
+                auto next_ids = full_idx.unsqueeze(1);
+                auto next_pos = makePosT();
+                for (int b = 0; b < B; b++)
+                    if (need_move[b].item<bool>()) seq_pos[b]++;
+                h_board = backbone_->causalIncremental(next_ids, next_pos,
+                                                      first_ov, first_om, need_move);
             }
 
-            // Sync graph tier back to dynamic causal cache
-            // (needed before any subsequent dynamic causal forwards or tier switches)
+            h_board_after_loop = h_board.squeeze(1).contiguous();
             backbone_->syncGraphToCausal();
 
-            // ONE sync: copy board tokens to CPU
+            cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
+
+            // Copy board tokens to CPU
             auto board_cpu = board_output.cpu();
             auto board_acc = board_cpu.accessor<int64_t, 2>();
             for (int b = 0; b < B; b++)
             {
                 if (!need_move[b].item<bool>()) continue;
-                // The block ID for this board was set when start_pos was added
                 int bid = next_block[b] - 1;
                 for (int j = 0; j < 67; j++)
                 {
@@ -541,8 +583,7 @@ BatchedInferenceEngine::predictMoves(
                 }
             }
 
-            // Prefix block forward for the 68 board tokens
-            int board_start = cur_len - 68;
+            // Prefix block forward for the 68 board tokens with per-seq positions
             auto board_ids_t = torch::zeros({B, 68}, opts_int);
             auto board_pos_t = torch::zeros({B, 68}, opts_int);
             auto board_ov_t = torch::zeros({B, 68}, opts_fp16);
@@ -550,39 +591,26 @@ BatchedInferenceEngine::predictMoves(
 
             for (int b = 0; b < B; b++)
             {
+                int bstart = seq_pos[b] - 68;
                 for (int j = 0; j < 68; j++)
                 {
-                    int idx = board_start + j;
-                    board_ids_t[b][j] = (idx < (int)token_ids[b].size())
+                    int idx = bstart + j;
+                    board_ids_t[b][j] = (idx >= 0 && idx < (int)token_ids[b].size())
                                         ? token_ids[b][idx] : 0;
-                    board_pos_t[b][j] = board_start + j;
+                    board_pos_t[b][j] = bstart + j;
                 }
             }
 
             backbone_->syncGraphToPrefix();
             auto h_block = backbone_->prefixBlockForward(
-                board_ids_t, board_pos_t, board_ov_t, board_om_t);
+                board_ids_t, board_pos_t, board_ov_t, board_om_t, need_move);
             backbone_->syncPrefixToGraph();
-            // Extract hidden at last board token (position 67 within block)
-            saved_h = h_block.index({torch::indexing::Slice(), 67}).contiguous();  // [B, E]
+            saved_h = h_block.index({torch::indexing::Slice(), 67}).contiguous();
         }
 
         // ── Step 2d: AFTER_BOARD ────────────────────────────────────────
         {
-            // Causal incremental on last board token to get board head decision
-            int last_tok_pos = cur_len - 1;
-            // Get last board token per sequence
-            auto last_tok = torch::zeros({B, 1}, opts_int);
-            for (int b = 0; b < B; b++)
-                last_tok[b][0] = token_ids[b].back();
-            auto last_pos = torch::full({B, 1}, last_tok_pos, opts_int);
-            auto last_ov = torch::zeros({B, 1}, opts_fp16);
-            auto last_om = torch::zeros({B, 1}, opts_bool);
-
-            auto h_after = backbone_->causalIncremental(last_tok, last_pos, last_ov, last_om);
-            cur_len++;
-
-            auto h_dec = h_after.squeeze(1);
+            auto h_dec = h_board_after_loop;
             auto board_logits = torch::mm(h_dec, board_w_t_) + board_b_;
             auto sub_idx = sampleBatched(board_logits, board_temp);
             auto sub_idx_cpu = sub_idx.cpu();
@@ -594,28 +622,26 @@ BatchedInferenceEngine::predictMoves(
 
                 if (sub_a[b] == board_end_var_sub)
                 {
-                    // End variation
                     token_ids[b].push_back(end_var_idx);
                     block_ids[b].push_back(orphan_ctr[b]++);
                     in_variation[b] = false;
-
-                    // Prefix incremental for end_var
-                    // (will be done batched below)
+                    seq_pos[b]++;
                 }
-                // else: continue PV (stay in_variation, loop back to MOVE)
+                // else: continue PV — no token, no position advance
             }
 
-            // Prefix incremental for sequences that emitted end_var
+            // Prefix for end_var sequences
             auto ended_var = need_move & ~in_variation;
             if (ended_var.any().item<bool>())
             {
                 auto ev_ids = torch::full({B, 1}, end_var_idx, opts_int);
-                auto ev_pos = torch::full({B, 1}, cur_len - 1, opts_int);
+                auto ev_pos = makePosT(-1);
                 auto ev_ov = torch::zeros({B, 1}, opts_fp16);
                 auto ev_om = torch::zeros({B, 1}, opts_bool);
-                auto h_ev = backbone_->prefixIncremental(ev_ids, ev_pos, ev_ov, ev_om);
-                // Update saved_h for sequences that ended variation
-                auto mask_2d = ended_var.unsqueeze(1);  // [B, 1]
+                auto h_ev = backbone_->prefixIncremental(ev_ids, ev_pos,
+                                                         ev_ov, ev_om, ended_var);
+                // Blend: use h_ev for ended_var sequences, keep saved_h for others
+                auto mask_2d = ended_var.unsqueeze(1);
                 saved_h = torch::where(mask_2d, h_ev.squeeze(1), saved_h);
             }
         }
@@ -625,16 +651,15 @@ BatchedInferenceEngine::predictMoves(
             auto between_vars = active & ~in_variation;
             if (between_vars.any().item<bool>())
             {
-                // Causal incremental to check end_think vs new_variation
                 auto ev_tok = torch::zeros({B, 1}, opts_int);
                 for (int b = 0; b < B; b++)
                     ev_tok[b][0] = token_ids[b].back();
-                auto ev_pos2 = torch::full({B, 1}, cur_len, opts_int);
+                auto ev_pos2 = makePosT(-1);
                 auto ev_ov2 = torch::zeros({B, 1}, opts_fp16);
                 auto ev_om2 = torch::zeros({B, 1}, opts_bool);
 
-                auto h_ev2 = backbone_->causalIncremental(ev_tok, ev_pos2, ev_ov2, ev_om2);
-                cur_len++;
+                // Probe: get hidden WITHOUT touching causal cache
+                auto h_ev2 = backbone_->causalProbe(ev_tok, ev_pos2, ev_ov2, ev_om2);
 
                 auto h_dec2 = h_ev2.squeeze(1);
                 auto logits2 = torch::mm(h_dec2, board_w_t_) + board_b_;
@@ -642,6 +667,7 @@ BatchedInferenceEngine::predictMoves(
                 auto sub2_cpu = sub2.cpu();
                 auto sub2_a = sub2_cpu.accessor<int64_t, 1>();
 
+                std::vector<int> end_think_seqs;
                 for (int b = 0; b < B; b++)
                 {
                     if (!between_vars[b].item<bool>()) continue;
@@ -651,22 +677,35 @@ BatchedInferenceEngine::predictMoves(
                         token_ids[b].push_back(end_think_idx);
                         block_ids[b].push_back(orphan_ctr[b]++);
                         active[b] = false;
-
-                        // Prefix incremental for end_think
-                        auto et_ids = torch::full({B, 1}, end_think_idx, opts_int);
-                        auto et_pos = torch::full({B, 1}, cur_len - 1, opts_int);
-                        auto et_ov = torch::zeros({B, 1}, opts_fp16);
-                        auto et_om = torch::zeros({B, 1}, opts_bool);
-                        auto h_et = backbone_->prefixIncremental(et_ids, et_pos, et_ov, et_om);
-                        auto mask_et = (~active & between_vars).unsqueeze(1);  // [B, 1]
-                        saved_h = torch::where(mask_et, h_et.squeeze(1), saved_h);
-                        break;  // Only one prefix incremental per step
+                        seq_pos[b]++;
+                        end_think_seqs.push_back(b);
                     }
                     else
                     {
                         // New variation
                         in_variation[b] = true;
                     }
+                }
+
+                // Prefix incremental for end_think sequences
+                if (!end_think_seqs.empty())
+                {
+                    auto et_active = torch::zeros({B}, opts_bool);
+                    for (int b : end_think_seqs) et_active[b] = true;
+
+                    auto et_ids = torch::full({B, 1}, end_think_idx, opts_int);
+                    auto et_pos = torch::zeros({B, 1}, opts_int);
+                    for (int b : end_think_seqs)
+                        et_pos[b][0] = seq_pos[b] - 1;
+                    auto et_ov = torch::zeros({B, 1}, opts_fp16);
+                    auto et_om = torch::zeros({B, 1}, opts_bool);
+
+                    auto h_et = backbone_->prefixIncremental(et_ids, et_pos,
+                                                             et_ov, et_om, et_active);
+                    auto h_et1 = h_et.squeeze(1);
+
+                    for (int b : end_think_seqs)
+                        saved_h[b] = h_et1[b];
                 }
             }
         }
@@ -683,8 +722,8 @@ BatchedInferenceEngine::predictMoves(
     // Phase 3: FINAL — predict final moves
     // ================================================================
 
-    auto final_sub_idx = evalPolicyHead(saved_h, policy_temp, padded_fens);  // [B] move sub-vocab
-    auto final_full = move_lut.index({final_sub_idx});  // [B] full vocab
+    auto final_sub_idx = evalPolicyHead(saved_h, policy_temp, padded_fens);
+    auto final_full = move_lut.index({final_sub_idx});
     auto final_cpu = final_full.cpu();
     auto final_a = final_cpu.accessor<int64_t, 1>();
 
@@ -695,7 +734,6 @@ BatchedInferenceEngine::predictMoves(
         int tok = final_a[b];
         std::string move = vocab_->pseudoToStandardUci(vocab_->idxToToken(tok));
 
-        // If empty (sequence hit max_len without end_think), try fallback
         if (move.empty() && !first_root_move[b].empty())
             move = vocab_->pseudoToStandardUci(first_root_move[b]);
 
@@ -705,7 +743,6 @@ BatchedInferenceEngine::predictMoves(
         results[b].d_entries = std::move(d_entries[b]);
     }
 
-    // Truncate to actual batch size (discard padding)
     results.resize(B_actual);
 
     auto t1 = std::chrono::high_resolution_clock::now();
