@@ -1,8 +1,8 @@
 #include "inference.hpp"
-#include "mcts/adversarial_runner.hpp"
-#include "mcts/common.hpp"
-#include "mcts/single_inference.hpp"
-#include "mcts/summary.hpp"
+#include "adversarial_runner.hpp"
+#include "common.hpp"
+#include "single_inference.hpp"
+#include "summary.hpp"
 
 #include <algorithm>
 #include <array>

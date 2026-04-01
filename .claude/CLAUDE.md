@@ -16,7 +16,8 @@ src/rl/                      # GRPO reinforcement learning + config.yaml
 src/eval/                    # ELO evaluation against Stockfish
 src/export/                  # TorchScript export for C++ engine
 src/cpp/decoder/             # C++ inference engine (single + batched, pybind11)
-src/cpp/                     # MCTS/TensorRT engine (optional, needs TRT)
+src/cpp/mcts/                # MCTS/TensorRT engine (optional, needs TRT)
+src/cpp/chess-library/       # Shared C++ chess library (git submodule, header-only)
 scripts/                     # Evaluation, inference, data generation scripts
 tests/                       # Pytest suite (77 tests)
 markdowns/                   # Technical documentation (01-10)

@@ -222,7 +222,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/93/09/7d04d7581ae3bb8b5
 [[package]]
 name = "chessrl-inference-cpp"
 version = "0.1.0"
-source = { editable = "src/cpp" }
+source = { editable = "src/cpp/mcts" }
 dependencies = [
     { name = "pybind11" },
 ]
@@ -304,7 +304,7 @@ mcts = [
 [package.metadata]
 requires-dist = [
     { name = "bulletchess", specifier = ">=0.4.0" },
-    { name = "chessrl-inference-cpp", marker = "extra == 'mcts'", editable = "src/cpp" },
+    { name = "chessrl-inference-cpp", marker = "extra == 'mcts'", editable = "src/cpp/mcts" },
     { name = "decoder-inference-cpp", editable = "src/cpp/decoder" },
     { name = "numpy", specifier = ">=2.4.0" },
     { name = "pyarrow", specifier = ">=22.0.0" },

@@ -1,4 +1,4 @@
-#include "mcts/common.hpp"
+#include "common.hpp"
 
 #include <algorithm>
 #include <cctype>

@@ -6,7 +6,7 @@
 #include <memory>
 
 #include "chess-library/include/chess.hpp"
-#include "mcts/summary.hpp"
+#include "summary.hpp"
 
 namespace chessrl::mcts
 {

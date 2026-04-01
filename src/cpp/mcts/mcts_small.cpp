@@ -1,7 +1,7 @@
 #include "inference.hpp"
-#include "mcts/common.hpp"
-#include "mcts/small_runner.hpp"
-#include "mcts/single_inference.hpp"
+#include "common.hpp"
+#include "small_runner.hpp"
+#include "single_inference.hpp"
 
 #include <algorithm>
 #include <array>

@@ -1,8 +1,8 @@
 #include "inference.hpp"
-#include "mcts/common.hpp"
-#include "mcts/leela_runner.hpp"
-#include "mcts/single_inference.hpp"
-#include "mcts/summary.hpp"
+#include "common.hpp"
+#include "leela_runner.hpp"
+#include "single_inference.hpp"
+#include "summary.hpp"
 
 #include <algorithm>
 #include <array>

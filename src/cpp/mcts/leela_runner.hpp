@@ -3,8 +3,8 @@
 #include <string>
 #include <vector>
 
-#include "mcts/common.hpp"
-#include "mcts/summary.hpp"
+#include "common.hpp"
+#include "summary.hpp"
 
 namespace chessrl::mcts
 {

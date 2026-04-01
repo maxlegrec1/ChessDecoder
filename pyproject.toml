@@ -27,7 +27,7 @@ mcts = ["chessrl-inference-cpp"]
 no-build-isolation-package = ["decoder-inference-cpp"]
 
 [tool.uv.sources]
-chessrl-inference-cpp = { path = "src/cpp", editable = true }
+chessrl-inference-cpp = { path = "src/cpp/mcts", editable = true }
 decoder-inference-cpp = { path = "src/cpp/decoder", editable = true }
 
 [tool.pytest.ini_options]

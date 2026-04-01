@@ -1,4 +1,4 @@
-#include "mcts/single_inference.hpp"
+#include "single_inference.hpp"
 
 #include <NvInfer.h>
 #include <cuda_runtime_api.h>

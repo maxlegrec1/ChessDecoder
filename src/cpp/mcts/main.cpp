@@ -3,10 +3,10 @@
 #include <string_view>
 #include <vector>
 
-#include "mcts/adversarial_runner.hpp"
-#include "mcts/leela_runner.hpp"
-#include "mcts/small_runner.hpp"
-#include "mcts/summary.hpp"
+#include "adversarial_runner.hpp"
+#include "leela_runner.hpp"
+#include "small_runner.hpp"
+#include "summary.hpp"
 
 namespace
 {

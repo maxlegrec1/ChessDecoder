@@ -5,7 +5,7 @@
 #include <algorithm>
 
 #include "inference.hpp"
-#include "mcts/common.hpp"
+#include "common.hpp"
 
 using chessrl::mcts::MctsOptions;
 using chessrl::mcts::SearchInput;
