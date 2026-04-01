@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--simulations", type=int, default=100)
     p.add_argument("--cpuct", type=float, default=1.5)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--engine-path", default="model_dynamic_leela.trt")
+    p.add_argument("--engine-path", default="trt/model_dynamic_leela.trt")
     p.add_argument("--stockfish", default="stockfish", help="Path to stockfish binary (default: find on PATH).")
     p.add_argument("--stockfish-time", type=float, default=0.1, help="Stockfish think time (seconds).")
     p.add_argument("--stockfish-elo", type=int, default=2800, help="Stockfish Elo limit.")

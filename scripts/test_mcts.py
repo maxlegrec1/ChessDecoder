@@ -1,5 +1,5 @@
 from src.mcts import LeelaMCTS
-leela = LeelaMCTS(engine_path="leela_minibatch.trt", temperature=600, cpuct=1.0)
+leela = LeelaMCTS(engine_path="trt/leela_minibatch.trt", temperature=600, cpuct=1.0)
 from tqdm import tqdm
 
 # fen = "6k1/6p1/2p1r1q1/p2p4/1p4p1/1BP2bQ1/PP1B3R/6K1 w - - 6 36"

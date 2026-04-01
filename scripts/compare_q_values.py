@@ -22,7 +22,7 @@ from src.mcts import LeelaMCTS
 
 
 def main():
-    engine_path = "model_dynamic_leela.trt"
+    engine_path = "trt/model_dynamic_leela.trt"
 
     # Italian Game: 1.e4 e5 2.Nf3 Nc6 3.Bc4 Bc5 — rich position with multiple candidates
     origin_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"

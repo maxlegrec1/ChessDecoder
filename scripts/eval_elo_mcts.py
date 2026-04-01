@@ -37,7 +37,7 @@ class _MCTSModelBase:
 
     def __init__(
         self,
-        engine_path: str = "model_dynamic_leela.trt",
+        engine_path: str = "trt/model_dynamic_leela.trt",
         simulations: int = 600,
         cpuct: float = 1.5,
         max_variations: int = 50,
@@ -209,7 +209,7 @@ def parse_args():
     )
     parser.add_argument("--simulations", type=int, default=600)
     parser.add_argument("--cpuct", type=float, default=1.5)
-    parser.add_argument("--engine-path", type=str, default="model_dynamic_leela.trt")
+    parser.add_argument("--engine-path", type=str, default="trt/model_dynamic_leela.trt")
     parser.add_argument("--elo", type=int, default=1500, help="Stockfish ELO.")
     parser.add_argument("--num-games", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.0)

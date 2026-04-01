@@ -75,7 +75,7 @@ class _BaseMCTS:
 class LeelaMCTS(_BaseMCTS):
     def __init__(
         self,
-        engine_path: str = "leela_minibatch.trt",
+        engine_path: str = "trt/leela_minibatch.trt",
         *,
         simulations: int = 800,
         cpuct: float = 1.5,

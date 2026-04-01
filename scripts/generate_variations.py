@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engine-path",
         type=str,
-        default="model_dynamic_leela.trt",
+        default="trt/model_dynamic_leela.trt",
         help="TRT engine file path.",
     )
     parser.add_argument(

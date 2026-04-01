@@ -21,6 +21,9 @@ pgns/
 # Binaries
 /bin/
 
+# TensorRT engines
+/trt/
+
 # Compiled extensions
 *.so
 
@@ -30,8 +33,6 @@ pgns/
 # Model checkpoints (top-level)
 *.pt
 
-# TensorRT engines
-*.trt
 
 # ONNX models
 *.onnx
@@ -65,8 +66,3 @@ src/cpp/decoder/uv.lock
 
 # Verification cache
 scripts/.verify_cache/
-
-
-parquet_variations2/
-single_parquet/
-single_unseen_parquet/
