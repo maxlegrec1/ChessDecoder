@@ -50,7 +50,7 @@ class GRPOConfig:
     # --- Checkpointing ---
     finetuned_checkpoint: str = ""
     resume_from: str = ""
-    checkpoint_dir: str = "checkpoints_rl/"
+    checkpoint_dir: str = "checkpoints/"
     save_every: int = 50
     eval_every: int = 50
     log_every: int = 1

@@ -32,5 +32,5 @@ decoder-inference-cpp = { path = "src/cpp/decoder", editable = true }
 pythonpath = ["."]
 markers = [
     "gpu: requires CUDA GPU",
-    "cpp: requires C++ inference engine and exported model in export/",
+    "cpp: requires C++ inference engine and exported model in exports/",
 ]

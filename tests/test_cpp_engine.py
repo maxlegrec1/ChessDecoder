@@ -1,4 +1,4 @@
-"""C++ inference engine tests (requires exported model in export/ and GPU)."""
+"""C++ inference engine tests (requires exported model in exports/ and GPU)."""
 
 import chess
 import pytest

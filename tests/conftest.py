@@ -69,8 +69,8 @@ def tiny_model():
 def single_engine():
     cpp = pytest.importorskip("_decoder_inference_cpp")
     engine = cpp.ThinkingInferenceEngine(
-        "export/backbone.pt", "export/weights",
-        "export/vocab.json", "export/config.json",
+        "exports/backbone.pt", "exports/weights",
+        "exports/vocab.json", "exports/config.json",
     )
     return engine
 
@@ -79,8 +79,8 @@ def single_engine():
 def batched_engine():
     cpp = pytest.importorskip("_decoder_inference_cpp")
     engine = cpp.BatchedInferenceEngine(
-        "export/backbone.pt", "export/weights",
-        "export/vocab.json", "export/config.json",
+        "exports/backbone.pt", "exports/weights",
+        "exports/vocab.json", "exports/config.json",
         8,
     )
     return engine
