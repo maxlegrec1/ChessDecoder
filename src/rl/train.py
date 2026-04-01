@@ -333,15 +333,16 @@ def train():
                 mb_advantages = advantages_flat[mb_idx]
 
                 with torch.no_grad():
-                    mb_ref_lp = compute_ref_log_probs(ref_model, mb_batch, config.use_amp)
+                    mb_ref_lp, mb_move_mask = compute_ref_log_probs(ref_model, mb_batch, config.use_amp)
                 with torch.no_grad():
-                    mb_old_lp = compute_current_log_probs(model, mb_batch, config.use_amp).detach()
+                    mb_old_lp, _ = compute_current_log_probs(model, mb_batch, config.use_amp)
+                    mb_old_lp = mb_old_lp.detach()
 
-                mb_lp = compute_current_log_probs(model, mb_batch, config.use_amp)
+                mb_lp, _ = compute_current_log_probs(model, mb_batch, config.use_amp)
 
                 loss, info = grpo_loss(
-                    mb_lp, mb_old_lp, mb_ref_lp, mb_advantages,
-                    config.clip_epsilon, config.kl_coeff,
+                    mb_lp, mb_old_lp, mb_ref_lp, mb_move_mask,
+                    mb_advantages, config.clip_epsilon, config.kl_coeff,
                 )
 
                 scaled_loss = loss / config.grad_accum_steps

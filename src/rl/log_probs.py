@@ -3,6 +3,9 @@
 Only runs the prefix pass (not causal). Board tokens are deterministic
 (temperature=0) so their log-probs don't contribute to the policy ratio.
 Only move tokens (thinking_policy_head + policy_head) matter.
+
+Returns per-token log-probs so that GRPO can compute per-token ratios
+and KL penalties as in the original DeepSeek-Math formulation.
 """
 
 import torch
@@ -52,12 +55,12 @@ def _prefix_forward(
     return h
 
 
-def _gather_move_log_probs(
+def _gather_per_token_log_probs(
     model: ChessDecoder,
     h: torch.Tensor,
     batch: dict,
-) -> torch.Tensor:
-    """Extract per-sequence sum of log-probs at all move positions.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract per-token log-probs at all move positions.
 
     Args:
         model: the ChessDecoder (for head access).
@@ -65,39 +68,38 @@ def _gather_move_log_probs(
         batch: must contain thinking_move_mask, final_move_mask, move_token_ids.
 
     Returns:
-        seq_log_probs: [B] sum of log-probs for each sequence.
+        token_log_probs: [B, S] log-probs at move positions (0.0 elsewhere).
+        move_mask: [B, S] bool — True at positions with valid move log-probs.
     """
-    B = h.shape[0]
-    thinking_mask = batch["thinking_move_mask"]  # [B, S]
-    final_mask = batch["final_move_mask"]         # [B, S]
-    move_ids = batch["move_token_ids"]            # [B, S] move sub-vocab indices
+    B, S, _E = h.shape
+    thinking_mask = batch["thinking_move_mask"]   # [B, S]
+    final_mask = batch["final_move_mask"]          # [B, S]
+    move_ids = batch["move_token_ids"]             # [B, S] move sub-vocab indices
 
-    seq_log_probs = torch.zeros(B, device=h.device, dtype=h.dtype)
+    token_log_probs = torch.zeros(B, S, device=h.device, dtype=h.dtype)
+    move_mask = torch.zeros(B, S, device=h.device, dtype=torch.bool)
 
     # Thinking move positions → thinking_policy_head
     if thinking_mask.any():
-        think_h = h[thinking_mask]                                  # [N_think, E]
-        think_logits = model.thinking_policy_head(think_h)          # [N_think, 1924]
-        think_log_p = F.log_softmax(think_logits, dim=-1)           # [N_think, 1924]
-        think_targets = move_ids[thinking_mask]                     # [N_think]
+        think_h = h[thinking_mask]                                       # [N_think, E]
+        think_logits = model.thinking_policy_head(think_h)               # [N_think, 1924]
+        think_log_p = F.log_softmax(think_logits, dim=-1)               # [N_think, 1924]
+        think_targets = move_ids[thinking_mask]                          # [N_think]
         think_token_lp = think_log_p.gather(1, think_targets.unsqueeze(1)).squeeze(1)
-
-        # Sum per sequence: scatter-add back to batch dimension
-        batch_indices = thinking_mask.nonzero(as_tuple=True)[0]     # [N_think]
-        seq_log_probs.scatter_add_(0, batch_indices, think_token_lp)
+        token_log_probs[thinking_mask] = think_token_lp
+        move_mask[thinking_mask] = True
 
     # Final move positions → policy_head
     if final_mask.any():
-        final_h = h[final_mask]                                     # [N_final, E]
-        final_logits = model.policy_head(final_h)                   # [N_final, 1924]
-        final_log_p = F.log_softmax(final_logits, dim=-1)           # [N_final, 1924]
-        final_targets = move_ids[final_mask]                        # [N_final]
+        final_h = h[final_mask]                                          # [N_final, E]
+        final_logits = model.policy_head(final_h)                        # [N_final, 1924]
+        final_log_p = F.log_softmax(final_logits, dim=-1)               # [N_final, 1924]
+        final_targets = move_ids[final_mask]                             # [N_final]
         final_token_lp = final_log_p.gather(1, final_targets.unsqueeze(1)).squeeze(1)
+        token_log_probs[final_mask] = final_token_lp
+        move_mask[final_mask] = True
 
-        batch_indices = final_mask.nonzero(as_tuple=True)[0]        # [N_final]
-        seq_log_probs.scatter_add_(0, batch_indices, final_token_lp)
-
-    return seq_log_probs
+    return token_log_probs, move_mask
 
 
 @torch.no_grad()
@@ -105,28 +107,31 @@ def compute_ref_log_probs(
     ref_model: ChessDecoder,
     batch: dict,
     use_amp: bool = True,
-) -> torch.Tensor:
-    """Compute reference model log-probs (frozen, no gradients).
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute reference model per-token log-probs (frozen, no gradients).
 
     Returns:
-        [B] per-sequence log-prob under the reference policy.
+        token_log_probs: [B, S] per-token log-probs.
+        move_mask: [B, S] bool.
     """
     h = _prefix_forward(ref_model, batch, use_amp)
-    return _gather_move_log_probs(ref_model, h, batch).float()
+    lp, mask = _gather_per_token_log_probs(ref_model, h, batch)
+    return lp.float(), mask
 
 
 def compute_current_log_probs(
     model: ChessDecoder,
     batch: dict,
     use_amp: bool = True,
-) -> torch.Tensor:
-    """Compute current policy log-probs (with gradients).
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute current policy per-token log-probs (with gradients).
 
     Returns:
-        [B] per-sequence log-prob under the current policy.
+        token_log_probs: [B, S] per-token log-probs.
+        move_mask: [B, S] bool.
     """
     h = _prefix_forward(model, batch, use_amp)
-    return _gather_move_log_probs(model, h, batch)
+    return _gather_per_token_log_probs(model, h, batch)
 
 
 @torch.no_grad()
