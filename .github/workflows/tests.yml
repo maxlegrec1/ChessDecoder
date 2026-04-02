@@ -24,7 +24,9 @@ jobs:
         run: |
           uv venv
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-          uv pip install pyarrow python-chess pyyaml numpy pytest
+          uv pip install pyarrow python-chess pyyaml numpy pytest torchtune
 
       - name: Run tests (CPU-only, no GPU/C++ engine)
-        run: uv run pytest tests/ -m "not gpu and not cpp" -v
+        run: .venv/bin/pytest tests/ -m "not gpu and not cpp" -v
+        env:
+          PYTHONPATH: .
