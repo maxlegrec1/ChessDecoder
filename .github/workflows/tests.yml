@@ -22,8 +22,9 @@ jobs:
 
       - name: Install dependencies (no C++ extensions)
         run: |
-          uv sync --no-install-package decoder-inference-cpp \
-                   --no-install-package chessrl-inference-cpp
+          uv venv
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install pyarrow python-chess pyyaml numpy pytest
 
       - name: Run tests (CPU-only, no GPU/C++ engine)
         run: uv run pytest tests/ -m "not gpu and not cpp" -v
