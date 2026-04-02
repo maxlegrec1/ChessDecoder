@@ -258,8 +258,16 @@ def train():
     if is_main_process():
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── WandB ─────────────────────────────────────────────────────────────
+    # ── WandB (resume existing run if ID file exists) ──────────────────
     if is_main_process():
+        wandb_run_id = None
+        # On resume, look for wandb ID in the resumed checkpoint dir
+        if config.resume_from:
+            old_id_path = Path(config.resume_from) / "wandb_run_id.txt"
+            if old_id_path.exists():
+                wandb_run_id = old_id_path.read_text().strip()
+                print_rank0(f"Resuming wandb run: {wandb_run_id}")
+
         wandb.init(
             project=config.project_name,
             name=f"{config.run_name}_{run_timestamp}",
@@ -267,7 +275,7 @@ def train():
                 "grpo": {
                     "group_size": config.group_size,
                     "clip_epsilon_low": config.clip_epsilon_low,
-                "clip_epsilon_high": config.clip_epsilon_high,
+                    "clip_epsilon_high": config.clip_epsilon_high,
                     "kl_coeff": config.kl_coeff,
                     "ppo_epochs": config.ppo_epochs,
                     "max_kl": config.max_kl,
@@ -285,7 +293,19 @@ def train():
                 },
                 "model": config.model,
             },
+            id=wandb_run_id,
+            resume="must" if wandb_run_id else None,
         )
+
+        # Save wandb run ID for future resume
+        wandb_id_path = checkpoint_dir / "wandb_run_id.txt"
+        if not wandb_run_id:
+            wandb_id_path.write_text(wandb.run.id)
+            print_rank0(f"Saved wandb run ID to {wandb_id_path}")
+        else:
+            # Copy ID to new checkpoint dir so next resume finds it
+            wandb_id_path.write_text(wandb_run_id)
+
 
     metrics = GRPOMetrics()
 
