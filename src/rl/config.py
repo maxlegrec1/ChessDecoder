@@ -44,7 +44,7 @@ class GRPOConfig:
     # --- Data ---
     variation_parquet_dir: str = "./parquets_variations/"
     pretrain_parquet_dir: str = "/home/maxime/parquet_files_decoder/"
-    num_train_positions: int = 50000
+    # num_train_positions removed — PositionStream reads fresh data from files
     num_eval_positions: int = 200
     eval_seed: int = 42
 

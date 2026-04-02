@@ -21,7 +21,7 @@ grpo:
   max_kl: 0.05
 
 rollout:
-  rollout_batch_size: 640
+  rollout_batch_size: 320
   inference_batch_size: 64
   think_temperature: 1.5
   policy_temperature: 1.5
@@ -50,6 +50,5 @@ rewards:
 data:
   variation_parquet_dir: ./parquets_variations/
   pretrain_parquet_dir: /home/maxime/parquet_files_decoder/
-  num_train_positions: 50000
   num_eval_positions: 200
   eval_seed: 42

@@ -47,48 +47,64 @@ def _make_scheduler(optimizer, warmup_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def _load_position_pool(config: GRPOConfig) -> list[dict]:
-    """Load positions with ground truth for RL training.
+class PositionStream:
+    """Streams training positions from pretrain parquet files.
 
-    Uses pretrain data (Stockfish best_move) for a large, diverse pool
-    that the model hasn't been directly finetuned on.
-    Loads from multiple parquet files to reach the target count.
+    Each call to sample_batch() loads B positions from the current file.
+    When a file is exhausted, advances to the next one.  When all files
+    have been used, reshuffles and cycles back to the first file.
     """
-    import glob
-    import pandas as pd
-    from src.finetune.cpp_eval import (
-        _normalize_castling, _filter_standard_games, _sample_one_per_game,
-    )
 
-    files = sorted(glob.glob(os.path.join(config.pretrain_parquet_dir, "*.parquet")))
-    rng = random.Random(config.eval_seed)
-    rng.shuffle(files)
-    n = config.num_train_positions
+    def __init__(self, parquet_dir: str, seed: int):
+        import glob
+        self._files = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
+        if not self._files:
+            raise RuntimeError(f"No parquet files found in {parquet_dir}")
+        self._rng = random.Random(seed)
+        self._rng.shuffle(self._files)
+        self._file_idx = 0
+        self._buffer: list[dict] = []
+        self._positions_served = 0
+        print_rank0(f"PositionStream: {len(self._files)} parquet files from {parquet_dir}")
 
-    seen: set[str] = set()
-    pairs: list[dict] = []
-    for fname in files:
-        if len(pairs) >= n:
-            break
+    def _load_next_file(self):
+        """Load and shuffle positions from the next parquet file."""
+        import pandas as pd
+        from src.finetune.cpp_eval import (
+            _normalize_castling, _filter_standard_games, _sample_one_per_game,
+        )
+
+        if self._file_idx >= len(self._files):
+            # All files consumed — reshuffle and restart
+            self._rng.shuffle(self._files)
+            self._file_idx = 0
+            print_rank0("  PositionStream: cycled through all files, reshuffling")
+
+        fname = self._files[self._file_idx]
+        self._file_idx += 1
+
         df = pd.read_parquet(fname, columns=["fen", "best_move", "game_id", "ply"])
         df = _filter_standard_games(df)
-        sampled = _sample_one_per_game(df, config.eval_seed)
-        sampled = sampled.sample(frac=1, random_state=config.eval_seed).reset_index(drop=True)
-        for _, row in sampled.iterrows():
-            fen = row["fen"]
-            if fen not in seen:
-                seen.add(fen)
-                pairs.append({"fen": fen, "best_move": _normalize_castling(row["best_move"])})
-            if len(pairs) >= n:
-                break
+        sampled = _sample_one_per_game(df, self._rng.randint(0, 2**31))
+        sampled = sampled.sample(frac=1, random_state=self._rng.randint(0, 2**31)).reset_index(drop=True)
 
-    print_rank0(f"Loaded {len(pairs)} pretrain positions for RL training (from {len(files)} files)")
-    return pairs
+        self._buffer = [
+            {"fen": row["fen"], "best_move": _normalize_castling(row["best_move"])}
+            for _, row in sampled.iterrows()
+        ]
+        print_rank0(f"  PositionStream: loaded {len(self._buffer)} positions from {Path(fname).name}")
 
-
-def _sample_batch(pool: list[dict], batch_size: int, rng: random.Random) -> list[dict]:
-    """Sample a batch of positions from the pool."""
-    return rng.sample(pool, min(batch_size, len(pool)))
+    def sample_batch(self, batch_size: int) -> list[dict]:
+        """Return batch_size positions, loading new files as needed."""
+        result: list[dict] = []
+        while len(result) < batch_size:
+            if not self._buffer:
+                self._load_next_file()
+            take = min(batch_size - len(result), len(self._buffer))
+            result.extend(self._buffer[:take])
+            self._buffer = self._buffer[take:]
+        self._positions_served += len(result)
+        return result
 
 
 def _save_checkpoint(model, ref_model, optimizer, scaler, config, step, checkpoint_dir):
@@ -191,8 +207,7 @@ def train():
             print_rank0(f"WARNING: resume_from={config.resume_from} but no checkpoints found")
 
     # ── Data ──────────────────────────────────────────────────────────────
-    position_pool = _load_position_pool(config)
-    rng = random.Random(config.eval_seed)
+    position_stream = PositionStream(config.pretrain_parquet_dir, config.eval_seed)
 
     # Eval positions (fixed set for periodic C++ evaluation)
     eval_var_positions = load_variation_positions(
@@ -267,8 +282,8 @@ def train():
             step_start = time.time()
             metrics.reset()
 
-            # 1. Sample positions
-            batch_positions = _sample_batch(position_pool, config.rollout_batch_size, rng)
+            # 1. Sample positions from streaming parquet files
+            batch_positions = position_stream.sample_batch(config.rollout_batch_size)
             fens = [p["fen"] for p in batch_positions]
             B = len(fens)
 
