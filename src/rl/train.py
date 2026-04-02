@@ -106,12 +106,33 @@ class PositionStream:
         self._positions_served += len(result)
         return result
 
+    def state_dict(self) -> dict:
+        """Serializable state for checkpointing."""
+        return {
+            "file_idx": self._file_idx,
+            "rng_state": self._rng.getstate(),
+            "positions_served": self._positions_served,
+            "buffer_len": len(self._buffer),
+        }
 
-def _save_checkpoint(model, ref_model, optimizer, scaler, config, step, checkpoint_dir):
+    def load_state_dict(self, state: dict):
+        """Restore state from checkpoint.  Replays file loading to recover buffer."""
+        self._rng.setstate(state["rng_state"])
+        self._file_idx = state["file_idx"]
+        self._positions_served = state["positions_served"]
+        # Buffer is not saved (too large); replay the last file load to recover it.
+        # After resume the first sample_batch will load the current file fresh.
+        self._buffer = []
+        print_rank0(f"  PositionStream: restored at file {self._file_idx}/{len(self._files)}, "
+                    f"{self._positions_served} positions served")
+
+
+def _save_checkpoint(model, ref_model, optimizer, scaler, config, step,
+                     checkpoint_dir, position_stream=None):
     """Save a training checkpoint."""
     path = Path(checkpoint_dir) / f"checkpoint_rl_step_{step}.pt"
     raw_model = model.module if hasattr(model, "module") else model
-    torch.save({
+    state = {
         "step": step,
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -125,7 +146,10 @@ def _save_checkpoint(model, ref_model, optimizer, scaler, config, step, checkpoi
                 "kl_coeff": config.kl_coeff,
             },
         },
-    }, path)
+    }
+    if position_stream is not None:
+        state["position_stream"] = position_stream.state_dict()
+    torch.save(state, path)
     print_rank0(f"  Saved checkpoint: {path}")
 
 
@@ -182,6 +206,7 @@ def train():
 
     # ── Resume from RL checkpoint ─────────────────────────────────────────
     start_step = 0
+    _resume_stream_state = None
     if config.resume_from:
         rl_ckpts = sorted(
             [f for f in os.listdir(config.resume_from)
@@ -196,6 +221,7 @@ def train():
             optimizer.load_state_dict(rl_checkpoint["optimizer_state_dict"])
             scaler.load_state_dict(rl_checkpoint["scaler_state_dict"])
             start_step = rl_checkpoint["step"]
+            _resume_stream_state = rl_checkpoint.get("position_stream")
             # Advance scheduler to match
             for _ in range(start_step):
                 scheduler.step()
@@ -208,6 +234,8 @@ def train():
 
     # ── Data ──────────────────────────────────────────────────────────────
     position_stream = PositionStream(config.pretrain_parquet_dir, config.eval_seed)
+    if _resume_stream_state is not None:
+        position_stream.load_state_dict(_resume_stream_state)
 
     # Eval positions (fixed set for periodic C++ evaluation)
     eval_var_positions = load_variation_positions(
@@ -433,7 +461,7 @@ def train():
 
             # ── Checkpoint ────────────────────────────────────────────────
             if is_main_process() and outer_step % config.save_every == 0:
-                _save_checkpoint(model, ref_model, optimizer, scaler, config, outer_step, checkpoint_dir)
+                _save_checkpoint(model, ref_model, optimizer, scaler, config, outer_step, checkpoint_dir, position_stream)
 
             # ── C++ evaluation ────────────────────────────────────────────
             if is_main_process() and outer_step % config.eval_every == 0:
@@ -455,7 +483,7 @@ def train():
     except KeyboardInterrupt:
         print_rank0("\nInterrupted. Saving checkpoint ...")
         if is_main_process():
-            _save_checkpoint(model, ref_model, optimizer, scaler, config, outer_step, checkpoint_dir)
+            _save_checkpoint(model, ref_model, optimizer, scaler, config, outer_step, checkpoint_dir, position_stream)
 
     finally:
         shutil.rmtree(export_dir, ignore_errors=True)
