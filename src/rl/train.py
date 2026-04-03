@@ -95,14 +95,14 @@ class PositionStream:
         print_rank0(f"  PositionStream: loaded {len(self._buffer)} positions from {Path(fname).name}")
 
     def sample_batch(self, batch_size: int) -> list[dict]:
-        """Return batch_size positions, loading new files as needed."""
-        result: list[dict] = []
-        while len(result) < batch_size:
-            if not self._buffer:
-                self._load_next_file()
-            take = min(batch_size - len(result), len(self._buffer))
-            result.extend(self._buffer[:take])
-            self._buffer = self._buffer[take:]
+        """Load a fresh parquet file and return batch_size positions from it.
+
+        Every call loads a new file for maximum data diversity.
+        Remaining positions in the file are discarded.
+        """
+        self._load_next_file()
+        result = self._buffer[:batch_size]
+        self._buffer = []  # discard remainder — next call loads a new file
         self._positions_served += len(result)
         return result
 
