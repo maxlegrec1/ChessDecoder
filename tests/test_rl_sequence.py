@@ -82,19 +82,21 @@ def test_parse_rollout_thinking_move():
     token_ids, wl, d = _make_rollout()
     result = parse_rollout(token_ids, wl, d, 256)
 
-    # e2e4 at position 69 should be marked as thinking move
-    assert result["thinking_move_mask"][69].item() is True
-    # Its move_token_id should be valid
-    assert 0 <= result["move_token_ids"][69].item() < move_vocab_size
+    # e2e4 at position 69 — mask should be at prediction position 68 (start_think)
+    assert result["thinking_move_mask"][68].item() is True
+    assert result["thinking_move_mask"][69].item() is False
+    # move_token_id at prediction position should be valid
+    assert 0 <= result["move_token_ids"][68].item() < move_vocab_size
 
 
 def test_parse_rollout_final_move():
     token_ids, wl, d = _make_rollout()
     result = parse_rollout(token_ids, wl, d, 256)
 
-    # d2d4 at position 142 should be marked as final move
-    assert result["final_move_mask"][142].item() is True
-    assert 0 <= result["move_token_ids"][142].item() < move_vocab_size
+    # d2d4 at position 142 — mask should be at prediction position 141 (end_think)
+    assert result["final_move_mask"][141].item() is True
+    assert result["final_move_mask"][142].item() is False
+    assert 0 <= result["move_token_ids"][141].item() < move_vocab_size
 
 
 def test_parse_rollout_wl_d_positions():

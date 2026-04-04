@@ -394,7 +394,30 @@ def train():
             print_rank0(f"  Diverse groups: {n_diverse}/{B} "
                         f"({n_diverse * G} sequences for training)")
 
-            # 8. Single-pass GRPO update
+            # 8. Cache rollout log-probs BEFORE any updates so importance-
+            #    sampling ratios reflect actual policy drift during training.
+            # TODO: get old_lp directly from the C++ inference engine during
+            #       rollout generation to avoid this extra forward pass.
+            model.eval()
+            print_rank0(f"  Caching old & ref log-probs ({N} sequences) ...")
+            t_cache = time.time()
+            old_lp_chunks, ref_lp_chunks, mask_chunks = [], [], []
+            for cb_start in range(0, N, config.mini_batch_size):
+                cb_end = min(cb_start + config.mini_batch_size, N)
+                cb_batch = {k: v[cb_start:cb_end] for k, v in all_batch.items()
+                            if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N}
+                olp, omask = compute_ref_log_probs(model, cb_batch, config.use_amp)
+                rlp, _ = compute_ref_log_probs(ref_model, cb_batch, config.use_amp)
+                old_lp_chunks.append(olp)
+                ref_lp_chunks.append(rlp)
+                mask_chunks.append(omask)
+            all_old_lp = torch.cat(old_lp_chunks)      # [N, S]
+            all_ref_lp = torch.cat(ref_lp_chunks)      # [N, S]
+            all_move_mask = torch.cat(mask_chunks)      # [N, S]
+            del old_lp_chunks, ref_lp_chunks, mask_chunks
+            print_rank0(f"  Cached log-probs in {time.time() - t_cache:.1f}s")
+
+            # 9. Single-pass GRPO update
             model.train()
             inner_step_count = 0
             perm = torch.randperm(N, device=device)
@@ -409,11 +432,9 @@ def train():
                 # Mini-batch advantage normalization
                 mb_advantages = normalize_advantages_minibatch(advantages_flat[mb_idx])
 
-                with torch.no_grad():
-                    mb_ref_lp, mb_move_mask = compute_ref_log_probs(ref_model, mb_batch, config.use_amp)
-                with torch.no_grad():
-                    mb_old_lp, _ = compute_current_log_probs(model, mb_batch, config.use_amp)
-                    mb_old_lp = mb_old_lp.detach()
+                mb_old_lp = all_old_lp[mb_idx]
+                mb_ref_lp = all_ref_lp[mb_idx]
+                mb_move_mask = all_move_mask[mb_idx]
 
                 mb_lp, _ = compute_current_log_probs(model, mb_batch, config.use_amp)
 

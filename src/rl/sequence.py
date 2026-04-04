@@ -90,12 +90,12 @@ def parse_rollout(
         if tok == _END_THINK:
             in_thinking = False
             found_end_think = True
-            # Next move token after end_think is the final move
+            # Final move is predicted from end_think position (i)
             j = i + 1
             while j < seq_len:
                 if _is_move_token(token_ids[j]):
-                    final_move_mask[j] = True
-                    move_token_ids[j] = full_idx_to_move_idx[token_ids[j]]
+                    final_move_mask[i] = True
+                    move_token_ids[i] = full_idx_to_move_idx[token_ids[j]]
                     break
                 j += 1
             i += 1
@@ -105,10 +105,10 @@ def parse_rollout(
             i += 1
             continue
 
-        # Move token inside thinking region
+        # Move token inside thinking region — mark the prediction position (i-1)
         if in_thinking and _is_move_token(tok):
-            thinking_move_mask[i] = True
-            move_token_ids[i] = full_idx_to_move_idx[tok]
+            thinking_move_mask[i - 1] = True
+            move_token_ids[i - 1] = full_idx_to_move_idx[tok]
             i += 1
             continue
 
