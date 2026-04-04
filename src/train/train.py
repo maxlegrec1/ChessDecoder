@@ -1,5 +1,4 @@
 import os
-import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,47 +7,14 @@ import wandb
 from datetime import datetime
 from tqdm import tqdm
 from src.models.model import ChessDecoder
-from src.models.vocab import (vocab_size, token_to_idx, board_vocab_size, move_vocab_size,
-                              board_idx_to_full_idx, move_idx_to_full_idx)
+from src.models.vocab import vocab_size, token_to_idx, board_vocab_size, move_vocab_size
 from src.dataloader.loader import get_dataloader
 from src.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
     average_gradients, barrier, print_rank0,
 )
-
-
-def load_config(config_path):
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
-
-
-def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
-    """Soft CE loss: distribute target probability across two nearest buckets via linear interpolation."""
-    N = target_values.shape[0]
-    n_buckets = bucket_centers.shape[0]
-
-    if N == 0 or valid_mask.sum() == 0:
-        # Return zero without requires_grad to avoid memory leak from retaining computation graph
-        return torch.tensor(0.0, device=logits.device)
-
-    # Find lower bucket: last bucket where center <= target
-    diffs = target_values.unsqueeze(-1) - bucket_centers  # (N, B)
-    lower_idx = (diffs >= 0).long().sum(dim=-1) - 1        # (N,)
-    lower_idx = lower_idx.clamp(0, n_buckets - 2)
-    upper_idx = lower_idx + 1
-
-    lower_centers = bucket_centers[lower_idx]
-    upper_centers = bucket_centers[upper_idx]
-    span = (upper_centers - lower_centers).clamp(min=1e-8)
-    upper_weight = (target_values - lower_centers) / span
-    upper_weight = upper_weight.clamp(0.0, 1.0)
-
-    soft_labels = torch.zeros(N, n_buckets, device=logits.device)
-    soft_labels.scatter_(1, lower_idx.unsqueeze(1), (1 - upper_weight).unsqueeze(1))
-    soft_labels.scatter_(1, upper_idx.unsqueeze(1), upper_weight.unsqueeze(1))
-
-    loss = -(soft_labels * F.log_softmax(logits, dim=-1)).sum(dim=-1)  # (N,)
-    return (loss * valid_mask.float()).sum() / (valid_mask.sum() + 1e-8)
+from src.utils.training import load_config, soft_bucket_loss, prepare_fourier_inputs
+from src.utils.checkpoint import migrate_state_dict
 
 
 def train():
@@ -120,55 +86,7 @@ def train():
         print_rank0(f"Resuming from checkpoint: {latest_checkpoint}")
         checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
 
-        state_dict = checkpoint["model_state_dict"]
-        def migrate_state_dict(state_dict):
-            """Migrate old checkpoint: sub-vocab heads, expand embedding, clone thinking_policy_head."""
-            # Expand tok_embedding if needed
-            if "tok_embedding.weight" in state_dict:
-                t = state_dict["tok_embedding.weight"]
-                if t.shape[0] < vocab_size:
-                    pad = torch.zeros(vocab_size - t.shape[0], *t.shape[1:], dtype=t.dtype, device=t.device)
-                    state_dict["tok_embedding.weight"] = torch.cat([t, pad], dim=0)
-
-            # board_head: extract rows for board sub-vocab from old full-vocab weights
-            if "board_head.weight" in state_dict:
-                old_w = state_dict["board_head.weight"]
-                old_b = state_dict["board_head.bias"]
-                if old_w.shape[0] > board_vocab_size:
-                    old_vocab_sz = old_w.shape[0]
-                    new_w = torch.zeros(board_vocab_size, old_w.shape[1], dtype=old_w.dtype, device=old_w.device)
-                    new_b = torch.zeros(board_vocab_size, dtype=old_b.dtype, device=old_b.device)
-                    for i, full_idx in enumerate(board_idx_to_full_idx):
-                        if full_idx < old_vocab_sz:
-                            new_w[i] = old_w[full_idx]
-                            new_b[i] = old_b[full_idx]
-                    state_dict["board_head.weight"] = new_w
-                    state_dict["board_head.bias"] = new_b
-
-            # policy_head / thinking_policy_head: extract rows for move sub-vocab
-            for head in ["policy_head", "thinking_policy_head"]:
-                if f"{head}.weight" not in state_dict:
-                    continue
-                old_w = state_dict[f"{head}.weight"]
-                old_b = state_dict[f"{head}.bias"]
-                if old_w.shape[0] > move_vocab_size:
-                    old_vocab_sz = old_w.shape[0]
-                    new_w = torch.zeros(move_vocab_size, old_w.shape[1], dtype=old_w.dtype, device=old_w.device)
-                    new_b = torch.zeros(move_vocab_size, dtype=old_b.dtype, device=old_b.device)
-                    for i, full_idx in enumerate(move_idx_to_full_idx):
-                        if full_idx < old_vocab_sz:
-                            new_w[i] = old_w[full_idx]
-                            new_b[i] = old_b[full_idx]
-                    state_dict[f"{head}.weight"] = new_w
-                    state_dict[f"{head}.bias"] = new_b
-
-            # Clone policy_head -> thinking_policy_head (if not already present)
-            if "thinking_policy_head.weight" not in state_dict and "policy_head.weight" in state_dict:
-                state_dict["thinking_policy_head.weight"] = state_dict["policy_head.weight"].clone()
-                state_dict["thinking_policy_head.bias"] = state_dict["policy_head.bias"].clone()
-
-            return state_dict
-        state_dict = migrate_state_dict(state_dict)
+        state_dict = migrate_state_dict(checkpoint["model_state_dict"])
         # # Checkpoint compatibility: rename old policy_head -> board_head
         # if "policy_head.weight" in state_dict and "board_head.weight" not in state_dict:
         #     state_dict["board_head.weight"] = state_dict.pop("policy_head.weight")
@@ -299,18 +217,9 @@ def train():
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 # === Prepare Fourier inputs (shared by both passes) ===
-                wl_fourier_input = torch.zeros_like(wl_targets)
-                d_fourier_input = torch.zeros_like(d_targets)
-
-                if wl_positions.any():
-                    wl_vals_at_pos = wl_targets[wl_positions]
-                    wl_disc = model.discretize_to_bucket(wl_vals_at_pos, model.wl_bucket_centers)
-                    wl_fourier_input[wl_positions] = wl_disc
-
-                if d_positions.any():
-                    d_vals_at_pos = d_targets[d_positions]
-                    d_disc = model.discretize_to_bucket(d_vals_at_pos, model.d_bucket_centers)
-                    d_fourier_input[d_positions] = d_disc
+                wl_fourier_input, d_fourier_input = prepare_fourier_inputs(
+                    model, wl_targets, d_targets, wl_positions, d_positions
+                )
 
                 # === Pass 1: Causal masking for board generation ===
                 h_causal = model(
