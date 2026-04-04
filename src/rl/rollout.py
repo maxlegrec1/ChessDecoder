@@ -23,8 +23,7 @@ class RolloutResult:
     num_tokens: int
 
 
-def _run_rollouts_subprocess(export_dir: str, fens_json_path: str, config_json_path: str,
-                              results_path: str):
+def _run_rollouts_subprocess(export_dir: str, fens_json_path: str, results_path: str):
     """Subprocess entry point: create engine, run rollouts, save results to disk."""
     import json
     import _decoder_inference_cpp as cpp
@@ -112,12 +111,14 @@ def generate_rollouts(
     # Run in subprocess with expandable_segments to avoid CUDA fragmentation.
     # Inherits CUDA_VISIBLE_DEVICES from parent so subprocess uses the same GPU.
     env = os.environ.copy()
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # PYTORCH_ALLOC_CONF is the new name (PyTorch 2.5+); keep the old one for
+    # backwards compat with older torch builds. Setting both avoids the
+    # "PYTORCH_CUDA_ALLOC_CONF is deprecated" warning on newer versions.
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     proc = subprocess.run(
-        [sys.executable, "-c",
-         f"import sys; sys.path.insert(0, '.'); "
-         f"from src.rl.rollout import _run_rollouts_subprocess; "
-         f"_run_rollouts_subprocess('{export_dir}', '{fens_path}', '', '{results_path}')"],
+        [sys.executable, "-m", "src.rl.rollout",
+         str(export_dir), str(fens_path), str(results_path)],
         capture_output=False,
         timeout=1800,
         env=env,
@@ -170,6 +171,7 @@ def export_model(model: torch.nn.Module, config: dict, export_dir: str | Path):
         config: full config dict (must have "model" key).
         export_dir: directory to write backbone.pt, weights/, vocab.json, config.json.
     """
+    import json
     import subprocess
     import sys
     import tempfile
@@ -188,40 +190,69 @@ def export_model(model: torch.nn.Module, config: dict, export_dir: str | Path):
     export_config(config, raw_model, export_dir)
     export_head_weights(raw_model, export_dir / "weights")
 
-    # Save model state to temp file for subprocess
+    # Save model state + config to temp files for subprocess
     tmp_ckpt = Path(tempfile.mktemp(suffix=".pt"))
+    tmp_cfg = Path(tempfile.mktemp(suffix=".json"))
     torch.save(raw_model.state_dict(), tmp_ckpt)
+    with open(tmp_cfg, "w") as f:
+        json.dump({"config": config, "vocab_size": raw_model.tok_embedding.num_embeddings}, f)
 
     if was_training:
         raw_model.train()
 
     # Run TorchScript tracing in subprocess (isolates libtorch GPU memory)
     proc = subprocess.run(
-        [sys.executable, "-c", f"""
-import torch, sys
-sys.path.insert(0, '.')
-from src.models.model import ChessDecoder
-from src.models.vocab import vocab_size
-from src.export.backbone_causal import from_chess_decoder
-from src.export.export_torchscript import export_torchscript
-from pathlib import Path
-
-mc = {repr(config['model'])}
-model = ChessDecoder(vocab_size={raw_model.tok_embedding.num_embeddings},
-    embed_dim=mc['embed_dim'], num_heads=mc['num_heads'], num_layers=mc['num_layers'],
-    max_seq_len=mc['max_seq_len'], d_ff=mc.get('d_ff'),
-    n_buckets=mc.get('n_buckets', 100), value_hidden_size=mc.get('value_hidden_size', 256),
-    num_fourier_freq=mc.get('num_fourier_freq', 128), wl_sigma=mc.get('wl_sigma', 0.4))
-model.load_state_dict(torch.load('{tmp_ckpt}', map_location='cpu', weights_only=True))
-backbone = from_chess_decoder(model)
-del model
-config = {repr(config)}
-export_torchscript(backbone, Path('{export_dir}'), config)
-"""],
+        [sys.executable, "-m", "src.rl.rollout", "--export",
+         str(tmp_ckpt), str(tmp_cfg), str(export_dir)],
         capture_output=False,
         timeout=120,
     )
     tmp_ckpt.unlink(missing_ok=True)
+    tmp_cfg.unlink(missing_ok=True)
 
     if proc.returncode != 0:
         raise RuntimeError(f"TorchScript export subprocess failed with code {proc.returncode}")
+
+
+def _run_export_subprocess(ckpt_path: str, cfg_path: str, export_dir: str):
+    """Subprocess entry point: load checkpoint, trace to TorchScript, save."""
+    import json
+
+    from src.models.model import ChessDecoder
+    from src.export.backbone_causal import from_chess_decoder
+    from src.export.export_torchscript import export_torchscript
+
+    with open(cfg_path) as f:
+        payload = json.load(f)
+    config = payload["config"]
+    vocab_size = payload["vocab_size"]
+    mc = config["model"]
+
+    model = ChessDecoder(
+        vocab_size=vocab_size,
+        embed_dim=mc["embed_dim"],
+        num_heads=mc["num_heads"],
+        num_layers=mc["num_layers"],
+        max_seq_len=mc["max_seq_len"],
+        d_ff=mc.get("d_ff"),
+        n_buckets=mc.get("n_buckets", 100),
+        value_hidden_size=mc.get("value_hidden_size", 256),
+        num_fourier_freq=mc.get("num_fourier_freq", 128),
+        wl_sigma=mc.get("wl_sigma", 0.4),
+    )
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    backbone = from_chess_decoder(model)
+    del model
+    export_torchscript(backbone, Path(export_dir), config)
+
+
+if __name__ == "__main__":
+    import sys
+
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--export":
+        # python -m src.rl.rollout --export <ckpt> <cfg> <export_dir>
+        _run_export_subprocess(argv[1], argv[2], argv[3])
+    else:
+        # python -m src.rl.rollout <export_dir> <fens_json> <results_json>
+        _run_rollouts_subprocess(argv[0], argv[1], argv[2])
