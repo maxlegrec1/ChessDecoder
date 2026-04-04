@@ -32,14 +32,19 @@ from src.utils.distributed import (
     average_gradients, barrier, print_rank0,
 )
 from src.utils.training import load_config, soft_bucket_loss, prepare_fourier_inputs
-from src.utils.checkpoint import migrate_state_dict
 
 
 def load_pretrained_checkpoint(model, checkpoint_path, device):
-    """Load pretrained checkpoint, migrating vocab size and cloning thinking_policy_head."""
+    """Load pretrained checkpoint and clone policy_head -> thinking_policy_head.
+
+    Pretraining does not train thinking_policy_head, so at the start of
+    finetuning we initialize it from the (trained) policy_head.
+    """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = migrate_state_dict(checkpoint["model_state_dict"])
-    model.load_state_dict(state_dict, strict=False)
+    state_dict = checkpoint["model_state_dict"]
+    state_dict["thinking_policy_head.weight"] = state_dict["policy_head.weight"].clone()
+    state_dict["thinking_policy_head.bias"] = state_dict["policy_head.bias"].clone()
+    model.load_state_dict(state_dict)
     return checkpoint
 
 
