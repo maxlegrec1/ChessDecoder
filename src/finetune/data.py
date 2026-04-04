@@ -28,7 +28,6 @@ Move prediction positions:
 
 import json
 import random
-import chess
 import numpy as np
 import pandas as pd
 from src.dataloader.data import fen_to_position_tokens

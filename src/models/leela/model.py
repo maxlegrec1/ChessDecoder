@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .attn_map import apm_map, apm_out
-import math
 from .encoding_simple import encode_fen_to_tensor, encode_moves_to_tensor
 from .vocab import policy_index
 from typing import Union, List, Optional

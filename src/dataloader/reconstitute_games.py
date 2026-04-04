@@ -4,8 +4,6 @@ import numpy as np
 import chess
 import sys
 import tarfile
-import io
-import json
 import time
 import os
 from multiprocessing import Pool, cpu_count

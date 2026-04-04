@@ -11,7 +11,6 @@ import glob
 import os
 import random
 
-import numpy as np
 import pandas as pd
 
 from src.finetune.data import variation_to_token_ids, _gumbel_reorder, _to_model_uci
