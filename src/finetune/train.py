@@ -31,7 +31,9 @@ from src.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
     average_gradients, barrier, print_rank0,
 )
-from src.utils.training import load_config, soft_bucket_loss, prepare_fourier_inputs
+from src.utils.training import (
+    load_config, soft_bucket_loss, prepare_fourier_inputs, save_training_checkpoint,
+)
 
 
 def load_pretrained_checkpoint(model, checkpoint_path, device):
@@ -538,18 +540,11 @@ def train():
 
             # Save checkpoint every N steps
             if save_every_n_steps and step % save_every_n_steps == 0 and is_main_process():
-                ckpt = {
-                    "epoch": epoch,
-                    "step": step,
-                    "epoch_step": epoch_step,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scaler_state_dict": scaler.state_dict(),
-                    "config": config,
-                }
-                checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_step_{step}.pt")
-                torch.save(ckpt, checkpoint_path)
-                print(f"Saved checkpoint to {checkpoint_path}")
+                save_training_checkpoint(
+                    os.path.join(run_checkpoint_dir, f"checkpoint_step_{step}.pt"),
+                    model=model, optimizer=optimizer, scaler=scaler, step=step,
+                    extra_state={"epoch": epoch, "epoch_step": epoch_step, "config": config},
+                )
 
                 # C++ selfplay evaluation (inline on rank 0)
                 if cpp_eval_n > 0 and cpp_var_eval_positions:
@@ -567,18 +562,11 @@ def train():
 
         # Save checkpoint at end of epoch (epoch_step=0 so next epoch starts fresh)
         if is_main_process():
-            ckpt = {
-                "epoch": epoch + 1,
-                "step": step,
-                "epoch_step": 0,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "config": config,
-            }
-            checkpoint_path = os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt")
-            torch.save(ckpt, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
+            save_training_checkpoint(
+                os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt"),
+                model=model, optimizer=optimizer, scaler=scaler, step=step,
+                extra_state={"epoch": epoch + 1, "epoch_step": 0, "config": config},
+            )
         barrier()
 
     cleanup_distributed()
