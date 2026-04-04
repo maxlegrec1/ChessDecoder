@@ -87,6 +87,9 @@ def train():
 
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # Always honor the current config LR, even when resuming
+        for pg in optimizer.param_groups:
+            pg["lr"] = config["training"]["learning_rate"]
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_epoch = checkpoint["epoch"]
         step = checkpoint["step"]
