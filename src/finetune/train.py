@@ -32,22 +32,9 @@ from src.utils.distributed import (
     average_gradients, barrier, print_rank0,
 )
 from src.utils.training import (
-    load_config, soft_bucket_loss, prepare_fourier_inputs, save_training_checkpoint,
+    load_config, soft_bucket_loss, prepare_fourier_inputs,
+    save_training_checkpoint, load_pretrained_checkpoint, init_wandb_with_resume,
 )
-
-
-def load_pretrained_checkpoint(model, checkpoint_path, device):
-    """Load pretrained checkpoint and clone policy_head -> thinking_policy_head.
-
-    Pretraining does not train thinking_policy_head, so at the start of
-    finetuning we initialize it from the (trained) policy_head.
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint["model_state_dict"]
-    state_dict["thinking_policy_head.weight"] = state_dict["policy_head.weight"].clone()
-    state_dict["thinking_policy_head.bias"] = state_dict["policy_head.bias"].clone()
-    model.load_state_dict(state_dict)
-    return checkpoint
 
 
 
@@ -78,7 +65,7 @@ def train():
 
     # Load pretrained checkpoint
     pretrain_checkpoint = config["training"]["pretrain_checkpoint"]
-    checkpoint = load_pretrained_checkpoint(model, pretrain_checkpoint, device)
+    load_pretrained_checkpoint(model, pretrain_checkpoint, device)
     print_rank0(f"Loaded pretrained checkpoint from {pretrain_checkpoint}")
 
     # Check if resuming from a finetune checkpoint
@@ -192,24 +179,12 @@ def train():
 
     # Initialize wandb (resume existing run if ID file exists in checkpoint dir)
     if is_main_process():
-        wandb_id_path = os.path.join(run_checkpoint_dir, "wandb_run_id.txt")
-        wandb_run_id = None
-        if os.path.exists(wandb_id_path):
-            wandb_run_id = open(wandb_id_path).read().strip()
-            print(f"Resuming wandb run: {wandb_run_id}")
-
-        wandb.init(
+        init_wandb_with_resume(
             project=config["project_name"],
-            name=config["run_name"],
+            run_name=config["run_name"],
             config=config,
-            id=wandb_run_id,
-            resume="must" if wandb_run_id else None,
+            checkpoint_dir=run_checkpoint_dir,
         )
-
-        if not wandb_run_id:
-            with open(wandb_id_path, "w") as f:
-                f.write(wandb.run.id)
-            print(f"Saved wandb run ID to {wandb_id_path}")
 
     model.train()
 

@@ -209,5 +209,5 @@ if __name__ == "__main__":
     model1.load_state_dict(torch.load('src/models/small/model.pt'),strict=False)
     # model1.load_state_dict(torch.load('checkpoints/step_00001000.pt',weights_only=False)["model"])
     
-    score = main_model_vs_stockfish(model=model2,model1_name="run",device="cuda",num_games=20,temp=1, elo=2500)
+    score = main_model_vs_stockfish(model=model1,model1_name="run",device="cuda",num_games=20,temp=1, elo=2500)
     print(score)

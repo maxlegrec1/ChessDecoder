@@ -7,14 +7,15 @@ import wandb
 from datetime import datetime
 from tqdm import tqdm
 from src.models.model import ChessDecoder
-from src.models.vocab import vocab_size, token_to_idx, board_vocab_size, move_vocab_size
+from src.models.vocab import vocab_size, board_vocab_size, move_vocab_size
 from src.dataloader.loader import get_dataloader
 from src.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
     average_gradients, barrier, print_rank0,
 )
 from src.utils.training import (
-    load_config, soft_bucket_loss, prepare_fourier_inputs, save_training_checkpoint,
+    load_config, soft_bucket_loss, prepare_fourier_inputs,
+    save_training_checkpoint, init_wandb_with_resume,
 )
 
 
@@ -114,24 +115,12 @@ def train():
 
     # Initialize wandb (resume existing run if ID file exists in checkpoint dir)
     if is_main_process():
-        wandb_id_path = os.path.join(run_checkpoint_dir, "wandb_run_id.txt")
-        wandb_run_id = None
-        if os.path.exists(wandb_id_path):
-            wandb_run_id = open(wandb_id_path).read().strip()
-            print(f"Resuming wandb run: {wandb_run_id}")
-
-        wandb.init(
+        init_wandb_with_resume(
             project=config["project_name"],
-            name=config["run_name"],
+            run_name=config["run_name"],
             config=config,
-            id=wandb_run_id,
-            resume="must" if wandb_run_id else None,
+            checkpoint_dir=run_checkpoint_dir,
         )
-
-        if not wandb_run_id:
-            with open(wandb_id_path, "w") as f:
-                f.write(wandb.run.id)
-            print(f"Saved wandb run ID to {wandb_id_path}")
 
     model.train()
 

@@ -1,13 +1,12 @@
 import torch
 from torch.utils.data import IterableDataset, DataLoader
 import pandas as pd
-import numpy as np
 import glob
 import os
 import math
 import random
 from src.dataloader.data import fen_to_position_tokens
-from src.models.vocab import token_to_idx, policy_index, policy_to_idx
+from src.models.vocab import token_to_idx, policy_to_idx
 
 
 class ChessEncoderDataset(IterableDataset):

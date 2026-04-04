@@ -6,7 +6,10 @@ Behavior is intentionally preserved byte-for-byte — this file only centralizes
 the definitions.
 """
 
+import os
+
 import yaml
+import wandb
 import torch
 import torch.nn.functional as F
 
@@ -92,3 +95,46 @@ def save_training_checkpoint(path, *, model, optimizer, scaler, step, extra_stat
         state.update(extra_state)
     torch.save(state, path)
     print_rank0(f"Saved checkpoint: {path}")
+
+
+def load_pretrained_checkpoint(model, checkpoint_path, device):
+    """Load pretrained weights into ``model`` and clone policy_head → thinking_policy_head.
+
+    Pretraining does not train ``thinking_policy_head``, so at the start of
+    finetuning (and RL, which starts from a finetuned checkpoint) we
+    initialize it from the trained ``policy_head``.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint["model_state_dict"]
+    state_dict["thinking_policy_head.weight"] = state_dict["policy_head.weight"].clone()
+    state_dict["thinking_policy_head.bias"] = state_dict["policy_head.bias"].clone()
+    model.load_state_dict(state_dict)
+
+
+def init_wandb_with_resume(*, project, run_name, config, checkpoint_dir):
+    """Initialize a wandb run, resuming via ``wandb_run_id.txt`` if present.
+
+    On a fresh run, starts a new wandb run and persists its ID to
+    ``<checkpoint_dir>/wandb_run_id.txt`` so a future resume picks it up.
+    On resume, reads the ID and starts wandb with ``resume="must"``.
+
+    Caller is responsible for gating on ``is_main_process()``.
+    """
+    wandb_id_path = os.path.join(checkpoint_dir, "wandb_run_id.txt")
+    wandb_run_id = None
+    if os.path.exists(wandb_id_path):
+        wandb_run_id = open(wandb_id_path).read().strip()
+        print_rank0(f"Resuming wandb run: {wandb_run_id}")
+
+    wandb.init(
+        project=project,
+        name=run_name,
+        config=config,
+        id=wandb_run_id,
+        resume="must" if wandb_run_id else None,
+    )
+
+    if not wandb_run_id:
+        with open(wandb_id_path, "w") as f:
+            f.write(wandb.run.id)
+        print_rank0(f"Saved wandb run ID to {wandb_id_path}")

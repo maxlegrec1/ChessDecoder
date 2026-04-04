@@ -19,8 +19,7 @@ import wandb
 
 from src.models.model import ChessDecoder
 from src.models.vocab import vocab_size
-from src.finetune.train import load_pretrained_checkpoint
-from src.utils.training import save_training_checkpoint
+from src.utils.training import load_pretrained_checkpoint, save_training_checkpoint
 from src.finetune.cpp_eval import (
     load_variation_positions,
     load_pretrain_positions,
@@ -32,7 +31,7 @@ from src.utils.distributed import (
 )
 
 from src.rl.config import GRPOConfig
-from src.rl.rollout import generate_rollouts, RolloutResult, export_model
+from src.rl.rollout import generate_rollouts, export_model
 from src.rl.sequence import parse_rollout, collate_rollouts
 from src.rl.log_probs import compute_ref_log_probs, compute_current_log_probs, compute_policy_entropy
 from src.rl.rewards import CompositeReward

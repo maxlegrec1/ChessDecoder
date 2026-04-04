@@ -6,7 +6,7 @@ from torchtune.modules import TransformerSelfAttentionLayer, MultiHeadAttention,
 from src.dataloader.data import fen_to_position_tokens
 from src.models.vocab import (token_to_idx, idx_to_token,
                               board_vocab_size, move_vocab_size,
-                              board_idx_to_full_idx, move_idx_to_full_idx)
+                              move_idx_to_full_idx)
 
 
 def make_wl_buckets(n_buckets=100, sigma=0.4):

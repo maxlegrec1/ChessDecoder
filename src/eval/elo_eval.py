@@ -1,4 +1,3 @@
-import torch
 import chess
 from chess import engine, pgn
 import bulletchess
