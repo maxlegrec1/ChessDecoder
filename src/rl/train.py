@@ -20,6 +20,7 @@ import wandb
 from src.models.model import ChessDecoder
 from src.models.vocab import vocab_size
 from src.finetune.train import load_pretrained_checkpoint
+from src.utils.training import save_training_checkpoint
 from src.finetune.cpp_eval import (
     load_variation_positions,
     load_pretrain_positions,
@@ -127,16 +128,9 @@ class PositionStream:
                     f"{self._positions_served} positions served")
 
 
-def _save_checkpoint(model, ref_model, optimizer, scaler, config, step,
-                     checkpoint_dir, position_stream=None):
-    """Save a training checkpoint."""
-    path = Path(checkpoint_dir) / f"checkpoint_rl_step_{step}.pt"
-    raw_model = model.module if hasattr(model, "module") else model
-    state = {
-        "step": step,
-        "model_state_dict": raw_model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
+def _rl_extra_state(config, position_stream):
+    """Build the RL-specific extra_state for save_training_checkpoint."""
+    return {
         "config": {
             "model": config.model,
             "grpo": {
@@ -146,11 +140,8 @@ def _save_checkpoint(model, ref_model, optimizer, scaler, config, step,
                 "kl_coeff": config.kl_coeff,
             },
         },
+        "position_stream": position_stream.state_dict(),
     }
-    if position_stream is not None:
-        state["position_stream"] = position_stream.state_dict()
-    torch.save(state, path)
-    print_rank0(f"  Saved checkpoint: {path}")
 
 
 def train():
@@ -502,7 +493,11 @@ def train():
 
             # ── Checkpoint ────────────────────────────────────────────────
             if is_main_process() and outer_step % config.save_every == 0:
-                _save_checkpoint(model, ref_model, optimizer, scaler, config, outer_step, checkpoint_dir, position_stream)
+                save_training_checkpoint(
+                    Path(checkpoint_dir) / f"checkpoint_rl_step_{outer_step}.pt",
+                    model=model, optimizer=optimizer, scaler=scaler, step=outer_step,
+                    extra_state=_rl_extra_state(config, position_stream),
+                )
 
             # ── C++ evaluation ────────────────────────────────────────────
             if is_main_process() and outer_step % config.eval_every == 0:
@@ -524,7 +519,11 @@ def train():
     except KeyboardInterrupt:
         print_rank0("\nInterrupted. Saving checkpoint ...")
         if is_main_process():
-            _save_checkpoint(model, ref_model, optimizer, scaler, config, outer_step, checkpoint_dir, position_stream)
+            save_training_checkpoint(
+                Path(checkpoint_dir) / f"checkpoint_rl_step_{outer_step}.pt",
+                model=model, optimizer=optimizer, scaler=scaler, step=outer_step,
+                extra_state=_rl_extra_state(config, position_stream),
+            )
 
     finally:
         shutil.rmtree(export_dir, ignore_errors=True)

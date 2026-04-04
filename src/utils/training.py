@@ -10,6 +10,8 @@ import yaml
 import torch
 import torch.nn.functional as F
 
+from src.utils.distributed import print_rank0
+
 
 def load_config(config_path):
     with open(config_path, 'r') as f:
@@ -65,3 +67,28 @@ def prepare_fourier_inputs(model, wl_targets, d_targets, wl_positions, d_positio
         d_fourier_input[d_positions] = d_disc
 
     return wl_fourier_input, d_fourier_input
+
+
+def save_training_checkpoint(path, *, model, optimizer, scaler, step, extra_state=None):
+    """Save a training checkpoint to ``path``.
+
+    Shared by pretrain, finetune, and RL. The core dict is always
+    ``{step, model_state_dict, optimizer_state_dict, scaler_state_dict}``;
+    any caller-supplied ``extra_state`` is merged on top (e.g. ``epoch`` +
+    ``epoch_step`` + ``config`` for pretrain/finetune, ``position_stream`` +
+    partial ``config`` for RL).
+
+    The model is unwrapped via ``.module`` if present, so DDP-wrapped models
+    are handled transparently.
+    """
+    raw_model = model.module if hasattr(model, "module") else model
+    state = {
+        "step": step,
+        "model_state_dict": raw_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+    }
+    if extra_state:
+        state.update(extra_state)
+    torch.save(state, path)
+    print_rank0(f"Saved checkpoint: {path}")
