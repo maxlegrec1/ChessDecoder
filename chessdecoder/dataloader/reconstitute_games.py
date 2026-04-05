@@ -105,7 +105,10 @@ def mirror_move_uci(move_uci):
 
 def process_record(record):
     data = struct.unpack(V6_STRUCT_STRING, record)
+    # NOTE: currently unused. Kept as a reminder to investigate whether
+    # the raw policy distribution should be carried through to training.
     probs_raw = data[2]
+    _ = probs_raw
     planes_raw = data[3]
     us_ooo, us_oo, them_ooo, them_oo = data[4:8]
     stm_field = data[8]
@@ -128,6 +131,9 @@ def process_record(record):
     
     is_black = (stm_field == 1)
     
+    # NOTE: q_multiplier is computed but not currently applied to q_values.
+    # Investigate whether black-side q values need sign-flipping to match
+    # the rest of the pipeline's white-relative convention.
     if is_black:
         board = chess.Board(mirrored_fen)
         real_board = board.mirror()
@@ -140,6 +146,7 @@ def process_record(record):
         real_played_move = mirrored_played_move
         real_best_move = mirrored_best_move
         q_multiplier = 1
+    _ = q_multiplier
         
     row = {
         "fen": real_fen,

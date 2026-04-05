@@ -71,7 +71,6 @@ def parse_rollout(
     block_boundaries: list[tuple[int, int]] = []
     i = 0
     in_thinking = False
-    found_end_think = False
 
     while i < seq_len:
         tok = token_ids[i]
@@ -89,7 +88,6 @@ def parse_rollout(
 
         if tok == _END_THINK:
             in_thinking = False
-            found_end_think = True
             # Final move is predicted from end_think position (i)
             j = i + 1
             while j < seq_len:

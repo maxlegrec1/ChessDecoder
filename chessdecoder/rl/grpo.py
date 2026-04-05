@@ -64,7 +64,6 @@ def grpo_loss(
     clip_epsilon_low: float,
     clip_epsilon_high: float,
     kl_coeff: float,
-    group_size: int,
 ) -> tuple[torch.Tensor, dict]:
     """GRPO per-token clipped policy loss with improvements.
 
@@ -78,14 +77,11 @@ def grpo_loss(
         clip_epsilon_low:    Lower clipping bound (standard ε).
         clip_epsilon_high:   Upper clipping bound (≥ ε_low, allows more exploration).
         kl_coeff:            KL penalty weight (beta).
-        group_size:          G — number of sequences per group (for loss normalization).
 
     Returns:
         loss: scalar (to be minimized).
         info: dict with diagnostic metrics.
     """
-    N = token_log_probs.shape[0]
-
     # Per-token importance sampling ratio (current vs old policy)
     ratio = torch.exp(token_log_probs - old_token_log_probs)  # [N, S]
 

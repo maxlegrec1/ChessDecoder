@@ -401,7 +401,6 @@ def train():
             inner_step_count = 0
             perm = torch.randperm(N, device=device)
 
-            kl_exceeded = False
             for mb_start in range(0, N, config.mini_batch_size):
                 mb_end = min(mb_start + config.mini_batch_size, N)
                 mb_idx = perm[mb_start:mb_end]
@@ -420,7 +419,7 @@ def train():
                 loss, info = grpo_loss(
                     mb_lp, mb_old_lp, mb_ref_lp, mb_move_mask,
                     mb_advantages, config.clip_epsilon_low,
-                    config.clip_epsilon_high, config.kl_coeff, G,
+                    config.clip_epsilon_high, config.kl_coeff,
                 )
 
                 scaled_loss = loss / config.grad_accum_steps
@@ -440,7 +439,6 @@ def train():
 
                 if info["kl"] > config.max_kl:
                     print_rank0(f"  Early stop: KL={info['kl']:.4f} > {config.max_kl}")
-                    kl_exceeded = True
                     break
 
             # Flush remaining gradients
