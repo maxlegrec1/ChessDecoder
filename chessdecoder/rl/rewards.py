@@ -3,7 +3,7 @@
 from typing import Callable
 
 from chessdecoder.models.vocab import token_to_idx, idx_to_token, move_vocab_size, POSITION_TOKEN_LENGTH
-from chessdecoder.finetune.cpp_eval import _normalize_castling
+from chessdecoder.utils.uci import normalize_castling
 
 
 _START_THINK = token_to_idx["start_think"]
@@ -33,8 +33,8 @@ def move_quality_reward(
     +1.0 if final_move == best_move
      0.0 otherwise
     """
-    move = _normalize_castling(final_move)
-    best = _normalize_castling(ground_truth["best_move"])
+    move = normalize_castling(final_move)
+    best = normalize_castling(ground_truth["best_move"])
     return 1.0 if move == best else 0.0
 
 
@@ -110,7 +110,7 @@ def coherence_reward(
     while i < et_pos:
         tok = token_ids[i]
         if _is_move_token(tok):
-            root_moves.add(_normalize_castling(idx_to_token[tok]))
+            root_moves.add(normalize_castling(idx_to_token[tok]))
             # Skip to end of this variation (next end_var)
             i += 1
             while i < et_pos and token_ids[i] != _END_VAR:
@@ -119,7 +119,7 @@ def coherence_reward(
         else:
             i += 1
 
-    return 1.0 if _normalize_castling(final_move) in root_moves else 0.0
+    return 1.0 if normalize_castling(final_move) in root_moves else 0.0
 
 
 # ---------------------------------------------------------------------------

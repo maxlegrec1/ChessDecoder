@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import wandb
 
-from chessdecoder.finetune.cpp_eval import _normalize_castling
+from chessdecoder.utils.uci import normalize_castling
 
 
 @dataclass
@@ -64,18 +64,18 @@ class GRPOMetrics:
         for fen_idx, (group, rewards_group, gt) in enumerate(
             zip(grouped_rollouts, grouped_rewards, ground_truths)
         ):
-            best_move = _normalize_castling(gt["best_move"])
+            best_move = normalize_castling(gt["best_move"])
 
             # acc@k: any of G completions matches best_move
             any_correct = False
             for rollout in group:
-                if _normalize_castling(rollout.final_move) == best_move:
+                if normalize_castling(rollout.final_move) == best_move:
                     any_correct = True
                     break
             self._rollout.acc_at_k.append(any_correct)
 
             # acc@1: first completion matches (proxy for greedy)
-            first_correct = _normalize_castling(group[0].final_move) == best_move
+            first_correct = normalize_castling(group[0].final_move) == best_move
             self._rollout.acc_at_1.append(first_correct)
 
             for sample_idx, (rollout, (total_r, components)) in enumerate(

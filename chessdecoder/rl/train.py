@@ -20,11 +20,11 @@ import wandb
 from chessdecoder.models.model import ChessDecoder
 from chessdecoder.models.vocab import vocab_size
 from chessdecoder.utils.training import load_pretrained_checkpoint, save_training_checkpoint
-from chessdecoder.finetune.cpp_eval import (
+from chessdecoder.dataloader.sampling import (
     load_variation_positions,
     load_pretrain_positions,
-    evaluate as evaluate_cpp_selfplay,
 )
+from chessdecoder.finetune.cpp_eval import evaluate as evaluate_cpp_selfplay
 from chessdecoder.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
     average_gradients, barrier, print_rank0,
@@ -70,9 +70,10 @@ class PositionStream:
     def _load_next_file(self):
         """Load and shuffle positions from the next parquet file."""
         import pandas as pd
-        from chessdecoder.finetune.cpp_eval import (
-            _normalize_castling, _filter_standard_games, _sample_one_per_game,
+        from chessdecoder.dataloader.sampling import (
+            filter_standard_games, sample_one_per_game,
         )
+        from chessdecoder.utils.uci import normalize_castling
 
         if self._file_idx >= len(self._files):
             # All files consumed — reshuffle and restart
@@ -84,12 +85,12 @@ class PositionStream:
         self._file_idx += 1
 
         df = pd.read_parquet(fname, columns=["fen", "best_move", "game_id", "ply"])
-        df = _filter_standard_games(df)
-        sampled = _sample_one_per_game(df, self._rng.randint(0, 2**31))
+        df = filter_standard_games(df)
+        sampled = sample_one_per_game(df, self._rng.randint(0, 2**31))
         sampled = sampled.sample(frac=1, random_state=self._rng.randint(0, 2**31)).reset_index(drop=True)
 
         self._buffer = [
-            {"fen": row["fen"], "best_move": _normalize_castling(row["best_move"])}
+            {"fen": row["fen"], "best_move": normalize_castling(row["best_move"])}
             for _, row in sampled.iterrows()
         ]
         print_rank0(f"  PositionStream: loaded {len(self._buffer)} positions from {Path(fname).name}")

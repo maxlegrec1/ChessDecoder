@@ -8,7 +8,7 @@ import time
 
 import _decoder_inference_cpp as cpp
 
-from chessdecoder.finetune.cpp_eval import load_pretrain_positions
+from chessdecoder.dataloader.sampling import load_pretrain_positions
 
 
 def main():
