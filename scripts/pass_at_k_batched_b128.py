@@ -4,31 +4,11 @@ Generates k rollouts per FEN by batching them together.
 """
 
 import argparse
-import os
-import random
 import time
 
-import pyarrow.parquet as pq
 import _decoder_inference_cpp as cpp
 
-
-def load_fen_bestmove_pairs(n, seed, data_dir):
-    files = sorted(f for f in os.listdir(data_dir) if f.endswith(".parquet"))
-    rng = random.Random(seed)
-    fname = rng.choice(files)
-    table = pq.read_table(os.path.join(data_dir, fname), columns=["fen", "best_move"])
-    total = len(table)
-    indices = rng.sample(range(total), min(n * 3, total))
-    seen = set()
-    pairs = []
-    for i in indices:
-        fen = table.column("fen")[i].as_py()
-        if fen not in seen:
-            seen.add(fen)
-            pairs.append((fen, table.column("best_move")[i].as_py()))
-        if len(pairs) >= n:
-            break
-    return pairs[:n]
+from chessdecoder.finetune.cpp_eval import load_pretrain_positions
 
 
 def main():
@@ -59,36 +39,45 @@ def main():
     engine.wl_temperature = 0.0
     engine.d_temperature = 0.0
 
-    pairs = load_fen_bestmove_pairs(args.num_fens, args.seed, args.data_dir)
+    records = load_pretrain_positions(args.data_dir, args.num_fens, args.seed)
+    pairs = [(r["fen"], r["best_move"]) for r in records]
     N = len(pairs)
     print(f"Loaded {N} FEN/best_move pairs")
     print(f"Batch size: {B}, k={K}, temps: think={args.think_temp} policy={args.policy_temp}")
 
     correct = 0
     total_tokens = 0
+    processed = 0
     t0 = time.time()
 
-    for idx, (fen, best_move) in enumerate(pairs):
-        # Generate K rollouts for this FEN by batching K copies
-        # Process in chunks of B if K > B
-        moves = set()
-        remaining = K
-        while remaining > 0:
-            chunk = min(remaining, B)
-            batch_fens = [fen] * chunk
-            results = engine.predict_moves(batch_fens, args.think_temp)
-            for r in results[:chunk]:
+    # Pack multiple FENs per batch: each FEN is replicated K times, and we fit
+    # floor(B / K) distinct FENs per call. With K=1 this uses the whole batch
+    # for distinct FENs; with K=2 B=32 we get 16 FENs × 2 copies, etc.
+    if K > B:
+        raise ValueError(f"K={K} must be <= batch_size={B}")
+    fens_per_batch = B // K
+
+    for start in range(0, N, fens_per_batch):
+        chunk_pairs = pairs[start:start + fens_per_batch]
+        batch_fens = []
+        for fen, _ in chunk_pairs:
+            batch_fens.extend([fen] * K)
+
+        results = engine.predict_moves(batch_fens, args.think_temp)
+
+        for i, (fen, best_move) in enumerate(chunk_pairs):
+            moves = set()
+            for j in range(K):
+                r = results[i * K + j]
                 moves.add(r.move)
                 total_tokens += len(r.token_ids)
-            remaining -= chunk
+            if best_move in moves:
+                correct += 1
+            processed += 1
 
-        if best_move in moves:
-            correct += 1
-
-        if (idx + 1) % 10 == 0:
-            elapsed = time.time() - t0
-            print(f"  [{idx+1}/{N}] pass@{K}={correct}/{idx+1} "
-                  f"({correct/(idx+1):.1%}), {total_tokens/elapsed:.0f} tok/s")
+        elapsed = time.time() - t0
+        print(f"  [{processed}/{N}] pass@{K}={correct}/{processed} "
+              f"({correct/processed:.1%}), {total_tokens/elapsed:.0f} tok/s")
 
     elapsed = time.time() - t0
     print(f"\npass@{K}: {correct}/{N} = {correct/N:.1%}")
