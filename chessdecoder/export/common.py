@@ -5,7 +5,6 @@ Used by export_torchscript.py.
 """
 
 import json
-from pathlib import Path
 
 import numpy as np
 import torch
