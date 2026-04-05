@@ -7,14 +7,6 @@ from tests.conftest import SAMPLE_FENS
 
 pytestmark = pytest.mark.cpp
 
-# Castling normalization: C++ engine returns standard, vocab uses pseudo
-_STANDARD_TO_PSEUDO = {"e1g1": "e1h1", "e1c1": "e1a1", "e8g8": "e8h8", "e8c8": "e8a8"}
-_PSEUDO_TO_STANDARD = {v: k for k, v in _STANDARD_TO_PSEUDO.items()}
-
-
-def _to_standard(move: str) -> str:
-    return _PSEUDO_TO_STANDARD.get(move, move)
-
 
 # ---------------------------------------------------------------------------
 # Single engine tests

@@ -21,9 +21,7 @@ import chess
 
 from chessdecoder.mcts import LeelaMCTS
 from chessdecoder.eval.elo_eval import model_vs_stockfish
-
-# Pseudo-castling (model vocab) -> standard UCI
-_PSEUDO_TO_STANDARD = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
+from chessdecoder.utils.uci import normalize_castling
 
 
 class _MCTSModelBase:
@@ -123,7 +121,7 @@ class _MCTSModelBase:
         if move is None:
             return None
         # Convert pseudo-castling to standard UCI if needed
-        move = _PSEUDO_TO_STANDARD.get(move, move)
+        move = normalize_castling(move)
         # Track our own move
         if self._board is not None:
             try:
@@ -144,7 +142,7 @@ class MCTSRawNNModel(_MCTSModelBase):
         # Build raw NN Q for each candidate from the first variation node
         best_move, best_q = None, -float("inf")
         for var in result.get("variations", []):
-            move = _PSEUDO_TO_STANDARD.get(var["root_move"], var["root_move"])
+            move = normalize_castling(var["root_move"])
             if move not in legal_ucis:
                 continue
             nodes = var.get("nodes", [])
@@ -161,7 +159,7 @@ class MCTSRawNNModel(_MCTSModelBase):
         if best_move is None:
             action = result.get("action")
             if action:
-                best_move = _PSEUDO_TO_STANDARD.get(action, action)
+                best_move = normalize_castling(action)
 
         return best_move
 
@@ -176,7 +174,7 @@ class MCTSSearchQModel(_MCTSModelBase):
         q_values = result.get("q_values", {})
         best_move, best_q = None, -float("inf")
         for move, q in q_values.items():
-            move_std = _PSEUDO_TO_STANDARD.get(move, move)
+            move_std = normalize_castling(move)
             if move_std not in legal_ucis:
                 continue
             if q > best_q:
@@ -187,7 +185,7 @@ class MCTSSearchQModel(_MCTSModelBase):
         if best_move is None:
             action = result.get("action")
             if action:
-                best_move = _PSEUDO_TO_STANDARD.get(action, action)
+                best_move = normalize_castling(action)
 
         return best_move
 

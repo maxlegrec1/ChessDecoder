@@ -30,7 +30,7 @@ EXPORT_DIR = "exports/base"
 CHECKPOINT = "checkpoints/finetune-thinking-v1_20260320_205453/checkpoint_step_282000.pt"
 DATA_DIR = os.environ.get("PRETRAIN_PARQUET_DIR", "/home/maxime/parquet_files_decoder/")
 NUM_FENS = 30
-SEED = 42
+SEED = 123
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,8 @@ def python_engine():
     if not os.path.isfile(CHECKPOINT):
         pytest.skip(f"Checkpoint not found: {CHECKPOINT}")
 
-    from chessdecoder.inference.think import load_model, to_standard_uci, sample_token
+    from chessdecoder.inference.think import load_model, sample_token
+    from chessdecoder.utils.uci import normalize_castling
     from chessdecoder.models.vocab import (
         token_to_idx, idx_to_token, board_idx_to_full_idx,
         move_idx_to_full_idx, board_token_to_idx, move_token_to_idx,
@@ -105,13 +106,6 @@ def python_engine():
 
             _BOARD_END_VAR_IDX = board_token_to_idx["end_var"]
             _BOARD_END_THINK_IDX = board_token_to_idx["end_think"]
-            _PSEUDO_TO_STANDARD = {
-                "e1h1": "e1g1", "e1a1": "e1c1",
-                "e8h8": "e8g8", "e8a8": "e8c8",
-            }
-
-            def _to_std(m):
-                return _PSEUDO_TO_STANDARD.get(m, m)
 
             def orphan():
                 orphan_ctr[0] += 1
@@ -212,7 +206,7 @@ def python_engine():
                     tok = idx_to_token[full_idx]
                     append(full_idx, orphan())
                     if first_root_move is None:
-                        first_root_move = _to_std(tok)
+                        first_root_move = normalize_castling(tok)
                     state = "WL_D"
                 elif state == "WL_D":
                     if full(): break
@@ -254,7 +248,7 @@ def python_engine():
                     self.last_token_ids = list(token_ids)
                     self.last_wl_entries = list(wl_entries)
                     self.last_d_entries = list(d_entries)
-                    return _to_std(tok)
+                    return normalize_castling(tok)
 
             # Fallback
             self.last_token_ids = list(token_ids)

@@ -13,7 +13,8 @@ import random
 
 import pandas as pd
 
-from chessdecoder.finetune.data import variation_to_token_ids, _gumbel_reorder, _to_model_uci
+from chessdecoder.finetune.data import variation_to_token_ids, _gumbel_reorder
+from chessdecoder.utils.uci import to_model_uci
 
 
 def dump_sample(row, sample_idx, max_variations=3, max_depth=5, tau_base=0.3, tau_alpha=1.0):
@@ -52,7 +53,7 @@ def dump_sample(row, sample_idx, max_variations=3, max_depth=5, tau_base=0.3, ta
         variation_to_token_ids(row, max_variations=max_variations, max_depth=max_depth,
                                tau_base=tau_base, tau_alpha=tau_alpha)
 
-    final_move_model = _to_model_uci(mcts_action)
+    final_move_model = to_model_uci(mcts_action)
 
     print(f"=== Sample {sample_idx} ===")
     print(f"FEN: {fen}")

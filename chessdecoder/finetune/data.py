@@ -32,14 +32,7 @@ import numpy as np
 import pandas as pd
 from chessdecoder.dataloader.data import fen_to_position_tokens
 from chessdecoder.models.vocab import token_to_idx
-
-# Standard UCI -> pseudo-castling (model vocabulary uses king-captures-rook)
-_STANDARD_TO_PSEUDO_CASTLING = {
-    "e1g1": "e1h1",
-    "e1c1": "e1a1",
-    "e8g8": "e8h8",
-    "e8c8": "e8a8",
-}
+from chessdecoder.utils.uci import to_model_uci
 
 
 def _gumbel_reorder(variations, tau_base, tau_alpha, root_wdl):
@@ -54,11 +47,6 @@ def _gumbel_reorder(variations, tau_base, tau_alpha, root_wdl):
     order = np.argsort(-perceived)
     ranking = tuple(int(i) + 1 for i in order)
     return [variations[i] for i in order], ranking
-
-
-def _to_model_uci(move_uci: str) -> str:
-    """Convert standard UCI castling to pseudo-castling used by model vocab."""
-    return _STANDARD_TO_PSEUDO_CASTLING.get(move_uci, move_uci)
 
 
 def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau_alpha=1.0):
@@ -138,7 +126,7 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
         nodes = all_nodes[:sampled_depth]
 
         # Root move token - predicted from previous token (start_think or end_var)
-        root_move_model = _to_model_uci(root_move)
+        root_move_model = to_model_uci(root_move)
         if root_move_model not in token_to_idx:
             continue
 
@@ -175,7 +163,7 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
             node_move = node.get("move")
             if node_move and node_idx < len(nodes) - 1:
                 # This move leads to the next node
-                pv_move_model = _to_model_uci(node_move)
+                pv_move_model = to_model_uci(node_move)
                 if pv_move_model in token_to_idx:
                     predict_from_pos = len(sequence) - 1  # stm token of board
                     thinking_move_data.append((predict_from_pos, pv_move_model))
@@ -198,11 +186,11 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
     max_var_end_think_position = (end_think_seq_pos - 1) if at_max_variations else None
 
     # 5. Final move (predicted from end_think via policy_head)
-    final_move_model = _to_model_uci(mcts_action)
+    final_move_model = to_model_uci(mcts_action)
     if final_move_model not in token_to_idx:
         # Fallback: use played_move or best_move
         played = row.get("played_move", row.get("best_move", ""))
-        final_move_model = _to_model_uci(played) if played else None
+        final_move_model = to_model_uci(played) if played else None
 
     end_think_pos = len(sequence) - 1
     final_move_data = (end_think_pos, final_move_model) if final_move_model and final_move_model in token_to_idx else None
@@ -217,7 +205,7 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
     value_data.append((wl_pos, d_pos, final_wl, final_d, is_valid_wdl))
 
     # Compute first_is_not_best
-    first_var_root_move = _to_model_uci(variations[0]["root_move"]) if variations else None
+    first_var_root_move = to_model_uci(variations[0]["root_move"]) if variations else None
     first_is_not_best = (
         first_var_root_move is not None
         and final_move_model is not None

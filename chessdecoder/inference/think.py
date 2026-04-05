@@ -14,8 +14,7 @@ from chessdecoder.models.vocab import (vocab_size, token_to_idx, idx_to_token,
                               board_idx_to_full_idx, move_idx_to_full_idx,
                               board_token_to_idx)
 from chessdecoder.dataloader.data import fen_to_position_tokens
-
-_PSEUDO_TO_STANDARD = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
+from chessdecoder.utils.uci import normalize_castling
 
 _PIECE_SYMBOLS = {
     "white_king": "K", "white_queen": "Q", "white_rook": "R",
@@ -31,10 +30,6 @@ for _t in idx_to_token.values():
         _MOVE_TOKENS.add(_t)
     elif len(_t) == 5 and _t[0] in "abcdefgh" and _t[1] in "12345678" and _t[2] in "abcdefgh" and _t[3] in "12345678" and _t[4] in "qrbn":
         _MOVE_TOKENS.add(_t)
-
-
-def to_standard_uci(model_uci):
-    return _PSEUDO_TO_STANDARD.get(model_uci, model_uci)
 
 
 def sample_token(logits, temperature):
@@ -270,9 +265,9 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
                 prev_tok = idx_to_token[token_ids[-2]] if len(token_ids) >= 2 else ""
                 if prev_tok in ("start_think", "end_var"):
                     var_idx += 1
-                    print(f"  variation {var_idx} root_move: {to_standard_uci(tok)}")
+                    print(f"  variation {var_idx} root_move: {normalize_castling(tok)}")
                 else:
-                    print(f"    pv_move: {to_standard_uci(tok)}")
+                    print(f"    pv_move: {normalize_castling(tok)}")
             else:
                 print(f"  unexpected token from thinking_policy_head: {tok}")
             state = "WL_D"
@@ -334,7 +329,7 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
             idx = sample_move(model.policy_head, pos)
             tok = idx_to_token[idx]
             append(idx, orphan())
-            print(f"final_move: {to_standard_uci(tok)}")
+            print(f"final_move: {normalize_castling(tok)}")
 
             if not full():
                 move_pos = len(token_ids) - 1
