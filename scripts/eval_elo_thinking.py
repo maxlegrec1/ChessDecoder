@@ -6,6 +6,7 @@ Usage:
 """
 
 import argparse
+from pathlib import Path
 
 import _decoder_inference_cpp as cpp
 from chessdecoder.eval.elo_eval import model_vs_stockfish
