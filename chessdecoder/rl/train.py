@@ -19,7 +19,11 @@ import wandb
 
 from chessdecoder.models.model import ChessDecoder
 from chessdecoder.models.vocab import vocab_size
-from chessdecoder.utils.training import load_pretrained_checkpoint, save_training_checkpoint
+from chessdecoder.utils.training import (
+    load_pretrained_checkpoint,
+    save_training_checkpoint,
+    init_wandb_with_resume,
+)
 from chessdecoder.dataloader.sampling import (
     load_variation_positions,
     load_pretrain_positions,
@@ -204,24 +208,23 @@ def train():
              if f.startswith("checkpoint_rl_step_") and f.endswith(".pt")],
             key=lambda x: os.path.getmtime(os.path.join(config.resume_from, x)),
         )
-        if rl_ckpts:
-            latest = os.path.join(config.resume_from, rl_ckpts[-1])
-            print_rank0(f"Resuming from RL checkpoint: {latest}")
-            rl_checkpoint = torch.load(latest, map_location=device, weights_only=False)
-            model.load_state_dict(rl_checkpoint["model_state_dict"])
-            optimizer.load_state_dict(rl_checkpoint["optimizer_state_dict"])
-            scaler.load_state_dict(rl_checkpoint["scaler_state_dict"])
-            start_step = rl_checkpoint["step"]
-            _resume_stream_state = rl_checkpoint.get("position_stream")
-            # Advance scheduler to match
-            for _ in range(start_step):
-                scheduler.step()
-            # Override LR in case config changed
-            for pg in optimizer.param_groups:
-                pg["lr"] = config.learning_rate
-            print_rank0(f"  Resumed at step {start_step}")
-        else:
-            print_rank0(f"WARNING: resume_from={config.resume_from} but no checkpoints found")
+        if not rl_ckpts:
+            raise ValueError(f"No RL checkpoint files found in {config.resume_from}")
+        latest = os.path.join(config.resume_from, rl_ckpts[-1])
+        print_rank0(f"Resuming from RL checkpoint: {latest}")
+        rl_checkpoint = torch.load(latest, map_location=device, weights_only=False)
+        model.load_state_dict(rl_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(rl_checkpoint["optimizer_state_dict"])
+        scaler.load_state_dict(rl_checkpoint["scaler_state_dict"])
+        start_step = rl_checkpoint["step"]
+        _resume_stream_state = rl_checkpoint.get("position_stream")
+        # Advance scheduler to match
+        for _ in range(start_step):
+            scheduler.step()
+        # Override LR in case config changed
+        for pg in optimizer.param_groups:
+            pg["lr"] = config.learning_rate
+        print_rank0(f"  Resumed at step {start_step}")
 
     # ── Data ──────────────────────────────────────────────────────────────
     position_stream = PositionStream(config.pretrain_parquet_dir, config.eval_seed)
@@ -244,24 +247,19 @@ def train():
     })
 
     # ── Checkpoint dir ────────────────────────────────────────────────────
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = Path(config.checkpoint_dir) / f"{config.run_name}_{run_timestamp}"
+    if config.resume_from:
+        checkpoint_dir = Path(config.resume_from)
+    else:
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_dir = Path(config.checkpoint_dir) / f"{config.run_name}_{run_timestamp}"
     if is_main_process():
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ── WandB (resume existing run if ID file exists) ──────────────────
     if is_main_process():
-        wandb_run_id = None
-        # On resume, look for wandb ID in the resumed checkpoint dir
-        if config.resume_from:
-            old_id_path = Path(config.resume_from) / "wandb_run_id.txt"
-            if old_id_path.exists():
-                wandb_run_id = old_id_path.read_text().strip()
-                print_rank0(f"Resuming wandb run: {wandb_run_id}")
-
-        wandb.init(
+        init_wandb_with_resume(
             project=config.project_name,
-            name=f"{config.run_name}_{run_timestamp}",
+            run_name=config.run_name,
             config={
                 "grpo": {
                     "group_size": config.group_size,
@@ -284,18 +282,8 @@ def train():
                 },
                 "model": config.model,
             },
-            id=wandb_run_id,
-            resume="must" if wandb_run_id else None,
+            checkpoint_dir=str(checkpoint_dir),
         )
-
-        # Save wandb run ID for future resume
-        wandb_id_path = checkpoint_dir / "wandb_run_id.txt"
-        if not wandb_run_id:
-            wandb_id_path.write_text(wandb.run.id)
-            print_rank0(f"Saved wandb run ID to {wandb_id_path}")
-        else:
-            # Copy ID to new checkpoint dir so next resume finds it
-            wandb_id_path.write_text(wandb_run_id)
 
 
     metrics = GRPOMetrics()
