@@ -31,7 +31,7 @@ def _sample_one_per_game(df, seed):
     def _pick(g):
         game_seed = hash((seed, g.name)) % (2**31)
         return g.sample(1, random_state=game_seed)
-    return df.groupby("game_id", group_keys=False).apply(_pick).reset_index(drop=True)
+    return df.groupby("game_id", group_keys=False).apply(_pick, include_groups=False).reset_index(drop=True)
 
 
 def _filter_standard_games(df):
