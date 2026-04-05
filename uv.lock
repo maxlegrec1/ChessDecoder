@@ -222,7 +222,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/93/09/7d04d7581ae3bb8b5
 [[package]]
 name = "chessrl-inference-cpp"
 version = "0.1.0"
-source = { editable = "src/cpp/mcts" }
+source = { editable = "chessdecoder/cpp/mcts" }
 dependencies = [
     { name = "pybind11" },
 ]
@@ -279,7 +279,7 @@ wheels = [
 [[package]]
 name = "decoder"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "bulletchess" },
     { name = "decoder-inference-cpp" },
@@ -304,8 +304,8 @@ mcts = [
 [package.metadata]
 requires-dist = [
     { name = "bulletchess", specifier = ">=0.4.0" },
-    { name = "chessrl-inference-cpp", marker = "extra == 'mcts'", editable = "src/cpp/mcts" },
-    { name = "decoder-inference-cpp", editable = "src/cpp/decoder" },
+    { name = "chessrl-inference-cpp", marker = "extra == 'mcts'", editable = "chessdecoder/cpp/mcts" },
+    { name = "decoder-inference-cpp", editable = "chessdecoder/cpp/decoder" },
     { name = "numpy", specifier = ">=2.4.0" },
     { name = "pyarrow", specifier = ">=22.0.0" },
     { name = "pybind11", specifier = ">=3.0.1" },
@@ -323,7 +323,7 @@ provides-extras = ["mcts"]
 [[package]]
 name = "decoder-inference-cpp"
 version = "0.8.1"
-source = { editable = "src/cpp/decoder" }
+source = { editable = "chessdecoder/cpp/decoder" }
 
 [[package]]
 name = "dill"

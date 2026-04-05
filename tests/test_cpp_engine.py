@@ -39,7 +39,7 @@ def test_single_engine_deterministic(single_engine):
 
 
 def test_single_engine_token_structure(single_engine):
-    from src.models.vocab import token_to_idx, idx_to_token, move_vocab_size
+    from chessdecoder.models.vocab import token_to_idx, idx_to_token, move_vocab_size
 
     fen = SAMPLE_FENS[0]
     single_engine.predict_move(fen, 0.0)
@@ -127,7 +127,7 @@ def test_batched_mixed_fens_valid(batched_engine, sample_fens):
 
 
 def test_batched_token_structure(batched_engine):
-    from src.models.vocab import token_to_idx, move_vocab_size
+    from chessdecoder.models.vocab import token_to_idx, move_vocab_size
 
     results = batched_engine.predict_moves(SAMPLE_FENS[:3], 0.0)
     for r in results:

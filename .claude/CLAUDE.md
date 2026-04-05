@@ -7,17 +7,18 @@ A decoder-only chess transformer (~116M params, 12 layers, 1024 embed, 16 heads)
 ## Directory Layout
 
 ```
-src/models/model.py          # ChessDecoder model (5 heads: board, policy, thinking_policy, wl, d)
-src/models/vocab.py          # Vocabulary (1968 tokens), sub-vocab mappings
-src/dataloader/              # FEN-to-token conversion, reconstitute_games, policy_index
-src/train/                   # Pretraining loop + config.yaml
-src/finetune/                # Thinking variation finetuning + config.yaml
-src/rl/                      # GRPO reinforcement learning + config.yaml
-src/eval/                    # ELO evaluation against Stockfish
-src/export/                  # TorchScript export for C++ engine
-src/cpp/decoder/             # C++ inference engine (single + batched, pybind11)
-src/cpp/mcts/                # MCTS/TensorRT engine (optional, needs TRT)
-src/cpp/chess-library/       # Shared C++ chess library (git submodule, header-only)
+chessdecoder/                        # Installable Python package (import chessdecoder...)
+chessdecoder/models/model.py         # ChessDecoder model (5 heads: board, policy, thinking_policy, wl, d)
+chessdecoder/models/vocab.py         # Vocabulary (1968 tokens), sub-vocab mappings
+chessdecoder/dataloader/             # FEN-to-token conversion, reconstitute_games, policy_index
+chessdecoder/train/                  # Pretraining loop + config.yaml
+chessdecoder/finetune/               # Thinking variation finetuning + config.yaml
+chessdecoder/rl/                     # GRPO reinforcement learning + config.yaml
+chessdecoder/eval/                   # ELO evaluation against Stockfish
+chessdecoder/export/                 # TorchScript export for C++ engine
+chessdecoder/cpp/decoder/            # C++ inference engine (single + batched, pybind11)
+chessdecoder/cpp/mcts/               # MCTS/TensorRT engine (optional, needs TRT)
+chessdecoder/cpp/chess-library/      # Shared C++ chess library (git submodule, header-only)
 scripts/                     # Evaluation, inference, data generation scripts
 tests/                       # Pytest suite (77 tests)
 markdowns/                   # Technical documentation (01-10)
@@ -33,7 +34,8 @@ trt/                         # TensorRT engine files for MCTS (gitignored)
 - **Always use `uv run`** for all Python commands
 - **Build everything**: `uv sync` (builds C++ decoder engine via pybind11)
 - **Build with MCTS**: `uv sync --extra mcts` (also builds TensorRT-based MCTS engine)
-- **Rebuild C++ decoder after changes**: `uv pip install -e src/cpp/decoder/ --no-build-isolation`
+- **Rebuild C++ decoder after changes**: `uv pip install -e chessdecoder/cpp/decoder/ --no-build-isolation`
+- **Run entry-point modules directly** (package is installed): e.g. `uv run python chessdecoder/train/train.py`, `uv run python chessdecoder/inference/think.py`. Do NOT use `python -m src.X` — `src/` no longer exists.
 
 ## Two C++ Extensions
 
@@ -67,7 +69,7 @@ Markers: `@pytest.mark.gpu` (CUDA), `@pytest.mark.cpp` (exported model in export
 
 ## Batched C++ Engine
 
-The batched engine (`src/cpp/decoder/batched_engine.cpp`) uses per-element valid mask buffers (not KV zeroing) to handle sequences of different lengths. Pre-allocated `[B, 1, 1, max_seq_len]` FP32 mask buffers are updated incrementally via `masked_fill_`. This is critical for correctness — KV zeroing causes attention weight dilution (exp(0)=1 steals probability mass).
+The batched engine (`chessdecoder/cpp/decoder/batched_engine.cpp`) uses per-element valid mask buffers (not KV zeroing) to handle sequences of different lengths. Pre-allocated `[B, 1, 1, max_seq_len]` FP32 mask buffers are updated incrementally via `masked_fill_`. This is critical for correctness — KV zeroing causes attention weight dilution (exp(0)=1 steals probability mass).
 
 ## Stockfish
 

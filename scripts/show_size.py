@@ -1,6 +1,6 @@
 import torch
-from src.models.model import ChessDecoder
-from src.models.vocab import vocab_size
+from chessdecoder.models.model import ChessDecoder
+from chessdecoder.models.vocab import vocab_size
 
 def show_size():
     model = ChessDecoder(vocab_size=vocab_size)

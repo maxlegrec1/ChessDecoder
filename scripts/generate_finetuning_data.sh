@@ -9,7 +9,7 @@
 #   PARQUET_DIR  Directory with pretraining parquets (default: parquets/)
 #   OUTPUT_DIR   Directory for enriched parquets (default: parquets_variations/)
 #
-# This script wraps src/finetune/generate_variations.py, which reads existing parquets,
+# This script wraps chessdecoder/finetune/generate_variations.py, which reads existing parquets,
 # runs Leela MCTS on each position, and writes enriched parquets with variation data.
 #
 # Prerequisites:
@@ -49,7 +49,7 @@ fi
 echo "Found $PARQUET_COUNT parquet file(s) to process."
 echo ""
 
-uv run python -m src.finetune.generate_variations \
+uv run python chessdecoder/finetune/generate_variations.py \
     --parquet-dir "$PARQUET_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --simulations 600 \

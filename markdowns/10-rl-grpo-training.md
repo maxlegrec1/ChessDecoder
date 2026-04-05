@@ -286,7 +286,7 @@ Two evaluation sets are used:
 
 ## 8. Configuration Reference
 
-Full configuration with defaults from `src/rl/config.yaml`:
+Full configuration with defaults from `chessdecoder/rl/config.yaml`:
 
 ```yaml
 model:
@@ -341,11 +341,11 @@ data:
 
 | File | Purpose |
 |------|---------|
-| `src/rl/train.py` | Main GRPO training loop |
-| `src/rl/grpo.py` | `compute_group_advantages`, `grpo_loss` |
-| `src/rl/log_probs.py` | Prefix forward, log-prob gathering, entropy |
-| `src/rl/rollout.py` | Subprocess rollout generation, model export |
-| `src/rl/rewards.py` | Reward functions and `CompositeReward` |
-| `src/rl/sequence.py` | `parse_rollout`, `collate_rollouts` |
-| `src/rl/config.py` | `GRPOConfig` dataclass, YAML loading |
-| `src/rl/config.yaml` | Default configuration |
+| `chessdecoder/rl/train.py` | Main GRPO training loop |
+| `chessdecoder/rl/grpo.py` | `compute_group_advantages`, `grpo_loss` |
+| `chessdecoder/rl/log_probs.py` | Prefix forward, log-prob gathering, entropy |
+| `chessdecoder/rl/rollout.py` | Subprocess rollout generation, model export |
+| `chessdecoder/rl/rewards.py` | Reward functions and `CompositeReward` |
+| `chessdecoder/rl/sequence.py` | `parse_rollout`, `collate_rollouts` |
+| `chessdecoder/rl/config.py` | `GRPOConfig` dataclass, YAML loading |
+| `chessdecoder/rl/config.yaml` | Default configuration |

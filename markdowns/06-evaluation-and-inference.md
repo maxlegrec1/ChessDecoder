@@ -206,8 +206,8 @@ Recommended: `temperature=0.0` for evaluation, `temperature=0.1` for game play.
 
 ```python
 import torch
-from src.models.model import ChessDecoder
-from src.models.vocab import vocab_size
+from chessdecoder.models.model import ChessDecoder
+from chessdecoder.models.vocab import vocab_size
 
 # Load checkpoint
 checkpoint = torch.load("checkpoints/model.pt", map_location="cuda", weights_only=False)

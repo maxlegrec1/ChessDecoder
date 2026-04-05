@@ -3,8 +3,8 @@
 import pandas as pd
 import pytest
 
-from src.dataloader.data import fen_to_position_tokens, game_to_token_ids
-from src.models.vocab import (
+from chessdecoder.dataloader.data import fen_to_position_tokens, game_to_token_ids
+from chessdecoder.models.vocab import (
     token_to_idx, vocab_size, castling_tokens, POSITION_TOKEN_LENGTH,
 )
 from tests.conftest import SAMPLE_FENS

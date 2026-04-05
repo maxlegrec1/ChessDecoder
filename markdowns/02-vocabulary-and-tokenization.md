@@ -2,7 +2,7 @@
 
 ## Overview
 
-The vocabulary system (`src/models/vocab.py`) defines how chess positions and moves are converted to token indices for the transformer model. It also defines **sub-vocabularies** that allow each prediction head to output logits over only its relevant token subset.
+The vocabulary system (`chessdecoder/models/vocab.py`) defines how chess positions and moves are converted to token indices for the transformer model. It also defines **sub-vocabularies** that allow each prediction head to output logits over only its relevant token subset.
 
 **Total Vocabulary Size**: 1968 tokens
 **Board Sub-Vocabulary**: 41 tokens (for `board_head`)
@@ -168,7 +168,7 @@ policy_to_idx: Dict[str, int]           # "e2e4" -> 847 (O(1) lookup)
 
 ## FEN to Token Conversion
 
-The function `fen_to_position_tokens()` in `src/dataloader/data.py` converts a FEN string to exactly 68 tokens:
+The function `fen_to_position_tokens()` in `chessdecoder/dataloader/data.py` converts a FEN string to exactly 68 tokens:
 
 ### Process
 

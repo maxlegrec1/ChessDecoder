@@ -96,7 +96,7 @@ model = DDP(model, device_ids=[local_rank])
 
 ### 1. Mixed Precision Training
 
-**Status**: Implemented in both `src/train/train.py` and `finetune/train.py`
+**Status**: Implemented in both `chessdecoder/train/train.py` and `finetune/train.py`
 
 **Benefit**: ~2x speedup, ~50% memory reduction.
 

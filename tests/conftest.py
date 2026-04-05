@@ -45,8 +45,8 @@ def sample_fens():
 def tiny_model():
     if not torch.cuda.is_available():
         pytest.skip("No CUDA GPU available")
-    from src.models.vocab import vocab_size
-    from src.models.model import ChessDecoder
+    from chessdecoder.models.vocab import vocab_size
+    from chessdecoder.models.model import ChessDecoder
     model = ChessDecoder(
         vocab_size=vocab_size,
         embed_dim=64,
@@ -81,6 +81,6 @@ def batched_engine():
     engine = cpp.BatchedInferenceEngine(
         "exports/base/backbone.pt", "exports/base/weights",
         "exports/base/vocab.json", "exports/base/config.json",
-        8,
+        32,
     )
     return engine

@@ -1,6 +1,6 @@
 """Vocabulary invariant tests (pure Python, no GPU)."""
 
-from src.models.vocab import (
+from chessdecoder.models.vocab import (
     vocab_size, board_vocab_size, move_vocab_size, POSITION_TOKEN_LENGTH,
     token_to_idx, idx_to_token,
     board_vocab, move_vocab, board_token_to_idx,

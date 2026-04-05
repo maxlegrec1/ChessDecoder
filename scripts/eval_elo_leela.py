@@ -2,7 +2,7 @@
 """
 Play Leela MCTS against Stockfish and estimate Elo.
 
-Mimics src/eval/play_move.py structure: tqdm with running win rate,
+Mimics chessdecoder/eval/play_move.py structure: tqdm with running win rate,
 streams PGN to disk after each game, prints estimated Elo at the end.
 
 Usage:
@@ -26,7 +26,7 @@ import chess.engine
 import chess.pgn
 from tqdm import tqdm
 
-from src.mcts import LeelaMCTS
+from chessdecoder.mcts import LeelaMCTS
 
 PGN_DIR = "./pgns"
 

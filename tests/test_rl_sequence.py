@@ -2,8 +2,8 @@
 
 import torch
 
-from src.models.vocab import token_to_idx, move_vocab_size, POSITION_TOKEN_LENGTH
-from src.rl.sequence import parse_rollout, collate_rollouts
+from chessdecoder.models.vocab import token_to_idx, move_vocab_size, POSITION_TOKEN_LENGTH
+from chessdecoder.rl.sequence import parse_rollout, collate_rollouts
 
 
 # Token IDs

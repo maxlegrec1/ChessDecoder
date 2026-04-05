@@ -36,11 +36,11 @@ Each variation dict contains: `root_move`, `visit_count`, `visit_fraction`, `pri
 
 ## Pretraining Data Pipeline
 
-### File: `src/dataloader/loader.py` -- `ChessIterableDataset`
+### File: `chessdecoder/dataloader/loader.py` -- `ChessIterableDataset`
 
 ### Step 1: Game to Token Sequence
 
-Function `game_to_token_ids()` in `src/dataloader/data.py`:
+Function `game_to_token_ids()` in `chessdecoder/dataloader/data.py`:
 
 ```
 For each position in game (sorted by ply):
@@ -285,5 +285,5 @@ PARQUET FILES
 +----------------------------------+
   |
   v
-Training Loop (src/train/train.py)
+Training Loop (chessdecoder/train/train.py)
 ```

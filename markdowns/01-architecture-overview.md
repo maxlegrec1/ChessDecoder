@@ -563,12 +563,12 @@ All losses use `IGNORE_INDEX = -100` and sub-vocabulary logits.
 
 | File | Purpose |
 |------|---------|
-| `src/models/vocab.py` | Vocabulary definitions (1968 tokens), sub-vocabulary mappings |
-| `src/models/model.py` | ChessDecoder model with sub-vocab heads |
-| `src/dataloader/data.py` | FEN-to-token conversion, game sequence generation |
-| `src/dataloader/loader.py` | Pretraining IterableDataset and DataLoader |
-| `src/train/train.py` | Pretraining training loop |
-| `src/train/config.yaml` | Pretraining configuration |
+| `chessdecoder/models/vocab.py` | Vocabulary definitions (1968 tokens), sub-vocabulary mappings |
+| `chessdecoder/models/model.py` | ChessDecoder model with sub-vocab heads |
+| `chessdecoder/dataloader/data.py` | FEN-to-token conversion, game sequence generation |
+| `chessdecoder/dataloader/loader.py` | Pretraining IterableDataset and DataLoader |
+| `chessdecoder/train/train.py` | Pretraining training loop |
+| `chessdecoder/train/config.yaml` | Pretraining configuration |
 | `finetune/data.py` | Variation sequence generation (Plackett-Luce ordering) |
 | `finetune/loader.py` | Finetuning IterableDataset (mixed pretrain + variation) |
 | `finetune/train.py` | Finetuning training loop |

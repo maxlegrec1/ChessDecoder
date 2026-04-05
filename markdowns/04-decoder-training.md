@@ -2,7 +2,7 @@
 
 ## Overview
 
-The pretraining loop (`src/train/train.py`) uses the two-pass architecture to train the model on normal game sequences. Each step performs a causal pass (for board generation) and a prefix pass (for move and value prediction).
+The pretraining loop (`chessdecoder/train/train.py`) uses the two-pass architecture to train the model on normal game sequences. Each step performs a causal pass (for board generation) and a prefix pass (for move and value prediction).
 
 ---
 
@@ -200,7 +200,7 @@ if "thinking_policy_head.weight" not in state_dict:
 
 ## Configuration
 
-### `src/train/config.yaml`
+### `chessdecoder/train/config.yaml`
 
 ```yaml
 project_name: "chess-decoder"

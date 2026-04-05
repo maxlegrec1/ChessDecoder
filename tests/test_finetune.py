@@ -4,12 +4,12 @@ import json
 import pytest
 import pyarrow.parquet as pq
 
-from src.models.vocab import (
+from chessdecoder.models.vocab import (
     token_to_idx, idx_to_token, board_token_to_idx,
     move_vocab_size, POSITION_TOKEN_LENGTH,
 )
-from src.finetune.data import variation_to_token_ids
-from src.finetune.loader import FinetuneIterableDataset
+from chessdecoder.finetune.data import variation_to_token_ids
+from chessdecoder.finetune.loader import FinetuneIterableDataset
 
 
 @pytest.fixture(scope="module")

@@ -25,13 +25,15 @@ jobs:
           uv venv
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install pyarrow python-chess pyyaml numpy pytest torchtune pyflakes
+          # Install the chessdecoder package itself (editable, without the C++ extras)
+          uv pip install --no-deps -e . --config-setting editable_mode=compat || uv pip install --no-deps -e .
 
       - name: Lint (pyflakes — unused imports and undefined names)
         run: |
           # Run pyflakes and fail only on high-signal categories.
           # Cosmetic warnings (unused locals, f-strings without placeholders)
           # are intentionally allowed through.
-          .venv/bin/python -m pyflakes src/ 2>&1 | tee /tmp/pyflakes.out
+          .venv/bin/python -m pyflakes chessdecoder/ 2>&1 | tee /tmp/pyflakes.out
           if grep -E "imported but unused|undefined name" /tmp/pyflakes.out; then
             echo "::error::pyflakes found unused imports or undefined names"
             exit 1
@@ -39,5 +41,3 @@ jobs:
 
       - name: Run tests (CPU-only, no GPU/C++ engine)
         run: .venv/bin/pytest tests/ -m "not gpu and not cpp" -v
-        env:
-          PYTHONPATH: .

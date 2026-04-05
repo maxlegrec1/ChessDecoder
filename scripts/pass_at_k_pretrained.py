@@ -16,17 +16,14 @@ Baseline (argmax):
 import argparse
 import os
 import random
-import sys
 import time
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pyarrow.parquet as pq
 import torch
 
-from src.models.model import ChessDecoder
-from src.models.vocab import vocab_size
+from chessdecoder.models.model import ChessDecoder
+from chessdecoder.models.vocab import vocab_size
 
 
 def load_fen_bestmove_pairs(n, seed, data_dir):

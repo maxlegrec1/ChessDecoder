@@ -16,17 +16,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
 
 import chess
 
-_ROOT = Path(__file__).resolve().parents[1]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from src.mcts import LeelaMCTS
-from src.eval.elo_eval import model_vs_stockfish
+from chessdecoder.mcts import LeelaMCTS
+from chessdecoder.eval.elo_eval import model_vs_stockfish
 
 # Pseudo-castling (model vocab) -> standard UCI
 _PSEUDO_TO_STANDARD = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}

@@ -2,8 +2,8 @@
 
 import pytest
 
-from src.models.vocab import token_to_idx, move_vocab_size
-from src.rl.rewards import (
+from chessdecoder.models.vocab import token_to_idx, move_vocab_size
+from chessdecoder.rl.rewards import (
     move_quality_reward, format_reward, coherence_reward,
     CompositeReward,
 )

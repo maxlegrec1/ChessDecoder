@@ -4,11 +4,11 @@ import chess
 import pytest
 import torch
 
-from src.models.vocab import (
+from chessdecoder.models.vocab import (
     token_to_idx, vocab_size, board_vocab_size, move_vocab_size,
     POSITION_TOKEN_LENGTH,
 )
-from src.dataloader.data import fen_to_position_tokens
+from chessdecoder.dataloader.data import fen_to_position_tokens
 
 pytestmark = pytest.mark.gpu
 

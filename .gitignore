@@ -39,8 +39,8 @@ pgns/
 *.onnx.data
 
 # uv lock files in subpackages
-src/cpp/decoder/uv.lock
-src/cpp/mcts/uv.lock
+chessdecoder/cpp/decoder/uv.lock
+chessdecoder/cpp/mcts/uv.lock
 
 # IDE / editor settings
 .idea

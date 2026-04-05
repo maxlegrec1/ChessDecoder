@@ -4,17 +4,17 @@
 
 | Purpose | File |
 |---------|------|
-| Decoder model | `src/models/model.py` |
-| Vocabulary + sub-vocabs | `src/models/vocab.py` |
-| FEN tokenization | `src/dataloader/data.py` |
-| Pretraining dataset | `src/dataloader/loader.py` |
-| Finetuning dataset | `finetune/loader.py` |
-| Variation sequence generation | `finetune/data.py` |
-| Pretraining loop | `src/train/train.py` |
-| Finetuning loop | `finetune/train.py` |
-| Pretraining config | `src/train/config.yaml` |
-| Finetuning config | `finetune/config.yaml` |
-| Thinking inference | `scripts/think.py` |
+| Decoder model | `chessdecoder/models/model.py` |
+| Vocabulary + sub-vocabs | `chessdecoder/models/vocab.py` |
+| FEN tokenization | `chessdecoder/dataloader/data.py` |
+| Pretraining dataset | `chessdecoder/dataloader/loader.py` |
+| Finetuning dataset | `chessdecoder/finetune/loader.py` |
+| Variation sequence generation | `chessdecoder/finetune/data.py` |
+| Pretraining loop | `chessdecoder/train/train.py` |
+| Finetuning loop | `chessdecoder/finetune/train.py` |
+| Pretraining config | `chessdecoder/train/config.yaml` |
+| Finetuning config | `chessdecoder/finetune/config.yaml` |
+| Thinking inference | `chessdecoder/inference/think.py` |
 
 ---
 
@@ -102,7 +102,7 @@ These tokens appear in `board_target_ids` but **never** in the input sequence:
 ## Important Mappings
 
 ```python
-from src.models.vocab import (
+from chessdecoder.models.vocab import (
     # Full vocabulary
     token_to_idx,              # "e2e4" -> 847
     idx_to_token,              # 847 -> "e2e4"
@@ -133,19 +133,19 @@ from src.models.vocab import (
 ### Pretraining
 ```bash
 cd /mnt/2tb_2/decoder
-python -m src.train.train
+uv run python chessdecoder/train/train.py
 ```
 
 ### Finetuning
 ```bash
 cd /mnt/2tb_2/decoder
-python -m finetune.train
+uv run python chessdecoder/finetune/train.py
 ```
 
 ### Thinking Inference
 ```bash
 cd /mnt/2tb_2/decoder
-python scripts/think.py --checkpoint checkpoints/model.pt \
+uv run python chessdecoder/inference/think.py --checkpoint checkpoints/model.pt \
     --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" \
     --temperature 0.0 --device cuda
 ```
@@ -156,8 +156,8 @@ python scripts/think.py --checkpoint checkpoints/model.pt \
 
 ```python
 import torch
-from src.models.model import ChessDecoder
-from src.models.vocab import vocab_size
+from chessdecoder.models.model import ChessDecoder
+from chessdecoder.models.vocab import vocab_size
 
 # Load checkpoint
 checkpoint = torch.load("checkpoints/model.pt", map_location="cuda", weights_only=False)
@@ -214,7 +214,7 @@ Conversion happens automatically in `predict_move()`, `predict_move_and_value()`
 
 ## Loss Weights
 
-### Pretraining (`src/train/config.yaml`)
+### Pretraining (`chessdecoder/train/config.yaml`)
 
 | Loss | Weight | Head | Description |
 |------|--------|------|-------------|
@@ -223,7 +223,7 @@ Conversion happens automatically in `predict_move()`, `predict_move_and_value()`
 | WL | 1.0 | `wl_head` | Soft bucket CE for WL prediction (100 Gaussian buckets) |
 | D | 1.0 | `d_head` | Soft bucket CE for D prediction (100 uniform buckets) |
 
-### Finetuning (`finetune/config.yaml`)
+### Finetuning (`chessdecoder/finetune/config.yaml`)
 
 | Loss | Weight | Head | Description |
 |------|--------|------|-------------|
@@ -343,7 +343,7 @@ Token index = chess.square + 1
 
 ### Check if token is a move
 ```python
-from src.models.vocab import move_vocab_size
+from chessdecoder.models.vocab import move_vocab_size
 is_move = token_idx < move_vocab_size  # First 1924 tokens are moves
 ```
 
@@ -355,14 +355,14 @@ starts = (input_ids == token_to_idx["start_pos"]).nonzero()
 
 ### Verify FEN tokenization
 ```python
-from src.dataloader.data import fen_to_position_tokens
+from chessdecoder.dataloader.data import fen_to_position_tokens
 tokens = fen_to_position_tokens(fen)
 assert len(tokens) == 68
 ```
 
 ### Decode board_target_ids back to token names
 ```python
-from src.models.vocab import board_idx_to_full_idx, idx_to_token
+from chessdecoder.models.vocab import board_idx_to_full_idx, idx_to_token
 
 for i, board_idx in enumerate(board_target_ids):
     if board_idx == -100:
@@ -374,7 +374,7 @@ for i, board_idx in enumerate(board_target_ids):
 
 ### Decode move_target_ids back to token names
 ```python
-from src.models.vocab import move_idx_to_full_idx, idx_to_token
+from chessdecoder.models.vocab import move_idx_to_full_idx, idx_to_token
 
 for i, move_idx in enumerate(move_target_ids):
     if move_idx == -100:

@@ -68,7 +68,7 @@ for FILE in $FILE_LIST; do
         echo "[skip] $PARQUET (already exists)"
     else
         echo "[convert] $TAR -> $PARQUET"
-        uv run python -m src.dataloader.reconstitute_games "$TAR"
+        uv run python chessdecoder/dataloader/reconstitute_games.py "$TAR"
         # reconstitute_games.py writes output next to the tar; move it
         SRC_PARQUET="${TAR%.tar}.parquet"
         if [ -f "$SRC_PARQUET" ]; then

@@ -68,12 +68,12 @@ def python_engine():
     if not os.path.isfile(CHECKPOINT):
         pytest.skip(f"Checkpoint not found: {CHECKPOINT}")
 
-    from src.inference.think import load_model, to_standard_uci, sample_token
-    from src.models.vocab import (
+    from chessdecoder.inference.think import load_model, to_standard_uci, sample_token
+    from chessdecoder.models.vocab import (
         token_to_idx, idx_to_token, board_idx_to_full_idx,
         move_idx_to_full_idx, board_token_to_idx, move_token_to_idx,
     )
-    from src.dataloader.data import fen_to_position_tokens
+    from chessdecoder.dataloader.data import fen_to_position_tokens
 
     # Import ThinkingModelWrapper inline (it was removed from scripts, so
     # we reimplement a minimal version here for testing)
@@ -279,10 +279,12 @@ def cpp_single():
 @pytest.fixture(scope="module")
 def cpp_batched():
     cpp = pytest.importorskip("_decoder_inference_cpp")
+    # Must be >= NUM_FENS (30) so test_cpp_batched_legal can submit all pairs
+    # at once, and >= K (10) for pass@k tests.
     return cpp.BatchedInferenceEngine(
         f"{EXPORT_DIR}/backbone.pt", f"{EXPORT_DIR}/weights",
         f"{EXPORT_DIR}/vocab.json", f"{EXPORT_DIR}/config.json",
-        8,
+        max(NUM_FENS, 32),
     )
 
 
@@ -426,7 +428,7 @@ class TestTokenStructure:
     """All engines should produce well-formed thinking traces."""
 
     def _validate_structure(self, token_ids):
-        from src.models.vocab import token_to_idx, move_vocab_size, POSITION_TOKEN_LENGTH
+        from chessdecoder.models.vocab import token_to_idx, move_vocab_size, POSITION_TOKEN_LENGTH
         start_think = token_to_idx["start_think"]
         end_think = token_to_idx["end_think"]
         start_pos = token_to_idx["start_pos"]

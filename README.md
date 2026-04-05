@@ -15,7 +15,7 @@ uv sync                                             # install deps + build C++ e
 ./scripts/download_and_convert_pretraining_data.sh 2
 
 # Run thinking inference on the starting position (requires a checkpoint)
-uv run python -m src.inference.think \
+uv run python chessdecoder/inference/think.py \
     --checkpoint checkpoints/your_model.pt \
     --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 ```
@@ -32,17 +32,17 @@ uv run python -m src.inference.think \
 
 ```
 ChessDecoder/
-├── src/
-│   ├── models/          # Transformer model, vocabulary
-│   ├── dataloader/      # Pretraining data pipeline (Parquet → token sequences)
-│   ├── train/           # Pretraining loop + config
-│   ├── finetune/        # Finetuning with thinking variations + config
-│   ├── rl/              # GRPO reinforcement learning + config
-│   ├── eval/            # ELO evaluation against Stockfish
-│   ├── inference/       # Thinking inference (autoregressive generation)
-│   ├── export/          # TorchScript export for C++ engine
-│   ├── cpp/decoder/     # C++ decoder inference engine (pybind11)
-│   └── cpp/             # C++ MCTS/TensorRT engine (optional)
+├── chessdecoder/            # Installable Python package (import chessdecoder...)
+│   ├── models/              # Transformer model, vocabulary
+│   ├── dataloader/          # Pretraining data pipeline (Parquet → token sequences)
+│   ├── train/               # Pretraining loop + config
+│   ├── finetune/            # Finetuning with thinking variations + config
+│   ├── rl/                  # GRPO reinforcement learning + config
+│   ├── eval/                # ELO evaluation against Stockfish
+│   ├── inference/           # Thinking inference (autoregressive generation)
+│   ├── export/              # TorchScript export for C++ engine
+│   ├── cpp/decoder/         # C++ decoder inference engine (pybind11)
+│   └── cpp/mcts/            # C++ MCTS/TensorRT engine (optional)
 ├── scripts/             # Evaluation and utility scripts
 ├── tests/               # Pytest test suite (77 tests)
 ├── markdowns/           # Technical documentation (10 guides)
@@ -74,7 +74,7 @@ Only needed if you want to generate finetuning variation data via MCTS:
 uv sync --extra mcts
 ```
 
-Requires TensorRT at `/usr/local/TensorRT-10.14.1.48` and CUDA at `/usr/local/cuda`. Edit `src/cpp/setup.py` if your paths differ.
+Requires TensorRT at `/usr/local/TensorRT-10.14.1.48` and CUDA at `/usr/local/cuda`. Edit `chessdecoder/cpp/mcts/setup.py` if your paths differ.
 
 ### 3. (Optional) Install Stockfish
 
@@ -91,7 +91,7 @@ The eval scripts look for `bin/stockfish` automatically, falling back to `PATH`.
 ### 4. Verify
 
 ```bash
-uv run python -c "from src.models.model import ChessDecoder; print('OK')"
+uv run python -c "from chessdecoder.models.model import ChessDecoder; print('OK')"
 uv run python -c "import _decoder_inference_cpp; print('C++ decoder engine OK')"
 ```
 
@@ -109,12 +109,12 @@ Pretraining data comes from [Leela Chess Zero](https://lczero.org/) V6 training 
 PARQUET_DIR=/path/to/data ./scripts/download_and_convert_pretraining_data.sh 10
 ```
 
-Then set `parquet_dir` in `src/train/config.yaml` to point at your parquets directory.
+Then set `parquet_dir` in `chessdecoder/train/config.yaml` to point at your parquets directory.
 
 **Manual conversion** of a single tar file:
 
 ```bash
-uv run python -m src.dataloader.reconstitute_games lc0_tars/training.2411.tar
+uv run python chessdecoder/dataloader/reconstitute_games.py lc0_tars/training.2411.tar
 ```
 
 ### Finetuning Data (requires MCTS)
@@ -125,20 +125,20 @@ Generate MCTS variation data from pretraining parquets:
 ./scripts/generate_finetuning_data.sh trt/model_dynamic_leela.trt parquets parquets_variations
 ```
 
-Then set `variation_parquet_dir` in `src/finetune/config.yaml`.
+Then set `variation_parquet_dir` in `chessdecoder/finetune/config.yaml`.
 
 ## Training
 
 ```bash
-uv run python -m src.train.train        # Pretraining          (src/train/config.yaml)
-uv run python -m src.finetune.train     # Finetuning           (src/finetune/config.yaml)
-uv run python -m src.rl.train           # RL with GRPO         (src/rl/config.yaml)
+uv run python chessdecoder/train/train.py        # Pretraining  (chessdecoder/train/config.yaml)
+uv run python chessdecoder/finetune/train.py     # Finetuning   (chessdecoder/finetune/config.yaml)
+uv run python chessdecoder/rl/train.py           # RL with GRPO (chessdecoder/rl/config.yaml)
 ```
 
 ## Inference
 
 ```bash
-uv run python -m src.inference.think \
+uv run python chessdecoder/inference/think.py \
     --checkpoint checkpoints/model.pt \
     --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" \
     --temperature 0.0
