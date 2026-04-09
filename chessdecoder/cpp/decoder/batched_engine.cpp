@@ -737,6 +737,9 @@ BatchedInferenceEngine::predictMoves(
         if (move.empty() && !first_root_move[b].empty())
             move = vocab_->pseudoToStandardUci(first_root_move[b]);
 
+        // Append final move token so token_ids is the complete sequence
+        token_ids[b].push_back(tok);
+
         results[b].move = move;
         results[b].token_ids = std::move(token_ids[b]);
         results[b].wl_entries = std::move(wl_entries[b]);
