@@ -68,7 +68,9 @@ PYBIND11_MODULE(_decoder_inference_cpp, m)
         .def_readonly("move", &decoder::BatchedInferenceEngine::Result::move)
         .def_readonly("token_ids", &decoder::BatchedInferenceEngine::Result::token_ids)
         .def_readonly("wl_entries", &decoder::BatchedInferenceEngine::Result::wl_entries)
-        .def_readonly("d_entries", &decoder::BatchedInferenceEngine::Result::d_entries);
+        .def_readonly("d_entries", &decoder::BatchedInferenceEngine::Result::d_entries)
+        .def_readonly("move_log_probs",
+                      &decoder::BatchedInferenceEngine::Result::move_log_probs);
 
     py::class_<decoder::BatchedInferenceEngine>(m, "BatchedInferenceEngine")
         .def(py::init<const std::string&, const std::string&,

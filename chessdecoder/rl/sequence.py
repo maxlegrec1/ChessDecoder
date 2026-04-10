@@ -33,6 +33,7 @@ def parse_rollout(
     wl_entries: list[tuple[int, float]],
     d_entries: list[tuple[int, float]],
     max_seq_len: int,
+    move_log_probs: list[tuple[int, float]] | None = None,
 ) -> dict:
     """Parse a single rollout's token sequence into model-ready tensors.
 
@@ -54,6 +55,14 @@ def parse_rollout(
     d_positions = torch.zeros(max_seq_len, dtype=torch.bool)
     wl_values = torch.zeros(max_seq_len, dtype=torch.float32)
     d_values = torch.zeros(max_seq_len, dtype=torch.float32)
+
+    # Old log-probs from the C++ inference engine, aligned to the same
+    # positions as thinking_move_mask / final_move_mask.
+    old_log_probs = torch.zeros(max_seq_len, dtype=torch.float32)
+    if move_log_probs:
+        for pos, lp in move_log_probs:
+            if 0 <= pos < max_seq_len:
+                old_log_probs[pos] = lp
 
     # Build WL/D lookup from entries
     wl_lookup = {pos: val for pos, val in wl_entries if pos < max_seq_len}
@@ -128,6 +137,7 @@ def parse_rollout(
         "thinking_move_mask": thinking_move_mask,
         "final_move_mask": final_move_mask,
         "move_token_ids": move_token_ids,
+        "old_log_probs": old_log_probs,
         "seq_len": seq_len,
     }
 
@@ -144,7 +154,7 @@ def collate_rollouts(parsed_list: list[dict], device: torch.device) -> dict:
     """
     keys = ["input_ids", "block_id", "wl_positions", "d_positions",
             "wl_values", "d_values", "thinking_move_mask", "final_move_mask",
-            "move_token_ids"]
+            "move_token_ids", "old_log_probs"]
     batch = {}
     for k in keys:
         batch[k] = torch.stack([p[k] for p in parsed_list]).to(device)

@@ -169,16 +169,22 @@ torch::Tensor BatchedInferenceEngine::evalDHead(torch::Tensor h, float temp)
     return d_centers_.index({idx});
 }
 
-torch::Tensor BatchedInferenceEngine::evalPolicyHead(
+std::pair<torch::Tensor, torch::Tensor>
+BatchedInferenceEngine::evalPolicyHead(
     torch::Tensor h, float temp,
     const std::vector<std::string>& fens)
 {
     // h: [B, E] → logits [B, move_vocab]
     auto logits = torch::mm(h, policy_w_t_) + policy_b_;
 
-    // Mask illegal moves per FEN
+    // Compute log-probs on the UNMASKED logits (matches PyTorch
+    // chessdecoder/rl/log_probs.py which uses raw policy_head output).
+    auto logits_f32 = logits.to(torch::kFloat32);
+    auto log_probs = torch::log_softmax(logits_f32, /*dim=*/1);
+
+    // Mask illegal moves per FEN (sampling copy only)
     int B = h.size(0);
-    auto logits_a = logits.to(torch::kFloat32).cpu();
+    auto logits_a = logits_f32.cpu();
     auto logits_acc = logits_a.accessor<float, 2>();
 
     for (int b = 0; b < B; b++)
@@ -191,9 +197,11 @@ torch::Tensor BatchedInferenceEngine::evalPolicyHead(
                 logits_acc[b][j] = -1e9f;
         }
     }
-    logits_a = logits_a.cuda().to(torch::kFloat16);
+    auto masked_cuda = logits_a.cuda().to(torch::kFloat16);
 
-    return sampleBatched(logits_a, temp);  // [B] move sub-vocab indices
+    auto sub_idx = sampleBatched(masked_cuda, temp);           // [B]
+    auto lp = log_probs.gather(1, sub_idx.unsqueeze(1)).squeeze(1);  // [B]
+    return {sub_idx, lp};
 }
 
 // ============================================================================
@@ -234,6 +242,7 @@ BatchedInferenceEngine::predictMoves(
     std::vector<std::vector<int>> token_ids(B);
     std::vector<std::vector<int>> block_ids(B);
     std::vector<std::vector<std::pair<int, float>>> wl_entries(B), d_entries(B);
+    std::vector<std::vector<std::pair<int, float>>> move_log_probs(B);
     std::vector<int> next_block(B, 0);
     std::vector<int> orphan_ctr(B, 10000);
     std::vector<std::string> first_root_move(B);
@@ -363,10 +372,20 @@ BatchedInferenceEngine::predictMoves(
         {
             auto logits = torch::mm(saved_h, think_w_t_) + think_b_;
             auto logits_f32 = logits.to(torch::kFloat32);
+            // Compute log-probs on RAW logits (no temperature, no padding
+            // mask) — matches PyTorch chessdecoder/rl/log_probs.py.
+            auto log_probs = torch::log_softmax(logits_f32, /*dim=*/1);
+
+            // Mask inactive batch rows for the sampling copy only.
             logits_f32.index_put_({~need_move}, torch::tensor(-1e9f, torch::kCUDA));
             logits = logits_f32.to(torch::kFloat16);
             auto sub_idx = sampleBatched(logits, think_temp);
             auto full_idx = move_lut.index({sub_idx});
+
+            // Gather per-element log-prob at the sampled sub-vocab index.
+            auto lp = log_probs.gather(1, sub_idx.unsqueeze(1)).squeeze(1);  // [B]
+            auto lp_cpu = lp.cpu();
+            auto lp_a = lp_cpu.accessor<float, 1>();
 
             auto full_idx_cpu = full_idx.cpu();
             auto full_idx_a = full_idx_cpu.accessor<int64_t, 1>();
@@ -374,6 +393,13 @@ BatchedInferenceEngine::predictMoves(
             {
                 if (!need_move[b].item<bool>()) continue;
                 int tok = full_idx_a[b];
+                // seq_pos[b] is the position about to receive the move token.
+                // The hidden state that produced the move lives at seq_pos[b] - 1
+                // (the last token already in token_ids[b]), which is the position
+                // marked by thinking_move_mask in sequence.py::parse_rollout.
+                int pred_pos = seq_pos[b] - 1;
+                move_log_probs[b].push_back({pred_pos, lp_a[b]});
+
                 token_ids[b].push_back(tok);
                 block_ids[b].push_back(orphan_ctr[b]++);
                 if (first_root_move[b].empty())
@@ -722,10 +748,14 @@ BatchedInferenceEngine::predictMoves(
     // Phase 3: FINAL — predict final moves
     // ================================================================
 
-    auto final_sub_idx = evalPolicyHead(saved_h, policy_temp, padded_fens);
+    auto final_pair = evalPolicyHead(saved_h, policy_temp, padded_fens);
+    auto final_sub_idx = final_pair.first;
+    auto final_lp = final_pair.second;
     auto final_full = move_lut.index({final_sub_idx});
     auto final_cpu = final_full.cpu();
     auto final_a = final_cpu.accessor<int64_t, 1>();
+    auto final_lp_cpu = final_lp.cpu();
+    auto final_lp_a = final_lp_cpu.accessor<float, 1>();
 
     // Build results
     std::vector<Result> results(B);
@@ -737,6 +767,12 @@ BatchedInferenceEngine::predictMoves(
         if (move.empty() && !first_root_move[b].empty())
             move = vocab_->pseudoToStandardUci(first_root_move[b]);
 
+        // The final move is predicted from the end_think token, which was
+        // appended last and is now at position seq_pos[b] - 1. This matches
+        // final_move_mask[i] set at the end_think position in sequence.py.
+        int pred_pos = seq_pos[b] - 1;
+        move_log_probs[b].push_back({pred_pos, final_lp_a[b]});
+
         // Append final move token so token_ids is the complete sequence
         token_ids[b].push_back(tok);
 
@@ -744,6 +780,7 @@ BatchedInferenceEngine::predictMoves(
         results[b].token_ids = std::move(token_ids[b]);
         results[b].wl_entries = std::move(wl_entries[b]);
         results[b].d_entries = std::move(d_entries[b]);
+        results[b].move_log_probs = std::move(move_log_probs[b]);
     }
 
     results.resize(B_actual);

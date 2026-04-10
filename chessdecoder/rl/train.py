@@ -359,6 +359,7 @@ def train():
                     parsed.append(parse_rollout(
                         rollout.token_ids, rollout.wl_entries,
                         rollout.d_entries, max_seq_len,
+                        move_log_probs=rollout.move_log_probs,
                     ))
                     advantages_kept.append(advantages[fen_idx, sample_idx].item())
 
@@ -375,25 +376,23 @@ def train():
 
             # 8. Cache rollout log-probs BEFORE any updates so importance-
             #    sampling ratios reflect actual policy drift during training.
-            # TODO: get old_lp directly from the C++ inference engine during
-            #       rollout generation to avoid this extra forward pass.
+            #    old_lp comes directly from the C++ inference engine — no
+            #    extra forward pass needed. ref_lp still requires a forward
+            #    pass on the frozen reference model.
             model.eval()
-            print_rank0(f"  Caching old & ref log-probs ({N} sequences) ...")
+            all_old_lp = all_batch["old_log_probs"].float()                 # [N, S]
+            all_move_mask = all_batch["thinking_move_mask"] | all_batch["final_move_mask"]
+            print_rank0(f"  Caching ref log-probs ({N} sequences) ...")
             t_cache = time.time()
-            old_lp_chunks, ref_lp_chunks, mask_chunks = [], [], []
+            ref_lp_chunks = []
             for cb_start in range(0, N, config.mini_batch_size):
                 cb_end = min(cb_start + config.mini_batch_size, N)
                 cb_batch = {k: v[cb_start:cb_end] for k, v in all_batch.items()
                             if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == N}
-                olp, omask = compute_ref_log_probs(model, cb_batch, config.use_amp)
                 rlp, _ = compute_ref_log_probs(ref_model, cb_batch, config.use_amp)
-                old_lp_chunks.append(olp)
                 ref_lp_chunks.append(rlp)
-                mask_chunks.append(omask)
-            all_old_lp = torch.cat(old_lp_chunks)      # [N, S]
             all_ref_lp = torch.cat(ref_lp_chunks)      # [N, S]
-            all_move_mask = torch.cat(mask_chunks)      # [N, S]
-            del old_lp_chunks, ref_lp_chunks, mask_chunks
+            del ref_lp_chunks
             print_rank0(f"  Cached log-probs in {time.time() - t_cache:.1f}s")
 
             # 9. Single-pass GRPO update

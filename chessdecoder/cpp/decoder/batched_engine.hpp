@@ -36,6 +36,11 @@ public:
         std::vector<int> token_ids;
         std::vector<std::pair<int, float>> wl_entries;
         std::vector<std::pair<int, float>> d_entries;
+        // (prediction_position, log_prob) — one entry per sampled move token.
+        // Position is the index in token_ids of the hidden-state token that
+        // predicted the move (same position marked by thinking_move_mask /
+        // final_move_mask in chessdecoder/rl/sequence.py).
+        std::vector<std::pair<int, float>> move_log_probs;
     };
 
     /// Process up to max_batch_size FENs. Pads internally if fewer.
@@ -59,8 +64,11 @@ private:
 
     /// [B, E] → [B] sampled move token indices (full vocab)
     torch::Tensor evalThinkingPolicyHead(torch::Tensor h, float temp);
-    torch::Tensor evalPolicyHead(torch::Tensor h, float temp,
-                                 const std::vector<std::string>& fens);
+    /// [B, E] → ([B] sampled sub-vocab indices, [B] log-probs under UNMASKED
+    /// log_softmax). Legal-move masking is applied only to the sampling copy.
+    std::pair<torch::Tensor, torch::Tensor>
+        evalPolicyHead(torch::Tensor h, float temp,
+                       const std::vector<std::string>& fens);
     torch::Tensor evalBoardHead(torch::Tensor h, float temp);
 
     /// [B, E] → [B] float values (WL or D)

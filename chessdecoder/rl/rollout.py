@@ -20,6 +20,10 @@ class RolloutResult:
     token_ids: list[int]
     wl_entries: list[tuple[int, float]]
     d_entries: list[tuple[int, float]]
+    # (prediction_position, log_prob) pairs for every sampled move token
+    # (thinking moves + final move). Position matches thinking_move_mask /
+    # final_move_mask positions in sequence.py::parse_rollout.
+    move_log_probs: list[tuple[int, float]]
     num_tokens: int
 
 
@@ -57,6 +61,7 @@ def _run_rollouts_subprocess(export_dir: str, fens_json_path: str, results_path:
                 "token_ids": list(r.token_ids),
                 "wl_entries": list(r.wl_entries),
                 "d_entries": list(r.d_entries),
+                "move_log_probs": list(r.move_log_probs),
             })
         print(f"  [rollout] {start + len(chunk)}/{len(all_fens)} done", flush=True)
 
@@ -145,6 +150,7 @@ def generate_rollouts(
             token_ids=r["token_ids"],
             wl_entries=[tuple(e) for e in r["wl_entries"]],
             d_entries=[tuple(e) for e in r["d_entries"]],
+            move_log_probs=[tuple(e) for e in r.get("move_log_probs", [])],
             num_tokens=len(r["token_ids"]),
         ))
 
