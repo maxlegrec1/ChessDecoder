@@ -126,3 +126,63 @@ def test_composite_weighted_sum():
 def test_composite_unknown_reward_raises():
     with pytest.raises(ValueError, match="Unknown reward"):
         CompositeReward({"nonexistent": 1.0})
+
+
+# --- CompositeReward gate mode ---
+
+def _gate_weights():
+    # The format/coherence weights are intentionally non-zero to verify they
+    # get IGNORED in gate mode (the gate is binary, not weighted).
+    return {"move_quality": 1.0, "format": 0.5, "coherence": 0.3}
+
+
+def test_composite_gate_pass_emits_move_quality():
+    token_ids = _make_valid_thinking_seq(root_move=_E2E4, final_move=_E2E4)
+    cr = CompositeReward(_gate_weights(), gate_with_format_coherence=True)
+    total, components = cr("e2e4", token_ids, {"best_move": "e2e4"})
+    # format=1.0, coherence=1.0, move_quality=1.0 → gate passes → 1.0 * 1.0
+    assert total == 1.0
+    assert components == {"move_quality": 1.0, "format": 1.0, "coherence": 1.0}
+
+
+def test_composite_gate_pass_wrong_move_zero():
+    token_ids = _make_valid_thinking_seq(root_move=_E2E4, final_move=_E2E4)
+    cr = CompositeReward(_gate_weights(), gate_with_format_coherence=True)
+    total, _ = cr("e2e4", token_ids, {"best_move": "d2d4"})
+    # gate passes (format/coherence both 1.0) but move_quality is 0
+    assert total == 0.0
+
+
+def test_composite_gate_blocked_by_bad_format():
+    board = _make_board_block()
+    # Truncated thinking → format = -0.5
+    token_ids = board + [_START_THINK, _E2E4, _WL, _D] + board + [_END_VAR]
+    cr = CompositeReward(_gate_weights(), gate_with_format_coherence=True)
+    total, components = cr("e2e4", token_ids, {"best_move": "e2e4"})
+    # Even though best_move matches, broken format zeroes the reward
+    assert total == 0.0
+    assert components["format"] == -0.5
+
+
+def test_composite_gate_blocked_by_incoherent_move():
+    # Root move was e2e4 but final move is d2d4 → coherence = 0
+    token_ids = _make_valid_thinking_seq(root_move=_E2E4, final_move=_D2D4)
+    cr = CompositeReward(_gate_weights(), gate_with_format_coherence=True)
+    total, components = cr("d2d4", token_ids, {"best_move": "d2d4"})
+    assert components["coherence"] == 0.0
+    # move_quality is 1.0 but coherence gate fails
+    assert total == 0.0
+
+
+def test_composite_gate_ignores_format_coherence_weights():
+    # Verify the format/coherence weights don't leak into total in gate mode
+    token_ids = _make_valid_thinking_seq(root_move=_E2E4, final_move=_E2E4)
+    weights = {"move_quality": 1.0, "format": 999.0, "coherence": 999.0}
+    cr = CompositeReward(weights, gate_with_format_coherence=True)
+    total, _ = cr("e2e4", token_ids, {"best_move": "e2e4"})
+    assert total == 1.0  # not 1999.0 — weights ignored
+
+
+def test_composite_gate_requires_required_reward_fns():
+    with pytest.raises(ValueError, match="format"):
+        CompositeReward({"move_quality": 1.0}, gate_with_format_coherence=True)

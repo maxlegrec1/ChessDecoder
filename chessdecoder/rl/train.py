@@ -240,11 +240,14 @@ def train():
     )
 
     # ── Reward function ───────────────────────────────────────────────────
-    reward_fn = CompositeReward({
-        "move_quality": config.reward_move_quality_weight,
-        "format": config.reward_format_weight,
-        "coherence": config.reward_coherence_weight,
-    })
+    reward_fn = CompositeReward(
+        {
+            "move_quality": config.reward_move_quality_weight,
+            "format": config.reward_format_weight,
+            "coherence": config.reward_coherence_weight,
+        },
+        gate_with_format_coherence=config.format_coherence_as_gate,
+    )
 
     # ── Checkpoint dir ────────────────────────────────────────────────────
     if config.resume_from:
@@ -371,6 +374,7 @@ def train():
             advantages_flat = torch.tensor(advantages_kept, device=device)
             N = len(parsed)
             n_diverse = diverse_mask.sum().item()
+            metrics.log_diverse_groups(int(n_diverse), B)
             print_rank0(f"  Diverse groups: {n_diverse}/{B} "
                         f"({n_diverse * G} sequences for training)")
 

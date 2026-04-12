@@ -137,13 +137,35 @@ _REWARD_REGISTRY: dict[str, RewardFn] = {
 
 
 class CompositeReward:
-    """Weighted combination of reward functions."""
+    """Weighted combination of reward functions.
 
-    def __init__(self, weights: dict[str, float]):
+    Two modes:
+      - Additive (default): total = sum(weight_i * reward_i)
+      - Gated (gate_with_format_coherence=True): format and coherence become
+        a hard pass/fail gate on move_quality. Total reward is
+        move_quality_weight * move_quality iff format == 1.0 AND
+        coherence == 1.0, else 0. The format/coherence weights are ignored.
+        The raw component values are still reported in the breakdown so
+        wandb stats stay meaningful.
+    """
+
+    def __init__(
+        self,
+        weights: dict[str, float],
+        gate_with_format_coherence: bool = False,
+    ):
         self.weights = weights
+        self.gate_with_format_coherence = gate_with_format_coherence
         for name in weights:
             if name not in _REWARD_REGISTRY:
                 raise ValueError(f"Unknown reward function: {name}")
+        if gate_with_format_coherence:
+            for required in ("move_quality", "format", "coherence"):
+                if required not in weights:
+                    raise ValueError(
+                        f"gate_with_format_coherence=True requires "
+                        f"'{required}' in weights"
+                    )
 
     def __call__(
         self,
@@ -153,9 +175,25 @@ class CompositeReward:
     ) -> tuple[float, dict[str, float]]:
         """Compute weighted total reward and per-component breakdown."""
         components = {}
-        total = 0.0
-        for name, weight in self.weights.items():
-            value = _REWARD_REGISTRY[name](final_move, token_ids, ground_truth)
-            components[name] = value
-            total += weight * value
+        for name in self.weights:
+            components[name] = _REWARD_REGISTRY[name](
+                final_move, token_ids, ground_truth,
+            )
+
+        if self.gate_with_format_coherence:
+            passed = (
+                components["format"] >= 1.0
+                and components["coherence"] >= 1.0
+            )
+            total = (
+                self.weights["move_quality"] * components["move_quality"]
+                if passed
+                else 0.0
+            )
+        else:
+            total = sum(
+                self.weights[name] * value
+                for name, value in components.items()
+            )
+
         return total, components

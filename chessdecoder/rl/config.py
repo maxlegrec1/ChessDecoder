@@ -39,6 +39,11 @@ class GRPOConfig:
     reward_move_quality_weight: float = 1.0
     reward_format_weight: float = 0.5
     reward_coherence_weight: float = 0.3
+    # When true, format and coherence become a hard gate on move_quality
+    # rather than additive rewards: total = move_quality_weight * move_quality
+    # iff format == 1.0 AND coherence == 1.0, else 0. The format/coherence
+    # weights are ignored in this mode.
+    format_coherence_as_gate: bool = False
 
     # --- Data ---
     variation_parquet_dir: str = "./parquets_variations/"

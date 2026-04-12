@@ -19,6 +19,8 @@ class RolloutMetrics:
     acc_at_k: list[bool] = field(default_factory=list)
     coherence_hits: list[bool] = field(default_factory=list)
     rollout_time: float = 0.0
+    diverse_groups: int = 0
+    total_groups: int = 0
 
 
 @dataclass
@@ -88,6 +90,11 @@ class GRPOMetrics:
                 self._rollout.rollout_lengths.append(rollout.num_tokens)
                 self._rollout.coherence_hits.append(components.get("coherence", 0.0) > 0.0)
 
+    def log_diverse_groups(self, n_diverse: int, total: int):
+        """Record how many groups had non-identical rewards."""
+        self._rollout.diverse_groups = n_diverse
+        self._rollout.total_groups = total
+
     def log_training_step(self, loss_info: dict):
         """Record metrics from one PPO inner step."""
         self._training.policy_loss.append(loss_info["policy_loss"])
@@ -128,6 +135,10 @@ class GRPOMetrics:
                                        / len(r.rollout_lengths)) ** 0.5
             total_tokens = sum(r.rollout_lengths)
             d["rl/rollout_tok_per_sec"] = total_tokens / r.rollout_time if r.rollout_time > 0 else 0.0
+
+        if r.total_groups > 0:
+            d["rl/diverse_groups"] = r.diverse_groups
+            d["rl/diverse_groups_frac"] = r.diverse_groups / r.total_groups
 
         if r.acc_at_1:
             d["rl/acc_at_1"] = _mean([float(x) for x in r.acc_at_1])
