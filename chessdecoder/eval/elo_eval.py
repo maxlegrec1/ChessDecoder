@@ -38,10 +38,11 @@ def play_game(player1_name, player2_name, engine, model1, model2, temperature=0.
         pgn_game.headers["BlackElo"] = str(stockfish_elo)
 
     node = pgn_game # Current node in the PGN game tree
-    
-    # Initialize move history tracking
-    move_history = []
-    
+
+    # Notify adapters that a new game is starting (no-op for engines without history)
+    for m in (model1, model2):
+        if m is not None and hasattr(m, "new_game"):
+            m.new_game()
 
     # Helper: determine game-over state via bulletchess predicates
     def _is_game_over(b):
@@ -71,7 +72,7 @@ def play_game(player1_name, player2_name, engine, model1, model2, temperature=0.
         if is_stockfish_turn:
             move = get_stockfish_move(engine, board)
         else: # Model's turn
-            move_uci = model_to_use.predict_move(board.fen(), temperature=temperature)
+            move_uci = model_to_use.predict_moves([board.fen()], temperature)[0].move or None
             if move_uci is None:
                 print(f"Model ({current_player_name}) failed to produce a move for FEN: {board.fen()}")
                 # Forfeit or error handling
@@ -95,10 +96,14 @@ def play_game(player1_name, player2_name, engine, model1, model2, temperature=0.
 
 
         board.apply(move)
-        # Update move history
-        move_history.append(move.uci())
+        fen_after = board.fen()
+        move_uci_str = move.uci()
+        # Notify adapters with game history (no-op for engines without record_move)
+        for m in (model1, model2):
+            if m is not None and hasattr(m, "record_move"):
+                m.record_move(fen_after, move_uci_str)
         # Convert bulletchess.Move to python-chess.Move for PGN
-        pgn_move = chess.Move.from_uci(move.uci())
+        pgn_move = chess.Move.from_uci(move_uci_str)
         node = node.add_variation(pgn_move) # Add move to PGN
             
 

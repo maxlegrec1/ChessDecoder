@@ -6,9 +6,8 @@ Usage:
 """
 
 import argparse
-from pathlib import Path
 
-import _decoder_inference_cpp as cpp
+from chessdecoder.eval.engine import build_thinking_single_engine
 from chessdecoder.eval.elo_eval import model_vs_stockfish
 
 
@@ -20,14 +19,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
 
-    export = Path(args.export_dir)
-    engine = cpp.ThinkingSingleInferenceEngine(
-        str(export / "backbone.pt"),
-        str(export / "weights"),
-        str(export / "vocab.json"),
-        str(export / "config.json"),
-    )
-
+    engine = build_thinking_single_engine(args.export_dir)
     model_vs_stockfish(
         model=engine,
         model1_name="thinking-decoder",

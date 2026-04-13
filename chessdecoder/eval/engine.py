@@ -40,6 +40,7 @@ Usage
 from __future__ import annotations
 
 import os
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
@@ -159,11 +160,16 @@ class ThinkingSingleEngineAdapter:
 
     Only `move` is populated in returned `MoveResult`s; token_ids etc.
     are available via the engine's getter methods if needed.
+
+    Args:
+        root_only: When True, use `predict_move_root` instead of `predict_move`
+            (skips the thinking trace, uses root policy head directly).
+            Useful for ablating the effect of chain-of-thought.
     """
 
     optimal_batch_size: int = 1
 
-    def __init__(self, export_dir: str) -> None:
+    def __init__(self, export_dir: str, root_only: bool = False) -> None:
         import _decoder_inference_cpp as cpp  # noqa: PLC0415
         self._engine = cpp.ThinkingSingleInferenceEngine(
             f"{export_dir}/backbone.pt",
@@ -174,16 +180,17 @@ class ThinkingSingleEngineAdapter:
         for attr in ("board_temperature", "think_temperature",
                      "policy_temperature", "wl_temperature", "d_temperature"):
             setattr(self._engine, attr, 0.0)
+        self._root_only = root_only
 
     def predict_moves(
         self,
         fens: list[str],
         temperature: float = 0.0,
     ) -> list[MoveResult]:
+        predict = (self._engine.predict_move_root if self._root_only
+                   else self._engine.predict_move)
         return [
-            MoveResult(move=normalize_castling(
-                self._engine.predict_move(f, temperature) or ""
-            ))
+            MoveResult(move=normalize_castling(predict(f, temperature) or ""))
             for f in fens
         ]
 
@@ -195,9 +202,28 @@ class NonThinkingModelAdapter:
     needed.  All board positions are exactly 68 tokens, so N FENs can be
     stacked into a single (N, 68) batch and processed in one forward pass.
 
-    `optimal_batch_size` should be set to whatever fills the GPU without
-    OOM (default 64).  Pass this as `batch_size` to `evaluate_puzzles` /
+    `optimal_batch_size` controls how many FENs are forwarded per call
+    (default 64).  Pass this as `batch_size` to `evaluate_puzzles` /
     `evaluate_positions`.
+
+    Game-history context (n-move look-back)
+    ----------------------------------------
+    When `max_n > 0` the adapter can condition each prediction on the last
+    `max_n` (board, move) pairs from the current game.  This requires the
+    game loop to notify the adapter of each move played via:
+
+        engine.new_game()               # call once before each game
+        engine.record_move(fen_after, move_uci)  # call after every half-move
+
+    When `max_n == 0` (default) these methods are no-ops and the adapter
+    uses a plain single-board forward pass (faster, and appropriate for
+    position-level evals like tactics / CPL).
+
+    Args:
+        checkpoint_path: Path to a ``checkpoint_*.pt`` file.
+        batch_size: Number of FENs to forward in parallel.
+        device: "cuda" or "cpu".
+        max_n: Maximum number of (board, move) history pairs to condition on.
     """
 
     def __init__(
@@ -205,6 +231,7 @@ class NonThinkingModelAdapter:
         checkpoint_path: str,
         batch_size: int = 64,
         device: str = "cuda",
+        max_n: int = 0,
     ) -> None:
         import chess  # noqa: PLC0415
         import torch  # noqa: PLC0415
@@ -216,6 +243,7 @@ class NonThinkingModelAdapter:
         )
 
         self.optimal_batch_size = batch_size
+        self.max_n = max_n
         self._device = device
         self._torch = torch
         self._chess = chess
@@ -232,7 +260,12 @@ class NonThinkingModelAdapter:
             model.half()
         model.eval()
         self._model = model
-        print(f"[NonThinkingModelAdapter] Ready (batch={batch_size})")
+
+        # Game-history state (used only when max_n > 0)
+        self._history: deque[tuple[str, str]] = deque()  # (fen_after, move_uci)
+        self._initial_fen: str = chess.STARTING_FEN
+
+        print(f"[NonThinkingModelAdapter] Ready (batch={batch_size}, max_n={max_n})")
 
     _CASTLING_TO_VOCAB = {
         "e1g1": "e1h1", "e1c1": "e1a1",
@@ -240,15 +273,65 @@ class NonThinkingModelAdapter:
     }
     _CASTLING_FROM_VOCAB = {v: k for k, v in _CASTLING_TO_VOCAB.items()}
 
+    # ------------------------------------------------------------------
+    # Game-history API (used by elo_eval game loop when max_n > 0)
+    # ------------------------------------------------------------------
+
+    def new_game(self) -> None:
+        """Reset game history. Call once before each new game."""
+        self._history.clear()
+        self._initial_fen = self._chess.STARTING_FEN
+
+    def record_move(self, fen_after: str, move_uci: str) -> None:
+        """Notify the adapter that a move was played (by either side).
+
+        Args:
+            fen_after: Board FEN *after* the move was applied.
+            move_uci: The UCI string of the move that was played.
+        """
+        if self.max_n == 0:
+            return
+        self._history.append((fen_after, move_uci))
+        if len(self._history) > self.max_n:
+            # Slide the window: fen_after of the dropped entry becomes
+            # the new initial_fen (= board before the new first entry).
+            self._initial_fen = self._history.popleft()[0]
+
+    # ------------------------------------------------------------------
+    # MovePredictor implementation
+    # ------------------------------------------------------------------
+
     def predict_moves(
         self,
         fens: list[str],
         temperature: float = 0.0,
     ) -> list[MoveResult]:
+        # When history context is active, fall back to sequential predict_move_n
+        if self.max_n > 0 and self._history:
+            return [
+                MoveResult(move=self._predict_with_history(fen, temperature))
+                for fen in fens
+            ]
+        return self._predict_batched(fens, temperature)
+
+    def _predict_with_history(self, fen: str, temperature: float) -> str:
+        """Single-FEN inference conditioned on game history via predict_move_n."""
+        move_str, _ = self._model.predict_move_n(
+            self._initial_fen,
+            list(self._history),
+            temperature=temperature,
+        )
+        return move_str or ""
+
+    def _predict_batched(
+        self,
+        fens: list[str],
+        temperature: float,
+    ) -> list[MoveResult]:
+        """N-FEN batched single-board forward pass (no history)."""
         torch = self._torch
         chess = self._chess
 
-        # Build (B, 68) token-id tensor
         all_ids = [
             [self._token_to_idx[t] for t in self._fen_to_tokens(fen)]
             for fen in fens
@@ -259,14 +342,11 @@ class NonThinkingModelAdapter:
 
         with torch.no_grad():
             h = self._model(input_ids, mask_type="prefix", block_id=block_id)
-            # policy_head at last position (stm token = index S-1)
-            logits_all = self._model.policy_head(h[:, -1, :]).float()  # (B, move_vocab_size)
+            logits_all = self._model.policy_head(h[:, -1, :]).float()  # (B, move_vocab)
 
         results = []
         for i, fen in enumerate(fens):
             logits = logits_all[i]
-
-            # Mask out illegal moves
             board = chess.Board(fen)
             legal_sub_idxs = []
             for move in board.legal_moves:
@@ -339,7 +419,10 @@ def build_thinking_batched_engine(
     return ThinkingBatchedEngineAdapter(export_dir, batch_size)
 
 
-def build_thinking_single_engine(export_dir: str) -> ThinkingSingleEngineAdapter:
+def build_thinking_single_engine(
+    export_dir: str,
+    root_only: bool = False,
+) -> ThinkingSingleEngineAdapter:
     """Create a greedy `ThinkingSingleEngineAdapter` for sequential game-play eval.
 
     Suitable for ELO estimation (Stockfish games) where positions are
@@ -347,14 +430,17 @@ def build_thinking_single_engine(export_dir: str) -> ThinkingSingleEngineAdapter
 
     Args:
         export_dir: Path to the exported model directory.
+        root_only: When True, skip the thinking trace and use the root policy
+            head directly (equivalent to the old ``RootPolicyEngine`` wrapper).
     """
-    return ThinkingSingleEngineAdapter(export_dir)
+    return ThinkingSingleEngineAdapter(export_dir, root_only=root_only)
 
 
 def build_nonthinker_engine(
     checkpoint_path: str,
     batch_size: int = 64,
     device: str = "cuda",
+    max_n: int = 0,
 ) -> NonThinkingModelAdapter:
     """Create a batched engine for non-thinking (pretrain/finetune) checkpoints.
 
@@ -366,5 +452,11 @@ def build_nonthinker_engine(
         checkpoint_path: Path to a `checkpoint_*.pt` file.
         batch_size: Number of FENs to forward in parallel (default 64).
         device: "cuda" or "cpu".
+        max_n: Maximum number of (board, move) history pairs to condition on
+            during game play.  0 = no history (plain single-board inference).
+            Use ``engine.new_game()`` / ``engine.record_move()`` in the game
+            loop to provide history — the ELO eval loop calls these
+            automatically via duck-typing.
     """
-    return NonThinkingModelAdapter(checkpoint_path, batch_size=batch_size, device=device)
+    return NonThinkingModelAdapter(checkpoint_path, batch_size=batch_size,
+                                   device=device, max_n=max_n)

@@ -3,8 +3,8 @@
 Single source of truth for all metric math used across eval modules:
   * wilson_ci          — used in tactics.py and cpl.py (was duplicated)
   * bootstrap_ci_mean  — used in cpl.py
-  * estimate_elo       — used in elo_eval.py and elo_eval_n.py (was duplicated)
-  * win_rate           — inline formula repeated in elo_eval.py and elo_eval_n.py
+  * estimate_elo       — used in elo_eval.py (was duplicated across game-play eval scripts)
+  * win_rate           — inline formula repeated across game-play eval scripts
 """
 
 from __future__ import annotations
