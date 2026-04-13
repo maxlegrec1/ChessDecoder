@@ -264,7 +264,7 @@ def python_engine():
 @pytest.fixture(scope="module")
 def cpp_single():
     cpp = pytest.importorskip("_decoder_inference_cpp")
-    return cpp.ThinkingInferenceEngine(
+    return cpp.ThinkingSingleInferenceEngine(
         f"{EXPORT_DIR}/backbone.pt", f"{EXPORT_DIR}/weights",
         f"{EXPORT_DIR}/vocab.json", f"{EXPORT_DIR}/config.json",
     )
@@ -275,7 +275,7 @@ def cpp_batched():
     cpp = pytest.importorskip("_decoder_inference_cpp")
     # Must be >= NUM_FENS (30) so test_cpp_batched_legal can submit all pairs
     # at once, and >= K (10) for pass@k tests.
-    return cpp.BatchedInferenceEngine(
+    return cpp.ThinkingBatchedInferenceEngine(
         f"{EXPORT_DIR}/backbone.pt", f"{EXPORT_DIR}/weights",
         f"{EXPORT_DIR}/vocab.json", f"{EXPORT_DIR}/config.json",
         max(NUM_FENS, 32),

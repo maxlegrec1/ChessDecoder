@@ -64,7 +64,7 @@ def main():
     parser.add_argument("--d-temp", type=float, default=0.0)
     args = parser.parse_args()
 
-    engine = cpp.ThinkingInferenceEngine(
+    engine = cpp.ThinkingSingleInferenceEngine(
         f"{args.export_dir}/backbone.pt",
         f"{args.export_dir}/weights",
         f"{args.export_dir}/vocab.json",

@@ -5,15 +5,15 @@ plus adapters that bridge the two C++ engines and pure-Python callables.
 
 Design rationale
 ----------------
-`BatchedInferenceEngine` and `ThinkingInferenceEngine` have fundamentally
+`ThinkingBatchedInferenceEngine` and `ThinkingSingleInferenceEngine` have fundamentally
 different performance profiles:
 
-  BatchedInferenceEngine  — N FENs in one batched GPU op; pre-allocated CUDA
+  ThinkingBatchedInferenceEngine  — N FENs in one batched GPU op; pre-allocated CUDA
                             graph buffers always pad to max_batch_size.
                             → optimal_batch_size = max_batch_size (e.g. 32)
                             → right tool for: offline bulk eval (tactics, CPL)
 
-  ThinkingInferenceEngine — 1 FEN at a time; no batch padding overhead.
+  ThinkingSingleInferenceEngine — 1 FEN at a time; no batch padding overhead.
                             → optimal_batch_size = 1
                             → right tool for: sequential game play (ELO)
 
@@ -23,14 +23,14 @@ automatically.
 
 Usage
 -----
-    from chessdecoder.eval.engine import build_batched_engine, build_thinking_engine
+    from chessdecoder.eval.engine import build_thinking_batched_engine, build_thinking_single_engine
 
     # Bulk offline eval (tactics, CPL)
-    engine = build_batched_engine("exports/export_282k", batch_size=32)
+    engine = build_thinking_batched_engine("exports/export_282k", batch_size=32)
     results = evaluate_positions(engine, positions, batch_size=engine.optimal_batch_size)
 
     # Sequential game-play eval (ELO)
-    engine = build_thinking_engine("exports/export_282k")
+    engine = build_thinking_single_engine("exports/export_282k")
     move = engine.predict_moves([fen], 0.0)[0].move
 
     # Stub for unit tests (no C++ required)
@@ -105,8 +105,8 @@ class MovePredictor(Protocol):
 # --------------------------------------------------------------------------
 
 
-class BatchedEngineAdapter:
-    """Wraps `_decoder_inference_cpp.BatchedInferenceEngine`.
+class ThinkingBatchedEngineAdapter:
+    """Wraps `_decoder_inference_cpp.ThinkingBatchedInferenceEngine`.
 
     All five temperature attributes are set to 0.0 on construction
     (greedy / argmax inference).  Converts C++ `BatchedResult` objects
@@ -121,7 +121,7 @@ class BatchedEngineAdapter:
     def __init__(self, export_dir: str, batch_size: int = 32) -> None:
         import _decoder_inference_cpp as cpp  # noqa: PLC0415 — lazy import (GPU dep)
         self.optimal_batch_size = batch_size
-        self._engine = cpp.BatchedInferenceEngine(
+        self._engine = cpp.ThinkingBatchedInferenceEngine(
             f"{export_dir}/backbone.pt",
             f"{export_dir}/weights",
             f"{export_dir}/vocab.json",
@@ -150,8 +150,8 @@ class BatchedEngineAdapter:
         ]
 
 
-class ThinkingEngineAdapter:
-    """Wraps `_decoder_inference_cpp.ThinkingInferenceEngine`.
+class ThinkingSingleEngineAdapter:
+    """Wraps `_decoder_inference_cpp.ThinkingSingleInferenceEngine`.
 
     Implements `predict_moves` as a sequential loop over FENs — one C++
     `predict_move` call per FEN.  This is the engine's natural operating
@@ -165,7 +165,7 @@ class ThinkingEngineAdapter:
 
     def __init__(self, export_dir: str) -> None:
         import _decoder_inference_cpp as cpp  # noqa: PLC0415
-        self._engine = cpp.ThinkingInferenceEngine(
+        self._engine = cpp.ThinkingSingleInferenceEngine(
             f"{export_dir}/backbone.pt",
             f"{export_dir}/weights",
             f"{export_dir}/vocab.json",
@@ -186,6 +186,111 @@ class ThinkingEngineAdapter:
             ))
             for f in fens
         ]
+
+
+class NonThinkingModelAdapter:
+    """Batched GPU inference for non-thinking (pretrain/finetune) checkpoints.
+
+    Loads a `ChessDecoder` checkpoint directly — no TorchScript export
+    needed.  All board positions are exactly 68 tokens, so N FENs can be
+    stacked into a single (N, 68) batch and processed in one forward pass.
+
+    `optimal_batch_size` should be set to whatever fills the GPU without
+    OOM (default 64).  Pass this as `batch_size` to `evaluate_puzzles` /
+    `evaluate_positions`.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        batch_size: int = 64,
+        device: str = "cuda",
+    ) -> None:
+        import chess  # noqa: PLC0415
+        import torch  # noqa: PLC0415
+        from chessdecoder.export.common import load_model  # noqa: PLC0415
+        from chessdecoder.dataloader.data import fen_to_position_tokens  # noqa: PLC0415
+        from chessdecoder.models.vocab import (  # noqa: PLC0415
+            token_to_idx, idx_to_token,
+            move_idx_to_full_idx, move_token_to_idx,
+        )
+
+        self.optimal_batch_size = batch_size
+        self._device = device
+        self._torch = torch
+        self._chess = chess
+        self._fen_to_tokens = fen_to_position_tokens
+        self._token_to_idx = token_to_idx
+        self._idx_to_token = idx_to_token
+        self._move_idx_to_full = move_idx_to_full_idx
+        self._move_token_to_idx = move_token_to_idx
+
+        print(f"[NonThinkingModelAdapter] Loading {checkpoint_path} ...")
+        model, _ = load_model(checkpoint_path, device="cpu")
+        model.to(device)
+        if device == "cuda":
+            model.half()
+        model.eval()
+        self._model = model
+        print(f"[NonThinkingModelAdapter] Ready (batch={batch_size})")
+
+    _CASTLING_TO_VOCAB = {
+        "e1g1": "e1h1", "e1c1": "e1a1",
+        "e8g8": "e8h8", "e8c8": "e8a8",
+    }
+    _CASTLING_FROM_VOCAB = {v: k for k, v in _CASTLING_TO_VOCAB.items()}
+
+    def predict_moves(
+        self,
+        fens: list[str],
+        temperature: float = 0.0,
+    ) -> list[MoveResult]:
+        torch = self._torch
+        chess = self._chess
+
+        # Build (B, 68) token-id tensor
+        all_ids = [
+            [self._token_to_idx[t] for t in self._fen_to_tokens(fen)]
+            for fen in fens
+        ]
+        input_ids = torch.tensor(all_ids, dtype=torch.long, device=self._device)
+        B, S = input_ids.shape
+        block_id = torch.zeros(B, S, dtype=torch.long, device=self._device)
+
+        with torch.no_grad():
+            h = self._model(input_ids, mask_type="prefix", block_id=block_id)
+            # policy_head at last position (stm token = index S-1)
+            logits_all = self._model.policy_head(h[:, -1, :]).float()  # (B, move_vocab_size)
+
+        results = []
+        for i, fen in enumerate(fens):
+            logits = logits_all[i]
+
+            # Mask out illegal moves
+            board = chess.Board(fen)
+            legal_sub_idxs = []
+            for move in board.legal_moves:
+                uci = move.uci()
+                uci = self._CASTLING_TO_VOCAB.get(uci, uci)
+                if uci in self._move_token_to_idx:
+                    legal_sub_idxs.append(self._move_token_to_idx[uci])
+            if legal_sub_idxs:
+                mask = torch.full_like(logits, float("-inf"))
+                mask[legal_sub_idxs] = 0.0
+                logits = logits + mask
+
+            if temperature == 0.0:
+                sub_idx = torch.argmax(logits).item()
+            else:
+                probs = torch.softmax(logits / temperature, dim=-1)
+                sub_idx = torch.multinomial(probs, 1).item()
+
+            full_idx = self._move_idx_to_full[sub_idx]
+            move_str = self._idx_to_token[full_idx]
+            move_str = self._CASTLING_FROM_VOCAB.get(move_str, move_str)
+            results.append(MoveResult(move=move_str))
+
+        return results
 
 
 class PytorchModelAdapter:
@@ -216,11 +321,11 @@ class PytorchModelAdapter:
 # --------------------------------------------------------------------------
 
 
-def build_batched_engine(
+def build_thinking_batched_engine(
     export_dir: str,
     batch_size: int = 32,
-) -> BatchedEngineAdapter:
-    """Create a greedy `BatchedEngineAdapter` for bulk offline eval.
+) -> ThinkingBatchedEngineAdapter:
+    """Create a greedy `ThinkingBatchedEngineAdapter` for bulk offline eval.
 
     Suitable for tactics accuracy, CPL, and any eval that queries many
     positions in parallel.
@@ -231,11 +336,11 @@ def build_batched_engine(
         batch_size: CUDA-graph batch size; match to the eval script's
             `--batch-size` argument.
     """
-    return BatchedEngineAdapter(export_dir, batch_size)
+    return ThinkingBatchedEngineAdapter(export_dir, batch_size)
 
 
-def build_thinking_engine(export_dir: str) -> ThinkingEngineAdapter:
-    """Create a greedy `ThinkingEngineAdapter` for sequential game-play eval.
+def build_thinking_single_engine(export_dir: str) -> ThinkingSingleEngineAdapter:
+    """Create a greedy `ThinkingSingleEngineAdapter` for sequential game-play eval.
 
     Suitable for ELO estimation (Stockfish games) where positions are
     evaluated one at a time in game order.
@@ -243,4 +348,23 @@ def build_thinking_engine(export_dir: str) -> ThinkingEngineAdapter:
     Args:
         export_dir: Path to the exported model directory.
     """
-    return ThinkingEngineAdapter(export_dir)
+    return ThinkingSingleEngineAdapter(export_dir)
+
+
+def build_nonthinker_engine(
+    checkpoint_path: str,
+    batch_size: int = 64,
+    device: str = "cuda",
+) -> NonThinkingModelAdapter:
+    """Create a batched engine for non-thinking (pretrain/finetune) checkpoints.
+
+    Loads the `ChessDecoder` directly from a `.pt` checkpoint — no
+    TorchScript export needed.  All inputs are 68 tokens so the full
+    `batch_size` is forwarded in one GPU op.
+
+    Args:
+        checkpoint_path: Path to a `checkpoint_*.pt` file.
+        batch_size: Number of FENs to forward in parallel (default 64).
+        device: "cuda" or "cpu".
+    """
+    return NonThinkingModelAdapter(checkpoint_path, batch_size=batch_size, device=device)

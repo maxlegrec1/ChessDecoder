@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--output", default="temperature_search_results.json")
     args = parser.parse_args()
 
-    engine = cpp.ThinkingInferenceEngine(
+    engine = cpp.ThinkingSingleInferenceEngine(
         f"{args.export_dir}/backbone.pt",
         f"{args.export_dir}/weights",
         f"{args.export_dir}/vocab.json",

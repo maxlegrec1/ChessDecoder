@@ -26,7 +26,7 @@ def main():
     B = args.batch_size
     K = args.k
 
-    engine = cpp.BatchedInferenceEngine(
+    engine = cpp.ThinkingBatchedInferenceEngine(
         f"{args.export_dir}/backbone.pt",
         f"{args.export_dir}/weights",
         f"{args.export_dir}/vocab.json",

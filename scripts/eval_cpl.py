@@ -29,7 +29,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
 
 from pathlib import Path
 
-from chessdecoder.eval.engine import build_batched_engine
+from chessdecoder.eval.engine import build_thinking_batched_engine, build_nonthinker_engine
 from chessdecoder.eval.cpl import (
     PositionResult,
     aggregate,
@@ -124,9 +124,13 @@ def main():
     parser.add_argument("--bag-path", default="data/action_value_test.bag",
                         help="Path to the action-value test .bag file.")
     parser.add_argument("--export-dir",
-                        help="Single model export dir. Shorthand for --exports DIR=model.")
+                        help="Single thinking-model export dir. Shorthand for --exports DIR=model.")
     parser.add_argument("--exports", nargs="+", default=[],
-                        help="Multiple model specs: path[=label] path[=label] ...")
+                        help="Multiple thinking-model specs: path[=label] ...")
+    parser.add_argument("--checkpoint",
+                        help="Single non-thinking checkpoint (.pt). Shorthand for --checkpoints PATH=model.")
+    parser.add_argument("--checkpoints", nargs="+", default=[],
+                        help="Multiple non-thinking checkpoint specs: path[=label] ...")
     parser.add_argument("--max-positions", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -150,8 +154,15 @@ def main():
         export_specs.append((args.export_dir, Path(args.export_dir).name))
     for s in args.exports:
         export_specs.append(parse_export_spec(s))
-    if not export_specs:
-        parser.error("provide --export-dir or --exports")
+
+    checkpoint_specs: list[tuple[str, str]] = []
+    if args.checkpoint:
+        checkpoint_specs.append(parse_export_spec(args.checkpoint))
+    for s in args.checkpoints:
+        checkpoint_specs.append(parse_export_spec(s))
+
+    if not export_specs and not checkpoint_specs:
+        parser.error("provide --export-dir/--exports or --checkpoint/--checkpoints")
 
     print(f"Loading action-values from {args.bag_path} ...")
     positions = load_positions(
@@ -167,8 +178,14 @@ def main():
 
     all_results: dict[str, list[PositionResult]] = {}
     for path, label in export_specs:
-        print(f"\n--- Running {label} ({path}) ---")
-        engine = build_batched_engine(path, args.batch_size)
+        print(f"\n--- Running {label} ({path}) [thinking/C++] ---")
+        engine = build_thinking_batched_engine(path, args.batch_size)
+        results = evaluate_positions(engine, positions, batch_size=engine.optimal_batch_size)
+        all_results[label] = results
+        del engine
+    for path, label in checkpoint_specs:
+        print(f"\n--- Running {label} ({path}) [non-thinking/Python] ---")
+        engine = build_nonthinker_engine(path, batch_size=args.batch_size)
         results = evaluate_positions(engine, positions, batch_size=engine.optimal_batch_size)
         all_results[label] = results
         del engine

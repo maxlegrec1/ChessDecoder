@@ -19,11 +19,11 @@ namespace decoder
 /// Uses two KV caches:
 /// - Causal KV cache (inside TorchCausalBackbone): for autoregressive board generation
 /// - Prefix KV cache (inside TorchCausalBackbone): for incremental move/value prediction
-class ThinkingInferenceEngine
+class ThinkingSingleInferenceEngine
 {
 public:
     /// Construct engine from exported TorchScript backbone + weights.
-    ThinkingInferenceEngine(
+    ThinkingSingleInferenceEngine(
         const std::string& backbone_pt_path,
         const std::string& weights_dir,
         const std::string& vocab_path,

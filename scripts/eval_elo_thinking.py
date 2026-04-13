@@ -21,7 +21,7 @@ def main():
     args = parser.parse_args()
 
     export = Path(args.export_dir)
-    engine = cpp.ThinkingInferenceEngine(
+    engine = cpp.ThinkingSingleInferenceEngine(
         str(export / "backbone.pt"),
         str(export / "weights"),
         str(export / "vocab.json"),

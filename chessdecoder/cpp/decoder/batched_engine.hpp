@@ -21,10 +21,10 @@ namespace decoder
 ///
 /// No CUDA graphs — batching provides sufficient GPU utilization.
 /// No subprocess workers — runs in the main process.
-class BatchedInferenceEngine
+class ThinkingBatchedInferenceEngine
 {
 public:
-    BatchedInferenceEngine(const std::string& backbone_pt_path,
+    ThinkingBatchedInferenceEngine(const std::string& backbone_pt_path,
                            const std::string& weights_dir,
                            const std::string& vocab_path,
                            const std::string& config_path,
@@ -47,7 +47,7 @@ public:
     std::vector<Result> predictMoves(const std::vector<std::string>& fens,
                                      float temperature);
 
-    // Temperature controls (same semantics as ThinkingInferenceEngine)
+    // Temperature controls (same semantics as ThinkingSingleInferenceEngine)
     float board_temperature = 0.0f;
     float think_temperature = -1.0f;
     float policy_temperature = -1.0f;

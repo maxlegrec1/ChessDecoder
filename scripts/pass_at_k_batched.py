@@ -72,13 +72,13 @@ def main():
     parser.add_argument("--d-temp", type=float, default=0.0)
     args = parser.parse_args()
 
-    single = cpp.ThinkingInferenceEngine(
+    single = cpp.ThinkingSingleInferenceEngine(
         f"{args.export_dir}/backbone.pt",
         f"{args.export_dir}/weights",
         f"{args.export_dir}/vocab.json",
         f"{args.export_dir}/config.json",
     )
-    batched = cpp.BatchedInferenceEngine(
+    batched = cpp.ThinkingBatchedInferenceEngine(
         f"{args.export_dir}/backbone.pt",
         f"{args.export_dir}/weights",
         f"{args.export_dir}/vocab.json",

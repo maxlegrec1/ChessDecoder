@@ -45,7 +45,7 @@ int readJsonInt(const std::string& json, const std::string& key)
 // Constructor
 // ============================================================================
 
-ThinkingInferenceEngine::ThinkingInferenceEngine(
+ThinkingSingleInferenceEngine::ThinkingSingleInferenceEngine(
     const std::string& backbone_pt_path,
     const std::string& weights_dir,
     const std::string& vocab_path,
@@ -134,7 +134,7 @@ ThinkingInferenceEngine::ThinkingInferenceEngine(
 // Causal forward helpers
 // ============================================================================
 
-std::vector<float> ThinkingInferenceEngine::causalPrefill()
+std::vector<float> ThinkingSingleInferenceEngine::causalPrefill()
 {
     int S = static_cast<int>(token_ids_.size());
     std::vector<int64_t> input_ids(S);
@@ -172,7 +172,7 @@ std::vector<float> ThinkingInferenceEngine::causalPrefill()
 // Prefix mask & sampling
 // ============================================================================
 
-void ThinkingInferenceEngine::buildPrefixMask(std::vector<float>& mask) const
+void ThinkingSingleInferenceEngine::buildPrefixMask(std::vector<float>& mask) const
 {
     int S = static_cast<int>(token_ids_.size());
 
@@ -187,7 +187,7 @@ void ThinkingInferenceEngine::buildPrefixMask(std::vector<float>& mask) const
     }
 }
 
-int ThinkingInferenceEngine::sampleToken(const float* logits, int vocab_size, float temperature) const
+int ThinkingSingleInferenceEngine::sampleToken(const float* logits, int vocab_size, float temperature) const
 {
     if (temperature <= 0.0f)
     {
@@ -214,7 +214,7 @@ int ThinkingInferenceEngine::sampleToken(const float* logits, int vocab_size, fl
 // Fallback move (no thinking)
 // ============================================================================
 
-std::string ThinkingInferenceEngine::fallbackMove(const std::string& fen, float temperature)
+std::string ThinkingSingleInferenceEngine::fallbackMove(const std::string& fen, float temperature)
 {
     token_ids_.clear();
     block_ids_.clear();
@@ -267,7 +267,7 @@ std::string ThinkingInferenceEngine::fallbackMove(const std::string& fen, float 
     return DecoderVocab::pseudoToStandardUci(vocab_->idxToToken(full_idx));
 }
 
-std::string ThinkingInferenceEngine::predictMoveRoot(const std::string& fen, float temperature)
+std::string ThinkingSingleInferenceEngine::predictMoveRoot(const std::string& fen, float temperature)
 {
     return fallbackMove(fen, temperature);
 }
@@ -276,7 +276,7 @@ std::string ThinkingInferenceEngine::predictMoveRoot(const std::string& fen, flo
 // Main inference: predictMove
 // ============================================================================
 
-std::string ThinkingInferenceEngine::predictMove(const std::string& fen, float temperature)
+std::string ThinkingSingleInferenceEngine::predictMove(const std::string& fen, float temperature)
 {
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -685,7 +685,7 @@ exit_loop:
 // GPU head evaluation
 // ============================================================================
 
-int ThinkingInferenceEngine::evalThinkingPolicyHeadGpu(float temperature)
+int ThinkingSingleInferenceEngine::evalThinkingPolicyHeadGpu(float temperature)
 {
     auto h = saved_prefix_hidden_gpu_.view({1, embed_dim_});
     auto logits = torch::mm(h, think_policy_w_gpu_t_) + think_policy_b_gpu_;
@@ -696,7 +696,7 @@ int ThinkingInferenceEngine::evalThinkingPolicyHeadGpu(float temperature)
     return sampleToken(logits_cpu.data_ptr<float>(), heads_->moveVocabSize(), temperature);
 }
 
-int ThinkingInferenceEngine::evalPolicyHeadGpu(float temperature, const std::vector<int>& legal_indices)
+int ThinkingSingleInferenceEngine::evalPolicyHeadGpu(float temperature, const std::vector<int>& legal_indices)
 {
     auto h = saved_prefix_hidden_gpu_.view({1, embed_dim_});
     auto logits_gpu = torch::mm(h, policy_w_gpu_t_) + policy_b_gpu_;
@@ -716,7 +716,7 @@ int ThinkingInferenceEngine::evalPolicyHeadGpu(float temperature, const std::vec
     return sampleToken(logits_ptr, mvs, temperature);
 }
 
-float ThinkingInferenceEngine::predictWlGpu(float temperature)
+float ThinkingSingleInferenceEngine::predictWlGpu(float temperature)
 {
     auto h = saved_prefix_hidden_gpu_.view({1, embed_dim_});
     auto hidden = torch::mm(h, wl_w1_gpu_t_) + wl_b1_gpu_;
@@ -732,7 +732,7 @@ float ThinkingInferenceEngine::predictWlGpu(float temperature)
     return wl_centers_gpu_[idx].item<float>();
 }
 
-float ThinkingInferenceEngine::predictDGpu(float temperature)
+float ThinkingSingleInferenceEngine::predictDGpu(float temperature)
 {
     auto h = saved_prefix_hidden_gpu_.view({1, embed_dim_});
     auto hidden = torch::mm(h, d_w1_gpu_t_) + d_b1_gpu_;

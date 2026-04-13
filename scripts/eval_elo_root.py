@@ -14,7 +14,7 @@ from chessdecoder.eval.elo_eval import model_vs_stockfish
 
 
 class RootPolicyEngine:
-    """Wraps ThinkingInferenceEngine to only use root policy (no thinking)."""
+    """Wraps ThinkingSingleInferenceEngine to only use root policy (no thinking)."""
 
     def __init__(self, engine):
         self._engine = engine
@@ -32,7 +32,7 @@ def main():
     args = parser.parse_args()
 
     export_dir = Path(args.export_dir)
-    engine = cpp.ThinkingInferenceEngine(
+    engine = cpp.ThinkingSingleInferenceEngine(
         str(export_dir / "backbone.pt"),
         str(export_dir / "weights"),
         str(export_dir / "vocab.json"),

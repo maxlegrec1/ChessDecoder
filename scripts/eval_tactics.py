@@ -35,7 +35,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
 
 from pathlib import Path
 
-from chessdecoder.eval.engine import build_batched_engine
+from chessdecoder.eval.engine import build_thinking_batched_engine, build_nonthinker_engine
 from chessdecoder.eval.tactics import (
     Aggregate,
     PuzzleResult,
@@ -132,9 +132,13 @@ def main():
     parser.add_argument("--puzzles-csv", default="data/lichess_db_puzzle.csv",
                         help="Path to the decompressed Lichess CSV.")
     parser.add_argument("--export-dir",
-                        help="Single model export dir. Shorthand for --exports DIR=model.")
+                        help="Single thinking-model export dir. Shorthand for --exports DIR=model.")
     parser.add_argument("--exports", nargs="+", default=[],
-                        help="Multiple model specs: path[=label] path[=label] ...")
+                        help="Multiple thinking-model specs: path[=label] ...")
+    parser.add_argument("--checkpoint",
+                        help="Single non-thinking checkpoint (.pt). Shorthand for --checkpoints PATH=model.")
+    parser.add_argument("--checkpoints", nargs="+", default=[],
+                        help="Multiple non-thinking checkpoint specs: path[=label] ...")
     parser.add_argument("--max-puzzles", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -161,14 +165,21 @@ def main():
 
     args = parser.parse_args()
 
-    # Resolve export specs
+    # Resolve export specs (thinking models) and checkpoint specs (non-thinking)
     export_specs: list[tuple[str, str]] = []
     if args.export_dir:
         export_specs.append((args.export_dir, Path(args.export_dir).name))
     for s in args.exports:
         export_specs.append(parse_export_spec(s))
-    if not export_specs and not args.list_themes:
-        parser.error("provide --export-dir or --exports")
+
+    checkpoint_specs: list[tuple[str, str]] = []
+    if args.checkpoint:
+        checkpoint_specs.append(parse_export_spec(args.checkpoint))
+    for s in args.checkpoints:
+        checkpoint_specs.append(parse_export_spec(s))
+
+    if not export_specs and not checkpoint_specs and not args.list_themes:
+        parser.error("provide --export-dir/--exports or --checkpoint/--checkpoints")
 
     # Load puzzles
     rating_range = None
@@ -209,11 +220,17 @@ def main():
     # Run each model on the same puzzle set
     all_results: dict[str, list[PuzzleResult]] = {}
     for path, label in export_specs:
-        print(f"\n--- Running {label} ({path}) ---")
-        engine = build_batched_engine(path, args.batch_size)
+        print(f"\n--- Running {label} ({path}) [thinking/C++] ---")
+        engine = build_thinking_batched_engine(path, args.batch_size)
         results = evaluate_puzzles(engine, puzzles, batch_size=engine.optimal_batch_size)
         all_results[label] = results
         del engine  # free GPU before next model
+    for path, label in checkpoint_specs:
+        print(f"\n--- Running {label} ({path}) [non-thinking/Python] ---")
+        engine = build_nonthinker_engine(path, batch_size=args.batch_size)
+        results = evaluate_puzzles(engine, puzzles, batch_size=engine.optimal_batch_size)
+        all_results[label] = results
+        del engine
 
     # Per-model bucketed report
     for label, results in all_results.items():

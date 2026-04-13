@@ -40,7 +40,7 @@ def _run_rollouts_subprocess(export_dir: str, fens_json_path: str, results_path:
     policy_temp = data["policy_temperature"]
     board_temp = data["board_temperature"]
 
-    engine = cpp.BatchedInferenceEngine(
+    engine = cpp.ThinkingBatchedInferenceEngine(
         str(Path(export_dir) / "backbone.pt"),
         str(Path(export_dir) / "weights"),
         str(Path(export_dir) / "vocab.json"),

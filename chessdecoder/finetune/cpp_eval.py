@@ -28,7 +28,7 @@ def _run_inference(tmp_dir, var_positions_json, pt_positions_json, results_path)
     var_positions = json.loads(var_positions_json)
     pt_positions = json.loads(pt_positions_json)
 
-    engine = cpp.ThinkingInferenceEngine(
+    engine = cpp.ThinkingSingleInferenceEngine(
         str(Path(tmp_dir) / "backbone.pt"),
         str(Path(tmp_dir) / "weights"),
         str(Path(tmp_dir) / "vocab.json"),

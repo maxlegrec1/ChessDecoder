@@ -14,7 +14,7 @@ namespace decoder
 // Construction: load model, upload head weights to GPU
 // ============================================================================
 
-BatchedInferenceEngine::BatchedInferenceEngine(
+ThinkingBatchedInferenceEngine::ThinkingBatchedInferenceEngine(
     const std::string& backbone_pt_path,
     const std::string& weights_dir,
     const std::string& vocab_path,
@@ -122,7 +122,7 @@ BatchedInferenceEngine::BatchedInferenceEngine(
 // Head evaluations (batched, GPU)
 // ============================================================================
 
-torch::Tensor BatchedInferenceEngine::sampleBatched(torch::Tensor logits, float temp)
+torch::Tensor ThinkingBatchedInferenceEngine::sampleBatched(torch::Tensor logits, float temp)
 {
     // logits: [B, V] FP16 on CUDA — cast to FP32 to avoid Inf/NaN from FP16 overflow
     auto logits_f32 = logits.to(torch::kFloat32);
@@ -136,21 +136,21 @@ torch::Tensor BatchedInferenceEngine::sampleBatched(torch::Tensor logits, float 
     return torch::multinomial(probs, /*num_samples=*/1).squeeze(1);  // [B]
 }
 
-torch::Tensor BatchedInferenceEngine::evalThinkingPolicyHead(torch::Tensor h, float temp)
+torch::Tensor ThinkingBatchedInferenceEngine::evalThinkingPolicyHead(torch::Tensor h, float temp)
 {
     // h: [B, E] FP16 → logits [B, move_vocab] → sub_idx [B]
     auto logits = torch::mm(h, think_w_t_) + think_b_;
     return sampleBatched(logits, temp);  // [B] move sub-vocab indices
 }
 
-torch::Tensor BatchedInferenceEngine::evalBoardHead(torch::Tensor h, float temp)
+torch::Tensor ThinkingBatchedInferenceEngine::evalBoardHead(torch::Tensor h, float temp)
 {
     // h: [B, E] FP16 → logits [B, board_vocab]
     auto logits = torch::mm(h, board_w_t_) + board_b_;
     return sampleBatched(logits, temp);  // [B] board sub-vocab indices
 }
 
-torch::Tensor BatchedInferenceEngine::evalWlHead(torch::Tensor h, float temp)
+torch::Tensor ThinkingBatchedInferenceEngine::evalWlHead(torch::Tensor h, float temp)
 {
     // h: [B, E] → MLP → [B, n_buckets] → sample → bucket center values [B]
     auto hidden = torch::mm(h, wl_w1_t_) + wl_b1_;
@@ -160,7 +160,7 @@ torch::Tensor BatchedInferenceEngine::evalWlHead(torch::Tensor h, float temp)
     return wl_centers_.index({idx});  // [B] float values
 }
 
-torch::Tensor BatchedInferenceEngine::evalDHead(torch::Tensor h, float temp)
+torch::Tensor ThinkingBatchedInferenceEngine::evalDHead(torch::Tensor h, float temp)
 {
     auto hidden = torch::mm(h, d_w1_t_) + d_b1_;
     hidden = torch::mish(hidden);
@@ -170,7 +170,7 @@ torch::Tensor BatchedInferenceEngine::evalDHead(torch::Tensor h, float temp)
 }
 
 std::pair<torch::Tensor, torch::Tensor>
-BatchedInferenceEngine::evalPolicyHead(
+ThinkingBatchedInferenceEngine::evalPolicyHead(
     torch::Tensor h, float temp,
     const std::vector<std::string>& fens)
 {
@@ -208,8 +208,8 @@ BatchedInferenceEngine::evalPolicyHead(
 // Main inference: predictMoves (lockstep state machine)
 // ============================================================================
 
-std::vector<BatchedInferenceEngine::Result>
-BatchedInferenceEngine::predictMoves(
+std::vector<ThinkingBatchedInferenceEngine::Result>
+ThinkingBatchedInferenceEngine::predictMoves(
     const std::vector<std::string>& fens, float temperature)
 {
     auto t0 = std::chrono::high_resolution_clock::now();
