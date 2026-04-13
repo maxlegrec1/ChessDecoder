@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from chessdecoder.eval.bagz import iter_action_value_records
+from chessdecoder.eval.stats import bootstrap_ci_mean, wilson_ci
 from chessdecoder.utils.uci import normalize_castling
 
 
@@ -163,41 +164,6 @@ def evaluate_positions(
 
 
 BLUNDER_THRESHOLD = 0.20  # Δwin% > 20 absolute pp counts as a blunder.
-
-
-def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Wilson 95% CI for a binomial proportion."""
-    if n == 0:
-        return 0.0, 0.0
-    p = k / n
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return max(0.0, center - half), min(1.0, center + half)
-
-
-def bootstrap_ci_mean(
-    values: list[float],
-    *,
-    n_resamples: int = 2000,
-    alpha: float = 0.05,
-    seed: int = 0,
-) -> tuple[float, float]:
-    """Percentile bootstrap CI for the mean of a flat list."""
-    if not values:
-        return 0.0, 0.0
-    rng = random.Random(seed)
-    n = len(values)
-    means = []
-    for _ in range(n_resamples):
-        s = 0.0
-        for _ in range(n):
-            s += values[rng.randrange(n)]
-        means.append(s / n)
-    means.sort()
-    lo_idx = int(math.floor(n_resamples * alpha / 2))
-    hi_idx = int(math.ceil(n_resamples * (1 - alpha / 2))) - 1
-    return means[lo_idx], means[min(hi_idx, n_resamples - 1)]
 
 
 @dataclass

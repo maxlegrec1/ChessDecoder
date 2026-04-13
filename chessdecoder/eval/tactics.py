@@ -29,13 +29,14 @@ read as a consistent comparative proxy, not absolute puzzle strength.
 from __future__ import annotations
 
 import csv
-import math
 import random
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import chess
+
+from chessdecoder.eval.stats import wilson_ci
 
 from chessdecoder.utils.uci import normalize_castling
 
@@ -298,17 +299,6 @@ def evaluate_puzzles(
 # --------------------------------------------------------------------------
 # Aggregation
 # --------------------------------------------------------------------------
-
-
-def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Wilson 95% CI for a binomial proportion."""
-    if n == 0:
-        return 0.0, 0.0
-    p = k / n
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return max(0.0, center - half), min(1.0, center + half)
 
 
 @dataclass

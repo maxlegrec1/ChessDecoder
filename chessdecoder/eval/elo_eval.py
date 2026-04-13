@@ -4,9 +4,10 @@ import bulletchess
 from bulletchess import CHECKMATE, DRAW
 from datetime import datetime
 from tqdm import tqdm
-from math import log10
 import os
 import shutil
+
+from chessdecoder.eval.stats import estimate_elo, win_rate as _win_rate
 
 _PROJECT_STOCKFISH = os.path.join(os.path.dirname(__file__), "..", "..", "bin", "stockfish")
 STOCKFISH_PATH = _PROJECT_STOCKFISH if os.path.isfile(_PROJECT_STOCKFISH) else shutil.which("stockfish")
@@ -18,18 +19,6 @@ def get_stockfish_move(engine_obj, bullet_board):
     ch_board = chess.Board(bullet_board.fen())
     result = engine_obj.play(ch_board, engine.Limit(time=0.1))
     return bulletchess.Move.from_uci(result.move.uci())
-
-
-def estimate_elo(win_rate, stockfish_elo):
-    if win_rate == 0:
-        return 0
-    elif win_rate == 1:
-        return 2500
-    if win_rate == 0.5: # Avoid log10(1) which is 0, leading to division by zero if win_rate makes (1-win_rate)/win_rate = 1
-        return stockfish_elo
-    if win_rate > 0 and win_rate < 1: # ensure win_rate is not 0 or 1 to avoid math errors with log10
-        return stockfish_elo - 400 * (log10((1 - win_rate) / win_rate))
-    return "N/A"
 
 
 
@@ -175,7 +164,7 @@ def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperatur
                 games_played += 1
                 
                 # Update progress bar description with current win rate and throughput
-                current_win_rate = (wins + 0.5 * draws) / (i + 1)
+                current_win_rate = _win_rate(wins, draws, i + 1)
                 desc = f"Win: {current_win_rate * 100:.1f}%"
                 if hasattr(model, 'total_time') and model.total_time > 0:
                     tok_s = model.total_tokens / model.total_time
@@ -189,7 +178,7 @@ def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperatur
 
     print(f"Model wins: {wins}, Draws: {draws}, Losses: {num_games - wins - draws} out of {num_games} games.")
     if num_games > 0:
-        win_rate = (wins + 0.5 * draws) / num_games
+        win_rate = _win_rate(wins, draws, num_games)
         estimated_elo = estimate_elo(win_rate, elo)
         print(f"Win rate against Stockfish ELO {elo}: {win_rate * 100:.2f}%")
         print(f"Estimated model ELO: {estimated_elo}")

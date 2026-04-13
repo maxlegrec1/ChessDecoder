@@ -35,8 +35,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
 
 from pathlib import Path
 
-import _decoder_inference_cpp as cpp
-
+from chessdecoder.eval.engine import build_batched_engine
 from chessdecoder.eval.tactics import (
     Aggregate,
     PuzzleResult,
@@ -59,20 +58,6 @@ DEFAULT_REPORT_THEMES = [
     "endgame", "middlegame", "opening",
     "short", "long",
 ]
-
-
-def build_engine(export_dir: str, batch_size: int):
-    engine = cpp.BatchedInferenceEngine(
-        f"{export_dir}/backbone.pt",
-        f"{export_dir}/weights",
-        f"{export_dir}/vocab.json",
-        f"{export_dir}/config.json",
-        batch_size,
-    )
-    for attr in ("board_temperature", "think_temperature",
-                 "policy_temperature", "wl_temperature", "d_temperature"):
-        setattr(engine, attr, 0.0)
-    return engine
 
 
 def parse_export_spec(spec: str) -> tuple[str, str]:
@@ -225,8 +210,8 @@ def main():
     all_results: dict[str, list[PuzzleResult]] = {}
     for path, label in export_specs:
         print(f"\n--- Running {label} ({path}) ---")
-        engine = build_engine(path, args.batch_size)
-        results = evaluate_puzzles(engine, puzzles, batch_size=args.batch_size)
+        engine = build_batched_engine(path, args.batch_size)
+        results = evaluate_puzzles(engine, puzzles, batch_size=engine.optimal_batch_size)
         all_results[label] = results
         del engine  # free GPU before next model
 

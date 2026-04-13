@@ -12,8 +12,8 @@ from chessdecoder.eval.tactics import (
     bucket_by_theme,
     evaluate_puzzles,
     load_puzzles,
-    wilson_ci,
 )
+from chessdecoder.eval.stats import wilson_ci
 
 
 # ---------------------------------------------------------------------------

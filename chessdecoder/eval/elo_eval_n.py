@@ -12,9 +12,10 @@ import bulletchess
 from bulletchess import CHECKMATE, DRAW
 from datetime import datetime
 from tqdm import tqdm
-from math import log10
 import os
 import shutil
+
+from chessdecoder.eval.stats import estimate_elo, win_rate as _win_rate
 
 _PROJECT_STOCKFISH = os.path.join(os.path.dirname(__file__), "..", "..", "bin", "stockfish")
 STOCKFISH_PATH = _PROJECT_STOCKFISH if os.path.isfile(_PROJECT_STOCKFISH) else shutil.which("stockfish")
@@ -27,19 +28,6 @@ def get_stockfish_move(engine_obj, bullet_board):
     ch_board = chess.Board(bullet_board.fen())
     result = engine_obj.play(ch_board, engine.Limit(time=0.1))
     return bulletchess.Move.from_uci(result.move.uci())
-
-
-def estimate_elo(win_rate, stockfish_elo):
-    """Estimate model ELO based on win rate against Stockfish."""
-    if win_rate == 0:
-        return 0
-    elif win_rate == 1:
-        return 2500
-    if win_rate == 0.5:
-        return stockfish_elo
-    if win_rate > 0 and win_rate < 1:
-        return stockfish_elo - 400 * (log10((1 - win_rate) / win_rate))
-    return "N/A"
 
 
 class WLDCache:
@@ -354,7 +342,7 @@ def model_vs_stockfish_n(model=None, model_name="run", num_games=1, max_n=5,
                 save_pgn_game(pgn_game, pgn_filename)
                 games_played += 1
 
-                current_win_rate = (wins + 0.5 * draws) / (i + 1)
+                current_win_rate = _win_rate(wins, draws, i + 1)
                 pbar.set_description(f"Model (n={max_n}) vs Stockfish (WR: {current_win_rate * 100:.1f}%)")
 
     except Exception as e:
@@ -366,7 +354,7 @@ def model_vs_stockfish_n(model=None, model_name="run", num_games=1, max_n=5,
     win_rate = 0
     estimated_model_elo = "N/A"
     if num_games > 0:
-        win_rate = (wins + 0.5 * draws) / num_games
+        win_rate = _win_rate(wins, draws, num_games)
         estimated_model_elo = estimate_elo(win_rate, elo)
         print(f"Win rate against Stockfish ELO {elo}: {win_rate * 100:.2f}%")
         print(f"Estimated model ELO: {estimated_model_elo}")

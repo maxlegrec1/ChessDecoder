@@ -29,8 +29,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
 
 from pathlib import Path
 
-import _decoder_inference_cpp as cpp
-
+from chessdecoder.eval.engine import build_batched_engine
 from chessdecoder.eval.cpl import (
     PositionResult,
     aggregate,
@@ -45,20 +44,6 @@ from chessdecoder.eval.cpl import (
 
 DEFAULT_BEST_WP_BUCKETS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0001]
 DEFAULT_NUM_LEGAL_BUCKETS = [2, 10, 20, 30, 40, 100]
-
-
-def build_engine(export_dir: str, batch_size: int):
-    engine = cpp.BatchedInferenceEngine(
-        f"{export_dir}/backbone.pt",
-        f"{export_dir}/weights",
-        f"{export_dir}/vocab.json",
-        f"{export_dir}/config.json",
-        batch_size,
-    )
-    for attr in ("board_temperature", "think_temperature",
-                 "policy_temperature", "wl_temperature", "d_temperature"):
-        setattr(engine, attr, 0.0)
-    return engine
 
 
 def parse_export_spec(spec: str) -> tuple[str, str]:
@@ -183,8 +168,8 @@ def main():
     all_results: dict[str, list[PositionResult]] = {}
     for path, label in export_specs:
         print(f"\n--- Running {label} ({path}) ---")
-        engine = build_engine(path, args.batch_size)
-        results = evaluate_positions(engine, positions, batch_size=args.batch_size)
+        engine = build_batched_engine(path, args.batch_size)
+        results = evaluate_positions(engine, positions, batch_size=engine.optimal_batch_size)
         all_results[label] = results
         del engine
 

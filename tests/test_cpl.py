@@ -17,15 +17,14 @@ from chessdecoder.eval.cpl import (
     Position,
     PositionResult,
     aggregate,
-    bootstrap_ci_mean,
     bucket_by_best_winprob,
     bucket_by_num_legal,
     evaluate_positions,
     load_positions,
     mcnemar_pvalue,
     paired_delta_winprob_ci,
-    wilson_ci,
 )
+from chessdecoder.eval.stats import bootstrap_ci_mean, wilson_ci
 
 
 # ---------------------------------------------------------------------------
