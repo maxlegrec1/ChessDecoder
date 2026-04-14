@@ -462,10 +462,11 @@ class ChessDecoder(nn.Module):
         block_id = torch.tensor(block_ids, dtype=torch.long).unsqueeze(0).to(device)
         seq_len = input_ids.shape[1]
 
+        param_dtype = next(self.parameters()).dtype
         wl_positions_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
         d_positions_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
-        wl_fourier_input = torch.zeros(1, seq_len, device=device)
-        d_fourier_input = torch.zeros(1, seq_len, device=device)
+        wl_fourier_input = torch.zeros(1, seq_len, dtype=param_dtype, device=device)
+        d_fourier_input = torch.zeros(1, seq_len, dtype=param_dtype, device=device)
 
         wl_values_list = []
         d_values_list = []
