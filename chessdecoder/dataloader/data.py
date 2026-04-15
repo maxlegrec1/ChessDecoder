@@ -50,7 +50,7 @@ def fen_to_position_tokens(fen: str):
 
 def game_to_token_ids(game_df, skip_board_prob=0.0):
     sequence = []
-    wdl_data = []  # (move_idx, best_move, wdl, is_valid_wdl) - legacy, kept for move targets
+    move_target_data = []  # (move_idx, best_move) — policy head supervision
     block_boundaries = []  # [(start_idx, end_idx), ...] for each board block
     value_data = []  # (wl_pos, d_pos, wl, d, is_valid_wdl)
 
@@ -71,13 +71,7 @@ def game_to_token_ids(game_df, skip_board_prob=0.0):
                 block_boundaries.append((block_start_idx, move_idx))
 
             best_move = row.best_move
-
-            # WDL for move target (still best_move / best_q convention)
-            win = row.win if pd.notna(row.win) else 0.0
-            draw = row.draw if pd.notna(row.draw) else 0.0
-            loss = row.loss if pd.notna(row.loss) else 0.0
-            wdl = [win, draw, loss]
-            wdl_data.append((move_idx, best_move, wdl, pd.notna(row.win)))
+            move_target_data.append((move_idx, best_move))
 
             # Append WL and D placeholder tokens
             wl_pos = len(sequence)
@@ -100,4 +94,4 @@ def game_to_token_ids(game_df, skip_board_prob=0.0):
             value_data.append((wl_pos, d_pos, wl, d, is_valid_wdl))
 
     ids = [token_to_idx[t] for t in sequence]
-    return ids, wdl_data, block_boundaries, value_data
+    return ids, move_target_data, block_boundaries, value_data

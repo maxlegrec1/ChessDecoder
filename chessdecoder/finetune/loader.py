@@ -144,7 +144,7 @@ class FinetuneIterableDataset(IterableDataset):
                 for game_id in game_ids:
                     game_df = grouped.get_group(game_id).sort_values('ply')
 
-                    ids, wdl_data, block_boundaries, value_data = game_to_token_ids(
+                    ids, move_target_data, block_boundaries, value_data = game_to_token_ids(
                         game_df, skip_board_prob=self.skip_board_prob
                     )
 
@@ -153,9 +153,9 @@ class FinetuneIterableDataset(IterableDataset):
                     start_idx = random.choice(valid_starts)
 
                     ids = ids[start_idx:]
-                    wdl_data = [(m_idx - start_idx, best, wdl, valid)
-                                for m_idx, best, wdl, valid in wdl_data
-                                if m_idx >= start_idx]
+                    move_target_data = [(m_idx - start_idx, best)
+                                        for m_idx, best in move_target_data
+                                        if m_idx >= start_idx]
                     value_data = [(wl_pos - start_idx, d_pos - start_idx, wl, d, valid)
                                   for wl_pos, d_pos, wl, d, valid in value_data
                                   if d_pos >= start_idx]
@@ -169,7 +169,7 @@ class FinetuneIterableDataset(IterableDataset):
                     # Truncate
                     if len(ids) > self.max_seq_len:
                         ids = ids[:self.max_seq_len]
-                        wdl_data = [d for d in wdl_data if d[0] < self.max_seq_len]
+                        move_target_data = [d for d in move_target_data if d[0] < self.max_seq_len]
                         value_data = [vd for vd in value_data if vd[1] < self.max_seq_len]
                         adjusted_boundaries = [(s, min(e, self.max_seq_len))
                                                for (s, e) in adjusted_boundaries
@@ -180,9 +180,9 @@ class FinetuneIterableDataset(IterableDataset):
                     valid_move_indices = set()
                     for vd in value_data:
                         valid_move_indices.add(vd[0] - 1)
-                    wdl_data = [d for d in wdl_data if d[0] in valid_move_indices]
+                    move_target_data = [d for d in move_target_data if d[0] in valid_move_indices]
 
-                    yield self._build_pretrain_tensors(ids, wdl_data, value_data, adjusted_boundaries)
+                    yield self._build_pretrain_tensors(ids, move_target_data, value_data, adjusted_boundaries)
 
             except Exception as e:
                 print(f"Error reading pretrain file {file_path}: {e}")
@@ -258,7 +258,7 @@ class FinetuneIterableDataset(IterableDataset):
                 print(f"Error reading variation file {file_path}: {e}")
                 continue
 
-    def _build_pretrain_tensors(self, ids, wdl_data, value_data, block_boundaries):
+    def _build_pretrain_tensors(self, ids, move_target_data, value_data, block_boundaries):
         """Build tensor dict for a pretrain sample (identical to ChessIterableDataset)."""
         seq_len = len(ids)
         IGNORE_INDEX = -100
@@ -284,7 +284,7 @@ class FinetuneIterableDataset(IterableDataset):
 
         # Move targets: override stm positions with generic_move + move sub-vocab target
         generic_move_board_idx = board_token_to_idx["generic_move"]
-        for move_idx, best_move, wdl, is_valid_wdl in wdl_data:
+        for move_idx, best_move in move_target_data:
             stm_pos = move_idx - 1
             if 0 <= stm_pos < self.max_seq_len:
                 board_target_ids[stm_pos] = generic_move_board_idx

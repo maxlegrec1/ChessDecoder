@@ -73,7 +73,7 @@ def test_game_to_token_ids_basic():
          "win": 0.4, "draw": 0.4, "loss": 0.2, "ply": 1},
     ]
     game_df = pd.DataFrame(data)
-    ids, wdl_data, block_boundaries, value_data = game_to_token_ids(game_df)
+    ids, move_target_data, block_boundaries, value_data = game_to_token_ids(game_df)
 
     # All IDs valid
     for tid in ids:

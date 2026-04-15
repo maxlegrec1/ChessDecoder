@@ -66,7 +66,7 @@ class ChessIterableDataset(IterableDataset):
                 for game_id in game_ids:
                     game_df = grouped.get_group(game_id).sort_values('ply')
 
-                    ids, wdl_data, block_boundaries, value_data = game_to_token_ids(
+                    ids, move_target_data, block_boundaries, value_data = game_to_token_ids(
                         game_df, skip_board_prob=self.skip_board_prob
                     )
 
@@ -78,10 +78,10 @@ class ChessIterableDataset(IterableDataset):
                     # Slice the sequence
                     ids = ids[start_idx:]
 
-                    # Adjust wdl_data (move targets)
-                    wdl_data = [(m_idx - start_idx, best, wdl, valid)
-                                for m_idx, best, wdl, valid in wdl_data
-                                if m_idx >= start_idx]
+                    # Adjust move_target_data
+                    move_target_data = [(m_idx - start_idx, best)
+                                        for m_idx, best in move_target_data
+                                        if m_idx >= start_idx]
 
                     # Adjust value_data
                     value_data = [(wl_pos - start_idx, d_pos - start_idx, wl, d, valid)
@@ -99,7 +99,7 @@ class ChessIterableDataset(IterableDataset):
                     # Truncate if necessary
                     if len(ids) > self.max_seq_len:
                         ids = ids[:self.max_seq_len]
-                        wdl_data = [d for d in wdl_data if d[0] < self.max_seq_len]
+                        move_target_data = [d for d in move_target_data if d[0] < self.max_seq_len]
                         value_data = [vd for vd in value_data if vd[1] < self.max_seq_len]
                         adjusted_boundaries = [(b_start, min(b_end, self.max_seq_len))
                                                for (b_start, b_end) in adjusted_boundaries
@@ -116,7 +116,7 @@ class ChessIterableDataset(IterableDataset):
                     for vd in value_data:
                         # wl_pos = move_idx + 1, so move_idx = wl_pos - 1
                         valid_move_indices.add(vd[0] - 1)
-                    wdl_data = [d for d in wdl_data if d[0] in valid_move_indices]
+                    move_target_data = [d for d in move_target_data if d[0] in valid_move_indices]
 
                     seq_len = len(ids)
                     IGNORE_INDEX = -100
@@ -141,7 +141,7 @@ class ChessIterableDataset(IterableDataset):
 
                     # Process move targets: override stm positions with generic_move + move sub-vocab target
                     generic_move_board_idx = board_token_to_idx["generic_move"]
-                    for move_idx, best_move, wdl, is_valid_wdl in wdl_data:
+                    for move_idx, best_move in move_target_data:
                         stm_pos = move_idx - 1
                         if 0 <= stm_pos < self.max_seq_len:
                             board_target_ids[stm_pos] = generic_move_board_idx
