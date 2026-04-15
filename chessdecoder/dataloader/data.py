@@ -72,15 +72,12 @@ def game_to_token_ids(game_df, skip_board_prob=0.0):
 
             best_move = row.best_move
 
-            # Handle WDL NaNs
+            # WDL for move target (still best_move / best_q convention)
             win = row.win if pd.notna(row.win) else 0.0
             draw = row.draw if pd.notna(row.draw) else 0.0
             loss = row.loss if pd.notna(row.loss) else 0.0
-
-            is_valid_wdl = pd.notna(row.win) and pd.notna(row.draw) and pd.notna(row.loss)
-
             wdl = [win, draw, loss]
-            wdl_data.append((move_idx, best_move, wdl, is_valid_wdl))
+            wdl_data.append((move_idx, best_move, wdl, pd.notna(row.win)))
 
             # Append WL and D placeholder tokens
             wl_pos = len(sequence)
@@ -88,9 +85,17 @@ def game_to_token_ids(game_df, skip_board_prob=0.0):
             d_pos = len(sequence)
             sequence.append("d_value")
 
-            # Compute WL and D targets
-            wl = win - loss   # WL in [-1, 1]
-            d = draw          # D in [0, 1]
+            # WL/D targets: use the played move's Q/D values so the model learns
+            # action-value estimation rather than a position-level state value.
+            # played_q ∈ [-1, 1] is the Leela Q value for the move that was played;
+            # played_d ∈ [0, 1] is its draw probability.
+            # (Previously best_q / best_d were used here — an oversight.)
+            raw_pq = getattr(row, 'played_q', None)
+            raw_pd = getattr(row, 'played_d', None)
+            is_valid_wdl = (raw_pq is not None and pd.notna(raw_pq) and
+                            raw_pd is not None and pd.notna(raw_pd))
+            wl = float(raw_pq) if is_valid_wdl else 0.0   # WL = win - loss = Q
+            d  = float(raw_pd) if is_valid_wdl else 0.0   # D  = draw prob
 
             value_data.append((wl_pos, d_pos, wl, d, is_valid_wdl))
 
