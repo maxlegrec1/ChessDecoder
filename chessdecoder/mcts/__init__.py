@@ -65,11 +65,13 @@ class _BaseMCTS:
 
         q_values = {str(move): float(q) for move, q in dict(q_values_raw).items()}
 
+        backed_up_value = payload.get("backed_up_value")
         return {
             "action": action,
             "policy": policy,
             "q_values": q_values,
             "value": tuple(value) if value is not None else None,
+            "backed_up_value": tuple(backed_up_value) if backed_up_value is not None else None,
         }
 
 class LeelaMCTS(_BaseMCTS):

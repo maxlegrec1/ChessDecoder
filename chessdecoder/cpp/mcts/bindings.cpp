@@ -18,6 +18,7 @@ py::dict summary_to_python(const chessrl::mcts::MctsSummary& summary)
     result["action"] = summary.action;
     result["policy"] = summary.policy;
     result["value"] = summary.value;
+    result["backed_up_value"] = summary.backed_up_value;
 
     py::dict q_values;
     for (const auto& detail : summary.rollouts)

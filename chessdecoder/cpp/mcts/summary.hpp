@@ -40,7 +40,8 @@ struct MctsSummary
 {
     std::string action;
     std::vector<std::pair<std::string, float>> policy;
-    std::array<float, 3> value{{0.0F, 0.0F, 0.0F}};
+    std::array<float, 3> value{{0.0F, 0.0F, 0.0F}};          // raw NN eval at root
+    std::array<float, 3> backed_up_value{{0.0F, 0.0F, 0.0F}}; // MCTS-backed WDL at root
     std::vector<RolloutDetail> rollouts;
     std::vector<VariationLine> variations;
 };

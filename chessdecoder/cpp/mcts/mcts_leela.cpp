@@ -712,6 +712,19 @@ private:
         summary.action = action;
         summary.policy = std::move(sorted);
         summary.value = root.wdl;
+        if (root.visit_count > 0)
+        {
+            const float inv_n   = 1.0F / static_cast<float>(root.visit_count);
+            const float backed_wl = root.value_sum * inv_n;
+            const float backed_d  = root.draw_sum  * inv_n;
+            const float backed_w  = (1.0F + backed_wl - backed_d) * 0.5F;
+            const float backed_l  = (1.0F - backed_wl - backed_d) * 0.5F;
+            summary.backed_up_value = {backed_w, backed_d, backed_l};
+        }
+        else
+        {
+            summary.backed_up_value = root.wdl;
+        }
         summary.rollouts.reserve(aggregated.size());
         for (const auto& entry : aggregated)
         {

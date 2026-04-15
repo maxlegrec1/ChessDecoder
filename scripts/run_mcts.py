@@ -38,8 +38,11 @@ def main():
         max_variation_depth=args.max_depth,
     )
 
-    print(f"Best move  : {result['action']}")
-    print(f"Root value : W={result['value'][0]:.3f}  D={result['value'][1]:.3f}  L={result['value'][2]:.3f}")
+    v    = result['value']
+    bv   = result.get('backed_up_value', v)
+    print(f"Best move      : {result['action']}")
+    print(f"Root raw   wdl : W={v[0]:.3f}  D={v[1]:.3f}  L={v[2]:.3f}  (Q={v[0]-v[2]:+.3f})")
+    print(f"Root backed wdl: W={bv[0]:.3f}  D={bv[1]:.3f}  L={bv[2]:.3f}  (Q={bv[0]-bv[2]:+.3f})")
     print()
 
     print("Top policy moves:")
