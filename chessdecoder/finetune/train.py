@@ -103,6 +103,7 @@ def train():
         max_depth=config["data"].get("max_depth", 5),
         tau_base=config["data"].get("tau_base", 0.3),
         tau_alpha=config["data"].get("tau_alpha", 1.0),
+        use_backed_up_wdl=config["data"].get("use_backed_up_wdl", False),
         seed=seed,
         rank=rank,
         world_size=world_size,

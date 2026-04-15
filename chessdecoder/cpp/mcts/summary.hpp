@@ -22,7 +22,8 @@ struct PVNodeDetail
 {
     std::string fen;
     std::string move;
-    std::array<float, 3> wdl{{0.0F, 0.0F, 0.0F}};
+    std::array<float, 3> wdl{{0.0F, 0.0F, 0.0F}};          // raw NN eval at this node
+    std::array<float, 3> backed_up_wdl{{0.0F, 0.0F, 0.0F}}; // MCTS-backed WDL (averaged over visits)
     int visit_count{0};
 };
 

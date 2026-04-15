@@ -225,7 +225,7 @@ public:
 
     MctsSummary run()
     {
-        evaluate_node(0);
+        (void)evaluate_node(0);  // root expansion — result not backpropagated
         for (int i = 0; i < options_.simulations; ++i)
         {
             run_simulation();
@@ -259,22 +259,23 @@ private:
             if (node.terminal)
             {
                 float value = terminal_value(node.board).value_or(node.value_prior);
-                backpropagate(path, value);
+                float draw  = node.wdl[1];
+                backpropagate(path, value, draw);
                 return;
             }
 
             if (!node.expanded || node.children.empty())
             {
-                float value = evaluate_node(node_index);
-                backpropagate(path, value);
+                auto [value, draw] = evaluate_node(node_index);
+                backpropagate(path, value, draw);
                 return;
             }
 
             const int child_index = select_child(node_index);
             if (child_index < 0)
             {
-                float value = evaluate_node(node_index);
-                backpropagate(path, value);
+                auto [value, draw] = evaluate_node(node_index);
+                backpropagate(path, value, draw);
                 return;
             }
 
@@ -316,7 +317,7 @@ private:
         return best_child;
     }
 
-    void backpropagate(const std::vector<int>& path, float value)
+    void backpropagate(const std::vector<int>& path, float value, float draw)
     {
         float current = value;
         for (auto it = path.rbegin(); it != path.rend(); ++it)
@@ -324,6 +325,7 @@ private:
             TreeNode& node = tree_.nodes[*it];
             node.visit_count += 1;
             node.value_sum += current;
+            node.draw_sum  += draw;   // D is symmetric — no sign flip
             current = -current;
         }
     }
@@ -351,12 +353,13 @@ private:
         return fresh;
     }
 
-    float evaluate_node(int node_index)
+    // Returns {q, draw} for backpropagation.
+    std::pair<float, float> evaluate_node(int node_index)
     {
         TreeNode& node = tree_.nodes[node_index];
         if (node.expanded && !node.children.empty())
         {
-            return node.value_prior;
+            return {node.value_prior, node.wdl[1]};
         }
 
         if (auto terminal = terminal_value(node.board))
@@ -375,7 +378,7 @@ private:
             {
                 node.wdl = {0.0F, 1.0F, 0.0F};
             }
-            return node.value_prior;
+            return {node.value_prior, node.wdl[1]};
         }
 
         const std::vector<std::string> history = history_to_vector(node.history);
@@ -420,7 +423,7 @@ private:
         std::vector<MovePrior> priors = compute_priors(node.board, eval);
         if (priors.empty())
         {
-            return node.value_prior;
+            return {node.value_prior, node.wdl[1]};
         }
 
         if (node.parent == -1 && options_.use_dirichlet)
@@ -440,7 +443,7 @@ private:
         TreeNode& refreshed = tree_.nodes[node_index];
         refreshed.expanded = true;
 
-        return value_prior;
+        return {value_prior, refreshed.wdl[1]};
     }
 
     std::vector<MovePrior> compute_priors(const chess::Board& board, const LeelaPolicyValue& eval) const

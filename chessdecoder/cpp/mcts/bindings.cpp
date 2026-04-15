@@ -43,6 +43,7 @@ py::dict summary_to_python(const chessrl::mcts::MctsSummary& summary)
                 node_dict["fen"] = node.fen;
                 node_dict["move"] = node.move;
                 node_dict["wdl"] = node.wdl;
+                node_dict["backed_up_wdl"] = node.backed_up_wdl;
                 node_dict["visit_count"] = node.visit_count;
                 nodes_list.append(std::move(node_dict));
             }

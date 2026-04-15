@@ -12,6 +12,7 @@ data:
   max_depth: 5
   tau_base: 0.3
   tau_alpha: 1.0
+  use_backed_up_wdl: false
   train_split: 0.8
 
 model:

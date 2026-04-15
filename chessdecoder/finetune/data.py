@@ -49,7 +49,7 @@ def _gumbel_reorder(variations, tau_base, tau_alpha, root_wdl):
     return [variations[i] for i in order], ranking
 
 
-def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau_alpha=1.0):
+def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau_alpha=1.0, use_backed_up_wdl=False):
     """
     Convert a parquet row with variation data into a finetuning token sequence.
 
@@ -137,7 +137,11 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
         # Each node in the PV: wl, d, board, pv_move
         for node_idx, node in enumerate(nodes):
             node_fen = node["fen"]
-            node_wdl = node.get("wdl", [0.0, 0.0, 0.0])
+            raw_wdl = node.get("wdl", [0.0, 0.0, 0.0])
+            if use_backed_up_wdl:
+                node_wdl = node.get("backed_up_wdl", raw_wdl)
+            else:
+                node_wdl = raw_wdl
             # wdl is [win, draw, loss] from the side-to-move at this node.
             # Alternates sign with depth: negative WL at opponent nodes, positive at root-player nodes.
             # We store wl = win - loss, d = draw

@@ -23,7 +23,7 @@ ext_modules = [
         ],
         include_dirs=[
             str(ROOT / "include"),
-            str(CPP_ROOT / "chess-library/include"),
+            str(CPP_ROOT),
             str(TENSORRT_ROOT / "include"),
             str(CUDA_ROOT / "include"),
             str(ROOT),

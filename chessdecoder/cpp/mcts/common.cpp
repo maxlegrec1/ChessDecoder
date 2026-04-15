@@ -228,6 +228,19 @@ std::vector<PVNodeDetail> principal_variation_detailed(const SearchTree& tree, i
         detail.move = move_uci;
         detail.wdl = node.wdl;
         detail.visit_count = node.visit_count;
+        if (node.visit_count > 0)
+        {
+            const float inv_n = 1.0F / static_cast<float>(node.visit_count);
+            const float backed_wl = node.value_sum * inv_n;
+            const float backed_d  = node.draw_sum  * inv_n;
+            const float backed_w  = (1.0F + backed_wl - backed_d) * 0.5F;
+            const float backed_l  = (1.0F - backed_wl - backed_d) * 0.5F;
+            detail.backed_up_wdl = {backed_w, backed_d, backed_l};
+        }
+        else
+        {
+            detail.backed_up_wdl = node.wdl;  // fallback to raw NN if unvisited
+        }
         line.push_back(std::move(detail));
 
         current = node.children[best_index];

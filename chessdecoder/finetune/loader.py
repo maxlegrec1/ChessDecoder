@@ -34,6 +34,7 @@ class FinetuneIterableDataset(IterableDataset):
         skip_board_prob=0.0,
         tau_base=0.3,
         tau_alpha=1.0,
+        use_backed_up_wdl=False,
         pretrain_files=None,
         variation_files=None,
         seed=42,
@@ -49,6 +50,7 @@ class FinetuneIterableDataset(IterableDataset):
         self.skip_board_prob = skip_board_prob
         self.tau_base = tau_base
         self.tau_alpha = tau_alpha
+        self.use_backed_up_wdl = use_backed_up_wdl
         self.pad_id = token_to_idx["pad"]
         self.seed = seed
         self.epoch = 0  # set externally before each epoch for deterministic resumption
@@ -221,6 +223,7 @@ class FinetuneIterableDataset(IterableDataset):
                                 max_depth=self.max_depth,
                                 tau_base=self.tau_base,
                                 tau_alpha=self.tau_alpha,
+                                use_backed_up_wdl=self.use_backed_up_wdl,
                             )
                     except Exception as e:
                         print(f"Error converting variation row {idx}: {e}")
@@ -235,6 +238,7 @@ class FinetuneIterableDataset(IterableDataset):
                                     variation_to_token_ids(
                                         row, max_variations=reduced_vars, max_depth=reduced_depth,
                                         tau_base=self.tau_base, tau_alpha=self.tau_alpha,
+                                        use_backed_up_wdl=self.use_backed_up_wdl,
                                     )
                                 if len(ids) <= self.max_seq_len:
                                     break
@@ -458,6 +462,7 @@ def get_finetune_dataloader(
     skip_board_prob=0.0,
     tau_base=0.3,
     tau_alpha=1.0,
+    use_backed_up_wdl=False,
     seed=42,
     rank=0,
     world_size=1,
@@ -474,6 +479,7 @@ def get_finetune_dataloader(
         skip_board_prob=skip_board_prob,
         tau_base=tau_base,
         tau_alpha=tau_alpha,
+        use_backed_up_wdl=use_backed_up_wdl,
         seed=seed,
         rank=rank,
         world_size=world_size,
@@ -494,6 +500,7 @@ def get_finetune_train_val_dataloaders(
     skip_board_prob=0.0,
     tau_base=0.3,
     tau_alpha=1.0,
+    use_backed_up_wdl=False,
     seed=42,
     rank=0,
     world_size=1,
@@ -527,6 +534,7 @@ def get_finetune_train_val_dataloaders(
         skip_board_prob=skip_board_prob,
         tau_base=tau_base,
         tau_alpha=tau_alpha,
+        use_backed_up_wdl=use_backed_up_wdl,
         seed=seed,
         rank=rank,
         world_size=world_size,

@@ -53,6 +53,7 @@ struct TreeNode
     bool expanded{false};
     float prior{0.0F};
     float value_sum{0.0F};
+    float draw_sum{0.0F};
     float virtual_loss{0.0F};
     int visit_count{0};
     float value_prior{0.0F};
