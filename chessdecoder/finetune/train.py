@@ -22,11 +22,11 @@ from tqdm import tqdm
 from chessdecoder.models.model import ChessDecoder
 from chessdecoder.models.vocab import vocab_size, board_vocab_size, move_vocab_size, board_token_to_idx
 from chessdecoder.finetune.loader import get_finetune_dataloader
-from chessdecoder.finetune.cpp_eval import (
+from chessdecoder.dataloader.sampling import (
     load_pretrain_positions as load_cpp_pretrain_positions,
     load_variation_positions as load_cpp_variation_positions,
-    evaluate as evaluate_cpp_selfplay,
 )
+from chessdecoder.finetune.cpp_eval import evaluate as evaluate_cpp_selfplay
 from chessdecoder.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
     average_gradients, barrier, print_rank0,

@@ -20,6 +20,7 @@ import argparse
 import chess
 
 from chessdecoder.mcts import LeelaMCTS
+from chessdecoder.eval.engine import MoveResult
 from chessdecoder.eval.elo_eval import model_vs_stockfish
 from chessdecoder.utils.uci import normalize_castling
 
@@ -164,6 +165,96 @@ class MCTSRawNNModel(_MCTSModelBase):
         return best_move
 
 
+class LeelaPolicyModel(_MCTSModelBase):
+    """Picks the move with the highest raw Leela policy prior (no value head, no search)."""
+
+    def predict_move(self, fen: str, temperature: float = 0.0) -> str | None:
+        self._sync_to_fen(fen)
+
+        result = self._mcts.run(self._origin_fen, self._history, simulations=0)
+        policy = result.get("policy", {})
+        board = chess.Board(fen)
+        legal_ucis = {normalize_castling(m.uci()) for m in board.legal_moves}
+
+        best_move, best_prior = None, -1.0
+        for move, prior in policy.items():
+            move_std = normalize_castling(move)
+            if move_std in legal_ucis and prior > best_prior:
+                best_prior = prior
+                best_move = move_std
+
+        if best_move is None:
+            return None
+
+        if self._board is not None:
+            try:
+                self._board.push(chess.Move.from_uci(best_move))
+                self._history.append(best_move)
+            except (chess.InvalidMoveError, chess.IllegalMoveError):
+                pass
+
+        return best_move
+
+    def predict_moves(self, fens: list[str], temperature: float = 0.0) -> list[MoveResult]:
+        return [MoveResult(move=self.predict_move(fen, temperature) or "") for fen in fens]
+
+    def _select_move(self, result: dict, fen: str) -> str | None:
+        raise NotImplementedError
+
+
+class LeelaDepth1Model(_MCTSModelBase):
+    """Picks the move with the highest raw Leela NN value at depth 1.
+
+    Evaluates ALL legal child positions with 0 simulations (pure NN, no search),
+    then selects the move whose resulting position has the lowest opponent Q.
+    Equivalent to a minimax depth-1 with the Leela value head.
+    """
+
+    def predict_move(self, fen: str, temperature: float = 0.0) -> str | None:
+        self._sync_to_fen(fen)
+
+        board = chess.Board(fen)
+        moves = [normalize_castling(m.uci()) for m in board.legal_moves]
+        if not moves:
+            return None
+
+        # Evaluate every child position with 0 simulations (raw NN only)
+        child_positions = [
+            (self._origin_fen, self._history + [move]) for move in moves
+        ]
+        results = self._mcts.run_parallel(child_positions, simulations=0)
+
+        best_move, best_q = None, -float("inf")
+        for move, result in zip(moves, results):
+            value = result.get("value")
+            if value is None:
+                continue
+            q = -(value[0] - value[2])   # negate: child value is from opponent's POV
+            if q > best_q:
+                best_q = q
+                best_move = move
+
+        if best_move is None:
+            return None
+
+        # Track our own move in history
+        if self._board is not None:
+            try:
+                self._board.push(chess.Move.from_uci(best_move))
+                self._history.append(best_move)
+            except (chess.InvalidMoveError, chess.IllegalMoveError):
+                pass
+
+        return best_move
+
+    def predict_moves(self, fens: list[str], temperature: float = 0.0) -> list[MoveResult]:
+        return [MoveResult(move=self.predict_move(fen, temperature) or "") for fen in fens]
+
+    def _select_move(self, result: dict, fen: str) -> str | None:
+        # Not used — predict_move is fully overridden
+        raise NotImplementedError
+
+
 class MCTSSearchQModel(_MCTSModelBase):
     """Selects the root candidate move with the highest MCTS-backed Q-value."""
 
@@ -196,7 +287,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--model", choices=["nn_q", "mcts_q", "both"], default="both",
+        "--model", choices=["nn_q", "mcts_q", "depth1", "policy", "both"], default="both",
         help="Which model(s) to evaluate.",
     )
     parser.add_argument("--simulations", type=int, default=600)
@@ -230,10 +321,26 @@ def main():
                 cpuct=args.cpuct,
             ),
         ))
+    if args.model in ("depth1",):
+        models_to_run.append((
+            "Leela_Depth1",
+            LeelaDepth1Model(engine_path=args.engine_path),
+        ))
+    if args.model in ("policy",):
+        models_to_run.append((
+            "Leela_Policy",
+            LeelaPolicyModel(engine_path=args.engine_path),
+        ))
 
     for name, model in models_to_run:
         print(f"\n{'='*60}")
-        print(f"Evaluating: {name} ({args.simulations} sims vs Stockfish {args.elo})")
+        if "Depth1" in name:
+            sims_str = "depth-1 value"
+        elif "Policy" in name:
+            sims_str = "policy argmax"
+        else:
+            sims_str = f"{args.simulations} sims"
+        print(f"Evaluating: {name} ({sims_str} vs Stockfish {args.elo})")
         print(f"{'='*60}\n")
         model_vs_stockfish(
             model,

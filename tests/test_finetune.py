@@ -8,7 +8,7 @@ from chessdecoder.models.vocab import (
     token_to_idx, idx_to_token, board_token_to_idx,
     move_vocab_size, POSITION_TOKEN_LENGTH,
 )
-from chessdecoder.finetune.data import variation_to_token_ids
+from chessdecoder.finetune.data import variation_to_token_ids, _synthesize_terminal_node
 from chessdecoder.finetune.loader import FinetuneIterableDataset
 
 
@@ -136,6 +136,53 @@ def test_build_variation_tensors_masks_exclusive(dataset, variation_result):
     )
     overlap = tensors["move_mask"] & tensors["thinking_move_mask"]
     assert not overlap.any(), "move_mask and thinking_move_mask overlap"
+
+
+def test_synthesize_terminal_node_checkmate():
+    # Mate-in-1: white Qe1# on 'h4e1'.
+    node = _synthesize_terminal_node("8/B7/8/8/7Q/1K6/8/k7 w - - 13 1", "h4e1")
+    assert node is not None
+    assert node["wdl"] == [0.0, 0.0, 1.0]
+    assert node["backed_up_wdl"] == [0.0, 0.0, 1.0]
+    assert node["move"] is None
+
+
+def test_synthesize_terminal_node_non_terminal_returns_none():
+    assert _synthesize_terminal_node(
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "e2e4"
+    ) is None
+
+
+def test_synthesize_terminal_node_illegal_move_returns_none():
+    assert _synthesize_terminal_node(
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "e2e5"
+    ) is None
+
+
+def test_variation_terminal_root_move_produces_one_node():
+    # Construct a fake parquet row with one variation whose root_move mates
+    # directly (nodes=[] as MCTS would emit for a terminal leaf).
+    row = {
+        "fen": "8/B7/8/8/7Q/1K6/8/k7 w - - 13 1",
+        "mcts_action": "h4e1",
+        "played_move": "h4e1",
+        "best_move": "h4e1",
+        "win": 1.0, "draw": 0.0, "loss": 0.0,
+        "variations": [
+            {"root_move": "h4e1", "visit_count": 400, "visit_fraction": 1.0,
+             "prior": 0.9, "nodes": []},
+        ],
+    }
+    ids, thinking_moves, final_move, value_data, blocks, _r, _f, _md, _mv = \
+        variation_to_token_ids(row, max_variations=1, max_depth=5, use_backed_up_wdl=True)
+    # Exactly one thinking move (the mating root_move) was emitted.
+    assert [m for _, m in thinking_moves] == ["h4e1"]
+    # A second board block (post-mate position) should be present.
+    assert len(blocks) == 2
+    # Value data for the terminal node: WL=-1, D=0 from the mated side's POV,
+    # plus the final-move WL at the end of the sequence.
+    terminal_wls = [(vd[2], vd[3]) for vd in value_data[:1]]
+    assert terminal_wls == [(-1.0, 0.0)]
 
 
 def test_build_variation_tensors_board_target_at_move_positions(dataset, variation_result):

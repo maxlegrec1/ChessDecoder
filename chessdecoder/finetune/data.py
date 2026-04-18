@@ -30,9 +30,44 @@ import json
 import random
 import numpy as np
 import pandas as pd
+import chess
 from chessdecoder.dataloader.data import fen_to_position_tokens
 from chessdecoder.models.vocab import token_to_idx
-from chessdecoder.utils.uci import to_model_uci
+from chessdecoder.utils.uci import to_model_uci, normalize_castling
+
+
+def _synthesize_terminal_node(root_fen, root_move_uci):
+    """If root_move leads to a terminal position, return a synthetic depth-1 PV
+    node with WDL from the resulting side-to-move's POV. Return None otherwise.
+
+    MCTS records no PV (`nodes=[]`) when the move lands on a terminal leaf
+    (checkmate, stalemate, insufficient material, 50-move, or repetition),
+    because the tree has no children to walk. Dropping those variations
+    removes mate-in-1 and similar forced lines from training.
+    """
+    try:
+        board = chess.Board(root_fen)
+        move = board.parse_uci(normalize_castling(root_move_uci))
+    except (chess.InvalidMoveError, chess.IllegalMoveError, ValueError):
+        return None
+    if move not in board.legal_moves:
+        return None
+    board.push(move)
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return None
+    if outcome.winner is None:
+        wdl = [0.0, 1.0, 0.0]
+    else:
+        # At a terminal node the side to move cannot be the winner, so this
+        # branch always represents a loss from the side-to-move's POV.
+        wdl = [0.0, 0.0, 1.0]
+    return {
+        "fen": board.fen(),
+        "move": None,
+        "wdl": wdl,
+        "backed_up_wdl": wdl,
+    }
 
 
 def _gumbel_reorder(variations, tau_base, tau_alpha, root_wdl):
@@ -119,9 +154,12 @@ def variation_to_token_ids(row, max_variations=3, max_depth=5, tau_base=0.3, tau
     for var_idx, var in enumerate(variations):
         root_move = var["root_move"]
         all_nodes = var.get("nodes", [])
+        if not all_nodes:
+            synth = _synthesize_terminal_node(fen, root_move)
+            if synth is None:
+                continue
+            all_nodes = [synth]
         available_depth = min(max_depth, len(all_nodes))
-        if available_depth == 0:
-            continue
         sampled_depth = random.randint(1, available_depth)
         nodes = all_nodes[:sampled_depth]
 
