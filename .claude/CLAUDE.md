@@ -32,7 +32,7 @@ trt/                         # TensorRT engine files for MCTS (gitignored)
 ## Build & Run
 
 - **Always use `uv run`** for all Python commands
-- **Always set `CUDA_VISIBLE_DEVICES=0`** for any GPU work — the other GPU is reserved for ongoing runs and must not be touched
+- **Always set `CUDA_VISIBLE_DEVICES=0`** for any GPU work — this is the RTX 4090 (CUDA enumerates it as device 0; note that `nvidia-smi` lists it as index 1). The other GPU (GTX 1070, nvidia-smi index 0) is reserved for ongoing runs and must not be touched.
 - **Build everything**: `uv sync` (builds C++ decoder engine via pybind11)
 - **Build with MCTS**: `uv sync --extra mcts` (also builds TensorRT-based MCTS engine)
 - **Rebuild C++ decoder after changes**: `uv pip install -e chessdecoder/cpp/decoder/ --no-build-isolation`
