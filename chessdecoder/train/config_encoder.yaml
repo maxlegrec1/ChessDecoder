@@ -1,26 +1,47 @@
 project_name: "chess-decoder"
-run_name: "encoder-v1"
+run_name: "encoder-v2"
 
 data:
-  parquet_dir: "parquets/"
+  parquet_dir: "/home/maxime/parquet_files_decoder/"
+  # batch_size × grad_accum = 2560 ≈ decoder's 16 × 4 × 38.7 plies/sample = 2477
+  # positions/grad-step at seq=4096. Encoder seq=68 makes large batches cheap.
   batch_size: 256
-  num_workers: 4
-  max_seq_len: 68  # Fixed position length: start_pos + 64 board + end_pos + castling + side_to_move
+  num_workers: 8
+  max_seq_len: 68  # start_pos + 64 squares + end_pos + castling + side_to_move
+  # Sampling distribution. Default: one sample per row (uniform over positions).
+  # When match_decoder_sampling=true, mirrors loader.py: group by game_id, pick
+  # one random start ply per game, yield (decoder_max_seq_len // 71) consecutive
+  # plies as individual samples. Set decoder_max_seq_len to the decoder's
+  # training max_seq_len so both see the same (game, start_ply) distribution.
+  match_decoder_sampling: false
+  decoder_max_seq_len: 4096
 
 model:
-  embed_dim: 768
-  num_heads: 12
+  embed_dim: 1024
+  num_heads: 16
   num_layers: 12
   max_seq_len: 68
+  d_ff: 1536
 
 training:
   learning_rate: 1.0e-4
   weight_decay: 0.1
   gradient_accumulation_steps: 1
-  num_epochs: 10
-  log_every_n_steps: 1
-  save_every_n_steps: 1000
-  save_every_n_epochs: 1
-  checkpoint_dir: "chessdecoder/train/checkpoints/encoder"
+  warmup_steps: 1000
+  max_steps: 200000
+  log_every_n_steps: 4
+  save_every_n_steps: 10000
   device: "cuda"
-  use_scheduler: true
+  use_amp: true
+  grad_clip: 10.0
+  checkpoint_dir: "checkpoints/encoder/"
+  resume_from: null
+
+eval:
+  # Every N grad steps, play num_games against Stockfish capped at stockfish_elo
+  # (temperature controls move sampling; 0.0 = greedy argmax over legal moves).
+  # Set every_n_steps to 0 or null to disable.
+  every_n_steps: 5000
+  num_games: 100
+  stockfish_elo: 2000
+  temperature: 0.0
