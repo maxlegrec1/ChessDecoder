@@ -50,6 +50,67 @@ def soft_bucket_loss(logits, target_values, bucket_centers, valid_mask):
     return (loss * valid_mask.float()).sum() / (valid_mask.sum() + 1e-8)
 
 
+def compute_board_block_metrics(board_correct, board_mask, block_id):
+    """Per-block board-prediction accuracy, restricted to real 68-token board blocks.
+
+    The loader assigns a unique ``block_id`` to each orphan position (for prefix
+    attention masking), which makes them indistinguishable from real blocks in a
+    raw scatter. We identify real blocks as those containing square positions
+    (intra-block indices 1-64) and drop everything else.
+
+    Returns ``board_total_acc`` (all non-structural tokens in the block correct),
+    ``board_square_acc`` (all 64 squares correct), and per-token
+    ``board_castling_acc`` / ``board_stm_acc``.
+    """
+    device = board_correct.device
+    zeros = {"board_total_acc": 0.0, "board_square_acc": 0.0,
+             "board_castling_acc": 0.0, "board_stm_acc": 0.0}
+
+    B, _ = block_id.shape
+    max_bid = block_id.max() + 1
+    uid = (block_id + (torch.arange(B, device=device) * max_bid).unsqueeze(1)).view(-1)
+    bp = board_mask.view(-1).nonzero(as_tuple=True)[0]
+    if bp.numel() == 0:
+        return zeros
+
+    bp_bc = board_correct.view(-1).float()[bp]
+    _, inv = uid[bp].unique(return_inverse=True)
+    n = int(inv.max().item()) + 1
+    ones = torch.ones_like(bp_bc)
+
+    # Intra-block offset relative to the earliest masked position in the block.
+    block_starts = torch.full((n,), float('inf'), device=device)
+    block_starts.scatter_reduce_(0, inv, bp.float(), reduce="amin")
+    intra = (bp.float() - block_starts[inv]).long()
+
+    # Real blocks contain square predictions (intra 1-64). Orphan single-token
+    # blocks only ever sit at intra 0, so they're excluded.
+    sq = (intra >= 1) & (intra <= 64)
+    if not sq.any():
+        return zeros
+
+    def _per_block_sum(values, groups):
+        return torch.zeros(n, device=device).scatter_add_(0, groups, values)
+
+    sq_correct = _per_block_sum(bp_bc[sq], inv[sq])
+    sq_total   = _per_block_sum(ones[sq],  inv[sq])
+    real = sq_total > 0
+    n_real = real.sum().clamp(min=1)
+
+    all_correct = _per_block_sum(bp_bc, inv)
+    all_total   = _per_block_sum(ones,  inv)
+
+    castle = intra == 65
+    stm    = intra == 66
+
+    return {
+        "board_total_acc":    (((all_correct == all_total) & real).float().sum() / n_real).item(),
+        "board_square_acc":   (((sq_correct  == sq_total)  & real).float().sum() / n_real).item(),
+        "board_castling_acc": bp_bc[castle].mean().item() if castle.any() else 0.0,
+        "board_stm_acc":      bp_bc[stm].mean().item()    if stm.any()    else 0.0,
+    }
+
+
 def prepare_fourier_inputs(model, wl_targets, d_targets, wl_positions, d_positions):
     """Build Fourier input tensors for WL/D signals, shared by both causal and prefix passes.
 

@@ -34,6 +34,7 @@ from chessdecoder.utils.distributed import (
 from chessdecoder.utils.training import (
     load_config, soft_bucket_loss, prepare_fourier_inputs,
     save_training_checkpoint, load_pretrained_checkpoint, init_wandb_with_resume,
+    compute_board_block_metrics,
 )
 
 
@@ -360,53 +361,12 @@ def train():
                 board_correct = (preds_board == board_target_ids) & board_mask_no_struct
                 board_acc = board_correct.sum() / (board_mask_no_struct.sum() + 1e-8)
 
-                # Board accuracy (per-block, grouped by block_id)
-                B, S = block_id.shape
-                max_bid = block_id.max() + 1
-                uid = block_id + (torch.arange(B, device=device) * max_bid).unsqueeze(1)
-                flat_uid = uid.view(-1)
-                flat_bc = board_correct.view(-1).float()
-                flat_bm = board_mask_no_struct.view(-1)
-                bp = flat_bm.nonzero(as_tuple=True)[0]
-
-                if bp.numel() > 0:
-                    bp_uid = flat_uid[bp]
-                    bp_bc = flat_bc[bp]
-                    unique_uids, inv = bp_uid.unique(return_inverse=True)
-                    n_unique = unique_uids.shape[0]
-                    sum_correct = torch.zeros(n_unique, device=device).scatter_add_(0, inv, bp_bc)
-                    sum_total = torch.zeros(n_unique, device=device).scatter_add_(0, inv, torch.ones_like(bp_bc))
-                    board_total_acc = (sum_correct == sum_total).float().mean().item()
-
-                    # Intra-block offset for sub-metrics
-                    bp_pos = bp.float()
-                    block_starts = torch.full((n_unique,), float('inf'), device=device)
-                    block_starts.scatter_reduce_(0, inv, bp_pos, reduce="amin")
-                    intra_idx = (bp_pos - block_starts[inv]).long()
-
-                    # Squares (intra 1-64): per-board all-correct
-                    sq = (intra_idx >= 1) & (intra_idx <= 64)
-                    if sq.any():
-                        sq_correct = torch.zeros(n_unique, device=device).scatter_add_(0, inv[sq], bp_bc[sq])
-                        sq_total = torch.zeros(n_unique, device=device).scatter_add_(0, inv[sq], torch.ones_like(bp_bc[sq]))
-                        has_sq = sq_total > 0
-                        board_square_acc = ((sq_correct == sq_total) & has_sq).float().sum() / (has_sq.sum() + 1e-8)
-                        board_square_acc = board_square_acc.item()
-                    else:
-                        board_square_acc = 0.0
-
-                    # Castling (intra 65: end_pos predicts castling token)
-                    castle = intra_idx == 65
-                    board_castling_acc = bp_bc[castle].mean().item() if castle.any() else 0.0
-
-                    # STM (intra 66: castling predicts STM token)
-                    stm_metric = intra_idx == 66
-                    board_stm_acc = bp_bc[stm_metric].mean().item() if stm_metric.any() else 0.0
-                else:
-                    board_total_acc = 0.0
-                    board_square_acc = 0.0
-                    board_castling_acc = 0.0
-                    board_stm_acc = 0.0
+                # Board accuracy (per-block, restricted to real 68-token boards)
+                block_metrics = compute_board_block_metrics(board_correct, board_mask_no_struct, block_id)
+                board_total_acc = block_metrics["board_total_acc"]
+                board_square_acc = block_metrics["board_square_acc"]
+                board_castling_acc = block_metrics["board_castling_acc"]
+                board_stm_acc = block_metrics["board_stm_acc"]
 
                 # end_var / end_think accuracy (derived from board_target_ids)
                 end_var_board_idx = board_token_to_idx["end_var"]
