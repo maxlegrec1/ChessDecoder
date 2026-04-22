@@ -415,8 +415,12 @@ private:
             throw std::runtime_error("Mismatch between board orientation and Leela evaluation result.");
         }
 
-        const std::array<float, 3> value_probs_raw = softmax3(eval.value_q_logits);
-        node.wdl = value_probs_raw;
+        // The Leela TRT value_q tensor is already a [W, D, L] probability
+        // distribution (softmax baked into the ONNX graph). Applying softmax
+        // again was compressing every eval toward uniform (~[0.33, 0.33, 0.33]),
+        // e.g. a mate-in-N position returned ~[0.58, 0.21, 0.21] instead of
+        // [~1, 0, 0]. Use the tensor directly.
+        node.wdl = {eval.value_q_logits[0], eval.value_q_logits[1], eval.value_q_logits[2]};
         node.value_prior = node.wdl[0] - node.wdl[2];
         node.expanded = true;
 
