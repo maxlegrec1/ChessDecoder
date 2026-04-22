@@ -187,19 +187,20 @@ def process_file(
             )
         except Exception as e:
             print(f"  Batch failed: {e}", file=sys.stderr)
-            results = [{"action": None, "value": None, "variations": []}] * len(batch)
+            results = [{"action": None, "value": None, "backed_up_value": None, "variations": []}] * len(batch)
+
+        def _dump(v):
+            return json.dumps(list(v), ensure_ascii=False) if v else None
 
         rows = []
         for (row, _, _), res in zip(batch, results):
             enriched = dict(row)
-            enriched["variations"] = json.dumps(
-                res.get("variations", []), ensure_ascii=False
-            )
+            enriched["variations"] = json.dumps(res.get("variations", []), ensure_ascii=False)
             enriched["mcts_action"] = res.get("action")
-            val = res.get("value")
-            enriched["mcts_value"] = (
-                json.dumps(list(val), ensure_ascii=False) if val else None
-            )
+            # mcts_value: raw network value-head output at the root (one-shot prior).
+            # mcts_backed_value: MCTS-backed WDL at the root (value_sum/visits over all sims).
+            enriched["mcts_value"] = _dump(res.get("value"))
+            enriched["mcts_backed_value"] = _dump(res.get("backed_up_value"))
             rows.append(enriched)
 
         table = pa.Table.from_pylist(rows)
