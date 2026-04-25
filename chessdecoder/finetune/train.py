@@ -10,6 +10,7 @@ Loads pretrained checkpoint, clones policy_head -> thinking_policy_head,
 and expands embedding/heads for the new end_var token (vocab_size += 1).
 """
 
+import glob
 import os
 import torch
 import torch.nn as nn
@@ -92,10 +93,23 @@ def train():
         resume_epoch_step = ft_checkpoint.get("epoch_step", 0)
         print_rank0(f"Resumed from epoch {start_epoch}, step {step}, epoch_step {resume_epoch_step}")
 
+    # Held-out variation-file split: finetuning trains on `train_variation_files`,
+    # C++ eval samples from `val_variation_files` so cpp_var_* metrics measure
+    # generalization rather than memorization of the training set.
+    all_variation = sorted(glob.glob(os.path.join(config["data"]["variation_parquet_dir"], "*.parquet")))
+    train_split = config["data"].get("train_split", 0.8)
+    n_train_var = int(len(all_variation) * train_split)
+    if n_train_var == len(all_variation) and len(all_variation) > 1:
+        n_train_var -= 1
+    train_variation_files = all_variation[:n_train_var]
+    val_variation_files = all_variation[n_train_var:]
+    print_rank0(f"Variation split: {len(train_variation_files)} train / {len(val_variation_files)} val files")
+
     # Dataloader
     dataloader = get_finetune_dataloader(
         pretrain_parquet_dir=config["data"]["pretrain_parquet_dir"],
         variation_parquet_dir=config["data"]["variation_parquet_dir"],
+        variation_files=train_variation_files,
         batch_size=config["data"]["batch_size"],
         num_workers=config["data"].get("num_workers", 0),
         max_seq_len=config["data"]["max_seq_len"],
@@ -117,10 +131,11 @@ def train():
     cpp_pt_eval_positions = []
     if is_main_process() and cpp_eval_n > 0:
         cpp_var_eval_positions = load_cpp_variation_positions(
-            config["data"]["variation_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed)
+            config["data"]["variation_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed,
+            files=val_variation_files)
         cpp_pt_eval_positions = load_cpp_pretrain_positions(
             config["data"]["pretrain_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed)
-        print_rank0(f"Loaded {len(cpp_var_eval_positions)} variation + "
+        print_rank0(f"Loaded {len(cpp_var_eval_positions)} variation (held-out) + "
                     f"{len(cpp_pt_eval_positions)} pretrain positions for C++ selfplay eval")
 
     # Optimizer

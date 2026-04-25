@@ -466,6 +466,8 @@ def get_finetune_dataloader(
     seed=42,
     rank=0,
     world_size=1,
+    pretrain_files=None,
+    variation_files=None,
 ):
     dataset = FinetuneIterableDataset(
         pretrain_parquet_dir=pretrain_parquet_dir,
@@ -480,6 +482,8 @@ def get_finetune_dataloader(
         tau_base=tau_base,
         tau_alpha=tau_alpha,
         use_backed_up_wdl=use_backed_up_wdl,
+        pretrain_files=pretrain_files,
+        variation_files=variation_files,
         seed=seed,
         rank=rank,
         world_size=world_size,
