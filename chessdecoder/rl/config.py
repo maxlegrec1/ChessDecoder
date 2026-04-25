@@ -48,6 +48,9 @@ class GRPOConfig:
     # --- Data ---
     variation_parquet_dir: str = "./parquets_variations/"
     pretrain_parquet_dir: str = "/home/maxime/parquet_files_decoder/"
+    # Fraction of sorted pretrain files used for RL training; the remainder
+    # is held out for cpp_pt_best_acc evaluation.
+    pretrain_train_split: float = 0.8
     # num_train_positions removed — PositionStream reads fresh data from files
     num_eval_positions: int = 200
     eval_seed: int = 42

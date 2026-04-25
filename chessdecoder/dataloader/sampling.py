@@ -35,15 +35,19 @@ def filter_standard_games(df):
     return df[df["game_id"].isin(standard_ids)]
 
 
-def load_pretrain_positions(data_dir, n, seed):
+def load_pretrain_positions(data_dir, n, seed, files=None):
     """Load (fen, best_move) pairs from pretrain parquets.
 
     Samples 1 position per game, excludes non-standard games (Chess960, etc.).
+    If `files` is given (list of absolute paths), it overrides directory globbing —
+    used to restrict eval to held-out pretrain files that training did not see.
     """
-    files = sorted(f for f in os.listdir(data_dir) if f.endswith(".parquet"))
+    if files is None:
+        files = sorted(os.path.join(data_dir, f)
+                       for f in os.listdir(data_dir) if f.endswith(".parquet"))
     rng = random.Random(seed)
-    fname = rng.choice(files)
-    df = pd.read_parquet(os.path.join(data_dir, fname),
+    fpath = rng.choice(files)
+    df = pd.read_parquet(fpath,
                          columns=["fen", "best_move", "game_id", "ply"])
     df = filter_standard_games(df)
     sampled = sample_one_per_game(df, seed)
@@ -60,12 +64,15 @@ def load_pretrain_positions(data_dir, n, seed):
     return pairs
 
 
-def load_variation_positions(data_dir, n, seed):
+def load_variation_positions(data_dir, n, seed, files=None):
     """Load (fen, best_move, mcts_action) from variation parquets.
 
-    Samples 1 position per game from 3 randomly chosen files.
+    Samples 1 position per game from 3 randomly chosen files. If `files` is
+    given, it overrides directory globbing — used to restrict eval to the
+    held-out variation files that finetuning did not train on.
     """
-    files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
+    if files is None:
+        files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
     rng = random.Random(seed)
     chosen_files = rng.sample(files, min(3, len(files)))
     dfs = []

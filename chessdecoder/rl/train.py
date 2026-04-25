@@ -59,17 +59,16 @@ class PositionStream:
     have been used, reshuffles and cycles back to the first file.
     """
 
-    def __init__(self, parquet_dir: str, seed: int):
-        import glob
-        self._files = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
-        if not self._files:
-            raise RuntimeError(f"No parquet files found in {parquet_dir}")
+    def __init__(self, files: list[str], seed: int):
+        if not files:
+            raise RuntimeError("PositionStream requires at least one parquet file")
+        self._files = list(files)
         self._rng = random.Random(seed)
         self._rng.shuffle(self._files)
         self._file_idx = 0
         self._buffer: list[dict] = []
         self._positions_served = 0
-        print_rank0(f"PositionStream: {len(self._files)} parquet files from {parquet_dir}")
+        print_rank0(f"PositionStream: {len(self._files)} parquet files (train split)")
 
     def _load_next_file(self):
         """Load and shuffle positions from the next parquet file."""
@@ -227,7 +226,25 @@ def train():
         print_rank0(f"  Resumed at step {start_step}")
 
     # ── Data ──────────────────────────────────────────────────────────────
-    position_stream = PositionStream(config.pretrain_parquet_dir, config.eval_seed)
+    # Held-out pretrain split: training samples positions only from
+    # `train_pretrain_files`; cpp_pt_best_acc is measured on positions drawn
+    # from `eval_pretrain_files` so the metric reflects generalization rather
+    # than memorization of positions seen during RL.
+    import glob as _glob
+    all_pretrain_files = sorted(_glob.glob(os.path.join(config.pretrain_parquet_dir, "*.parquet")))
+    if not all_pretrain_files:
+        raise RuntimeError(f"No parquet files found in {config.pretrain_parquet_dir}")
+    n_train_pt = int(len(all_pretrain_files) * config.pretrain_train_split)
+    if n_train_pt == len(all_pretrain_files) and len(all_pretrain_files) > 1:
+        n_train_pt -= 1
+    if n_train_pt == 0:
+        raise RuntimeError("pretrain_train_split too low — no training files left")
+    train_pretrain_files = all_pretrain_files[:n_train_pt]
+    eval_pretrain_files = all_pretrain_files[n_train_pt:]
+    print_rank0(f"Pretrain split: {len(train_pretrain_files)} train / "
+                f"{len(eval_pretrain_files)} eval files")
+
+    position_stream = PositionStream(train_pretrain_files, config.eval_seed)
     if _resume_stream_state is not None:
         position_stream.load_state_dict(_resume_stream_state)
 
@@ -237,6 +254,7 @@ def train():
     )
     eval_pt_positions = load_pretrain_positions(
         config.pretrain_parquet_dir, config.num_eval_positions, config.eval_seed + 2,
+        files=eval_pretrain_files,
     )
 
     # ── Reward function ───────────────────────────────────────────────────
