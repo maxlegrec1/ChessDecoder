@@ -3,7 +3,7 @@ run_name: finetune-thinking-v1
 
 data:
   pretrain_parquet_dir: /home/maxime/parquet_files_decoder/
-  variation_parquet_dir: ./parquets_variations/
+  variation_parquet_dir: ./parquets_variations2_fixed/
   batch_size: 4
   num_workers: 4
   max_seq_len: 4096
@@ -12,7 +12,7 @@ data:
   max_depth: 5
   tau_base: 0.3
   tau_alpha: 1.0
-  use_backed_up_wdl: false
+  use_backed_up_wdl: true
   train_split: 0.8
 
 model:
@@ -35,13 +35,13 @@ training:
   device: cuda
   use_amp: true
   checkpoint_dir: checkpoints/
-  pretrain_checkpoint: checkpoint_616000.pt
+  pretrain_checkpoint: checkpoints/checkpoint_616000.pt
   warmup_steps: 500
   save_every_n_steps: 2000
   val_batches: 100
   cpp_eval_n_positions: 100
   cpp_eval_seed: 42
-  resume_from: checkpoints/finetune-thinking-v1_20260320_205453
+  resume_from: "checkpoints/finetune-thinking-v1_20260422_135004"
 
 loss:
   final_move_weight: 3.0
