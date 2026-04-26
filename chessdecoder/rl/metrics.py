@@ -18,6 +18,9 @@ class RolloutMetrics:
     acc_at_1: list[bool] = field(default_factory=list)
     acc_at_k: list[bool] = field(default_factory=list)
     coherence_hits: list[bool] = field(default_factory=list)
+    # Per-group: True if at least one of the K rollouts achieved every reward
+    # component at its max simultaneously (move_quality=1, format=1, coherence=1).
+    perfect_in_group: list[bool] = field(default_factory=list)
     rollout_time: float = 0.0
     diverse_groups: int = 0
     total_groups: int = 0
@@ -80,6 +83,7 @@ class GRPOMetrics:
             first_correct = normalize_castling(group[0].final_move) == best_move
             self._rollout.acc_at_1.append(first_correct)
 
+            any_perfect = False
             for sample_idx, (rollout, (total_r, components)) in enumerate(
                 zip(group, rewards_group)
             ):
@@ -89,6 +93,11 @@ class GRPOMetrics:
                 self._rollout.reward_coherence.append(components.get("coherence", 0.0))
                 self._rollout.rollout_lengths.append(rollout.num_tokens)
                 self._rollout.coherence_hits.append(components.get("coherence", 0.0) > 0.0)
+                if (components.get("move_quality", 0.0) >= 1.0
+                        and components.get("format", 0.0) >= 1.0
+                        and components.get("coherence", 0.0) >= 1.0):
+                    any_perfect = True
+            self._rollout.perfect_in_group.append(any_perfect)
 
     def log_diverse_groups(self, n_diverse: int, total: int):
         """Record how many groups had non-identical rewards."""
@@ -146,6 +155,8 @@ class GRPOMetrics:
             d["rl/acc_at_k"] = _mean([float(x) for x in r.acc_at_k])
         if r.coherence_hits:
             d["rl/coherence_rate"] = _mean([float(x) for x in r.coherence_hits])
+        if r.perfect_in_group:
+            d["rl/group_perfect_at_k"] = _mean([float(x) for x in r.perfect_in_group])
 
         # Training metrics
         t = self._training
