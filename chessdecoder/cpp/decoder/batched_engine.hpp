@@ -41,6 +41,13 @@ public:
         // predicted the move (same position marked by thinking_move_mask /
         // final_move_mask in chessdecoder/rl/sequence.py).
         std::vector<std::pair<int, float>> move_log_probs;
+        // (wl_value_token_position, sampled_bucket_idx) and matching
+        // log_softmax(unscaled_logits)[bucket_idx]. Recorded so GRPO can treat
+        // WL/D bucket sampling as additional policy actions.
+        std::vector<std::pair<int, int>>   wl_bucket_indices;
+        std::vector<std::pair<int, int>>   d_bucket_indices;
+        std::vector<std::pair<int, float>> wl_log_probs;
+        std::vector<std::pair<int, float>> d_log_probs;
     };
 
     /// Process up to max_batch_size FENs. Pads internally if fewer.
@@ -71,9 +78,17 @@ private:
                        const std::vector<std::string>& fens);
     torch::Tensor evalBoardHead(torch::Tensor h, float temp);
 
-    /// [B, E] → [B] float values (WL or D)
-    torch::Tensor evalWlHead(torch::Tensor h, float temp);
-    torch::Tensor evalDHead(torch::Tensor h, float temp);
+    /// Bucket-sampling result for WL/D heads.
+    /// idx: [B] int64 sampled bucket indices.
+    /// value: [B] float bucket center values for Fourier injection.
+    /// log_prob: [B] float log_softmax(unscaled_logits)[idx] — recorded for GRPO.
+    struct ValueSample {
+        torch::Tensor idx;
+        torch::Tensor value;
+        torch::Tensor log_prob;
+    };
+    ValueSample evalWlHead(torch::Tensor h, float temp);
+    ValueSample evalDHead(torch::Tensor h, float temp);
 
     /// Sample from logits [B, V] → [B] indices. Argmax if temp <= 0.
     torch::Tensor sampleBatched(torch::Tensor logits, float temp);

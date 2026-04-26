@@ -18,6 +18,12 @@ class GRPOConfig:
     kl_coeff: float = 0.05
     ppo_epochs: int = 1
     max_kl: float = 0.05
+    # When true, treat WL/D bucket samples as additional policy actions:
+    # GRPO log-prob ratios and KL terms include wl_head/d_head outputs at
+    # their bucket-sampling positions. Requires wl_temperature/d_temperature
+    # > 0 during rollout — otherwise the bucket distribution collapses to
+    # one-hot and there is no gradient signal.
+    value_action_space: bool = False
 
     # --- Rollout ---
     rollout_batch_size: int = 640
@@ -25,6 +31,10 @@ class GRPOConfig:
     think_temperature: float = 1.5
     policy_temperature: float = 1.5
     board_temperature: float = 0.0
+    # WL/D bucket sampling temperature. Set > 0 (e.g. 0.5) when
+    # grpo.value_action_space is true; otherwise leave at 0.0 (greedy).
+    wl_temperature: float = 0.0
+    d_temperature: float = 0.0
 
     # --- Training ---
     learning_rate: float = 1e-6

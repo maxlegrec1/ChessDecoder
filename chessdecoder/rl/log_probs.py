@@ -60,16 +60,17 @@ def _gather_per_token_log_probs(
     h: torch.Tensor,
     batch: dict,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract per-token log-probs at all move positions.
+    """Extract per-token log-probs at all action positions (moves + WL/D).
 
-    Args:
-        model: the ChessDecoder (for head access).
-        h: hidden states [B, S, E] from prefix pass.
-        batch: must contain thinking_move_mask, final_move_mask, move_token_ids.
+    Action set:
+      - Move tokens: thinking_move_mask + final_move_mask
+      - WL/D buckets: wl_action_mask + d_action_mask (only populated when
+        engine recorded WL/D bucket samples — i.e., RL rollouts. Older
+        callers without these keys still work.)
 
     Returns:
-        token_log_probs: [B, S] log-probs at move positions (0.0 elsewhere).
-        move_mask: [B, S] bool — True at positions with valid move log-probs.
+        token_log_probs: [B, S] log-probs at action positions (0.0 elsewhere).
+        action_mask: [B, S] bool — True at positions with a valid log-prob.
     """
     B, S, _E = h.shape
     thinking_mask = batch["thinking_move_mask"]   # [B, S]
@@ -77,7 +78,7 @@ def _gather_per_token_log_probs(
     move_ids = batch["move_token_ids"]             # [B, S] move sub-vocab indices
 
     token_log_probs = torch.zeros(B, S, device=h.device, dtype=h.dtype)
-    move_mask = torch.zeros(B, S, device=h.device, dtype=torch.bool)
+    action_mask = torch.zeros(B, S, device=h.device, dtype=torch.bool)
 
     # Thinking move positions → thinking_policy_head
     if thinking_mask.any():
@@ -87,7 +88,7 @@ def _gather_per_token_log_probs(
         think_targets = move_ids[thinking_mask]                          # [N_think]
         think_token_lp = think_log_p.gather(1, think_targets.unsqueeze(1)).squeeze(1)
         token_log_probs[thinking_mask] = think_token_lp
-        move_mask[thinking_mask] = True
+        action_mask[thinking_mask] = True
 
     # Final move positions → policy_head
     if final_mask.any():
@@ -97,9 +98,31 @@ def _gather_per_token_log_probs(
         final_targets = move_ids[final_mask]                             # [N_final]
         final_token_lp = final_log_p.gather(1, final_targets.unsqueeze(1)).squeeze(1)
         token_log_probs[final_mask] = final_token_lp
-        move_mask[final_mask] = True
+        action_mask[final_mask] = True
 
-    return token_log_probs, move_mask
+    # WL bucket positions → wl_head (treats bucket sampling as a policy action)
+    wl_mask = batch.get("wl_action_mask")
+    if wl_mask is not None and wl_mask.any():
+        wl_h = h[wl_mask]                                                 # [N_wl, E]
+        wl_logits = model.wl_head(wl_h)                                   # [N_wl, n_buckets]
+        wl_log_p = F.log_softmax(wl_logits.float(), dim=-1)
+        wl_targets = batch["wl_bucket_ids"][wl_mask]                      # [N_wl]
+        wl_token_lp = wl_log_p.gather(1, wl_targets.unsqueeze(1)).squeeze(1)
+        token_log_probs[wl_mask] = wl_token_lp.to(token_log_probs.dtype)
+        action_mask[wl_mask] = True
+
+    # D bucket positions → d_head
+    d_mask = batch.get("d_action_mask")
+    if d_mask is not None and d_mask.any():
+        d_h = h[d_mask]                                                   # [N_d, E]
+        d_logits = model.d_head(d_h)                                      # [N_d, n_buckets]
+        d_log_p = F.log_softmax(d_logits.float(), dim=-1)
+        d_targets = batch["d_bucket_ids"][d_mask]
+        d_token_lp = d_log_p.gather(1, d_targets.unsqueeze(1)).squeeze(1)
+        token_log_probs[d_mask] = d_token_lp.to(token_log_probs.dtype)
+        action_mask[d_mask] = True
+
+    return token_log_probs, action_mask
 
 
 @torch.no_grad()

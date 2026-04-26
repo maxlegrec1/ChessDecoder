@@ -70,7 +70,15 @@ PYBIND11_MODULE(_decoder_inference_cpp, m)
         .def_readonly("wl_entries", &decoder::ThinkingBatchedInferenceEngine::Result::wl_entries)
         .def_readonly("d_entries", &decoder::ThinkingBatchedInferenceEngine::Result::d_entries)
         .def_readonly("move_log_probs",
-                      &decoder::ThinkingBatchedInferenceEngine::Result::move_log_probs);
+                      &decoder::ThinkingBatchedInferenceEngine::Result::move_log_probs)
+        .def_readonly("wl_bucket_indices",
+                      &decoder::ThinkingBatchedInferenceEngine::Result::wl_bucket_indices)
+        .def_readonly("d_bucket_indices",
+                      &decoder::ThinkingBatchedInferenceEngine::Result::d_bucket_indices)
+        .def_readonly("wl_log_probs",
+                      &decoder::ThinkingBatchedInferenceEngine::Result::wl_log_probs)
+        .def_readonly("d_log_probs",
+                      &decoder::ThinkingBatchedInferenceEngine::Result::d_log_probs);
 
     py::class_<decoder::ThinkingBatchedInferenceEngine>(m, "ThinkingBatchedInferenceEngine")
         .def(py::init<const std::string&, const std::string&,

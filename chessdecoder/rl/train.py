@@ -158,6 +158,14 @@ def train():
     device = get_device(local_rank)
     print_rank0(f"GRPO training | device={device} world_size={world_size}")
 
+    if config.value_action_space:
+        if config.wl_temperature <= 0.0 or config.d_temperature <= 0.0:
+            print_rank0("WARNING: value_action_space=true but wl/d temperatures are 0; "
+                        "all rollouts in a group will share the same bucket samples, "
+                        "providing no exploration signal for the value heads.")
+        print_rank0(f"value_action_space ENABLED (wl_temp={config.wl_temperature}, "
+                    f"d_temp={config.d_temperature})")
+
     # ── Model ────────────────────────────────────────────────────────────
     mc = config.model
 
@@ -381,6 +389,10 @@ def train():
                         rollout.token_ids, rollout.wl_entries,
                         rollout.d_entries, max_seq_len,
                         move_log_probs=rollout.move_log_probs,
+                        wl_bucket_indices=rollout.wl_bucket_indices,
+                        d_bucket_indices=rollout.d_bucket_indices,
+                        wl_log_probs=rollout.wl_log_probs,
+                        d_log_probs=rollout.d_log_probs,
                     ))
                     advantages_kept.append(advantages[fen_idx, sample_idx].item())
 
@@ -402,8 +414,21 @@ def train():
             #    extra forward pass needed. ref_lp still requires a forward
             #    pass on the frozen reference model.
             model.eval()
-            all_old_lp = all_batch["old_log_probs"].float()                 # [N, S]
+            all_old_lp = all_batch["old_log_probs"].float().clone()         # [N, S]
             all_move_mask = all_batch["thinking_move_mask"] | all_batch["final_move_mask"]
+            # Optionally extend the action space to include WL/D bucket sampling.
+            # Old log-probs at WL/D positions come from the C++ engine
+            # (recorded under unscaled log_softmax, same convention as moves).
+            if config.value_action_space:
+                wl_a = all_batch["wl_action_mask"]
+                d_a = all_batch["d_action_mask"]
+                all_old_lp[wl_a] = all_batch["wl_old_log_probs"][wl_a].float()
+                all_old_lp[d_a] = all_batch["d_old_log_probs"][d_a].float()
+                all_move_mask = all_move_mask | wl_a | d_a
+            else:
+                # Make sure log_probs.py doesn't try to gather at WL/D positions
+                all_batch["wl_action_mask"] = torch.zeros_like(all_batch["wl_action_mask"])
+                all_batch["d_action_mask"] = torch.zeros_like(all_batch["d_action_mask"])
             print_rank0(f"  Caching ref log-probs ({N} sequences) ...")
             t_cache = time.time()
             ref_lp_chunks = []

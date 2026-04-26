@@ -19,6 +19,9 @@ grpo:
   kl_coeff: 0.005
   ppo_epochs: 1
   max_kl: 1000.0
+  # Treat WL/D bucket samples as additional policy actions. Requires
+  # rollout.wl_temperature and rollout.d_temperature to be > 0 below.
+  value_action_space: false
 
 rollout:
   rollout_batch_size: 320
@@ -26,6 +29,8 @@ rollout:
   think_temperature: 0.8
   policy_temperature: 0.8
   board_temperature: 0.0
+  wl_temperature: 0.5
+  d_temperature: 0.5
 
 training:
   learning_rate: 1.0e-5

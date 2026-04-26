@@ -34,6 +34,10 @@ def parse_rollout(
     d_entries: list[tuple[int, float]],
     max_seq_len: int,
     move_log_probs: list[tuple[int, float]] | None = None,
+    wl_bucket_indices: list[tuple[int, int]] | None = None,
+    d_bucket_indices: list[tuple[int, int]] | None = None,
+    wl_log_probs: list[tuple[int, float]] | None = None,
+    d_log_probs: list[tuple[int, float]] | None = None,
 ) -> dict:
     """Parse a single rollout's token sequence into model-ready tensors.
 
@@ -75,6 +79,40 @@ def parse_rollout(
     for pos, val in d_lookup.items():
         d_positions[pos] = True
         d_values[pos] = val
+
+    # WL/D actions for GRPO over value heads. wl_action_mask marks positions
+    # whose hidden state produced the WL bucket sample (= one position before
+    # the wl_value token, mirroring the thinking_move_mask convention). The
+    # bucket idx and old log_prob are aligned to the SAME prediction position.
+    wl_action_mask = torch.zeros(max_seq_len, dtype=torch.bool)
+    d_action_mask = torch.zeros(max_seq_len, dtype=torch.bool)
+    wl_bucket_ids = torch.zeros(max_seq_len, dtype=torch.long)
+    d_bucket_ids = torch.zeros(max_seq_len, dtype=torch.long)
+    wl_old_log_probs = torch.zeros(max_seq_len, dtype=torch.float32)
+    d_old_log_probs = torch.zeros(max_seq_len, dtype=torch.float32)
+
+    if wl_bucket_indices:
+        for pos, bucket_idx in wl_bucket_indices:
+            pred_pos = pos - 1
+            if 0 <= pred_pos < max_seq_len:
+                wl_action_mask[pred_pos] = True
+                wl_bucket_ids[pred_pos] = bucket_idx
+    if d_bucket_indices:
+        for pos, bucket_idx in d_bucket_indices:
+            pred_pos = pos - 1
+            if 0 <= pred_pos < max_seq_len:
+                d_action_mask[pred_pos] = True
+                d_bucket_ids[pred_pos] = bucket_idx
+    if wl_log_probs:
+        for pos, lp in wl_log_probs:
+            pred_pos = pos - 1
+            if 0 <= pred_pos < max_seq_len:
+                wl_old_log_probs[pred_pos] = lp
+    if d_log_probs:
+        for pos, lp in d_log_probs:
+            pred_pos = pos - 1
+            if 0 <= pred_pos < max_seq_len:
+                d_old_log_probs[pred_pos] = lp
 
     # Walk tokens to identify blocks and move positions
     block_boundaries: list[tuple[int, int]] = []
@@ -138,6 +176,12 @@ def parse_rollout(
         "final_move_mask": final_move_mask,
         "move_token_ids": move_token_ids,
         "old_log_probs": old_log_probs,
+        "wl_action_mask": wl_action_mask,
+        "d_action_mask": d_action_mask,
+        "wl_bucket_ids": wl_bucket_ids,
+        "d_bucket_ids": d_bucket_ids,
+        "wl_old_log_probs": wl_old_log_probs,
+        "d_old_log_probs": d_old_log_probs,
         "seq_len": seq_len,
     }
 
@@ -154,7 +198,10 @@ def collate_rollouts(parsed_list: list[dict], device: torch.device) -> dict:
     """
     keys = ["input_ids", "block_id", "wl_positions", "d_positions",
             "wl_values", "d_values", "thinking_move_mask", "final_move_mask",
-            "move_token_ids", "old_log_probs"]
+            "move_token_ids", "old_log_probs",
+            "wl_action_mask", "d_action_mask",
+            "wl_bucket_ids", "d_bucket_ids",
+            "wl_old_log_probs", "d_old_log_probs"]
     batch = {}
     for k in keys:
         batch[k] = torch.stack([p[k] for p in parsed_list]).to(device)

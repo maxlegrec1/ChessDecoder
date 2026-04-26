@@ -24,6 +24,13 @@ class RolloutResult:
     # (thinking moves + final move). Position matches thinking_move_mask /
     # final_move_mask positions in sequence.py::parse_rollout.
     move_log_probs: list[tuple[int, float]]
+    # WL/D bucket sampling — recorded so GRPO can reinforce wl_head/d_head.
+    # Position is the wl_value/d_value token position; parse_rollout
+    # subtracts 1 to align with the hidden state that produced the sample.
+    wl_bucket_indices: list[tuple[int, int]]
+    d_bucket_indices: list[tuple[int, int]]
+    wl_log_probs: list[tuple[int, float]]
+    d_log_probs: list[tuple[int, float]]
     num_tokens: int
 
 
@@ -39,6 +46,8 @@ def _run_rollouts_subprocess(export_dir: str, fens_json_path: str, results_path:
     think_temp = data["think_temperature"]
     policy_temp = data["policy_temperature"]
     board_temp = data["board_temperature"]
+    wl_temp = data.get("wl_temperature", 0.0)
+    d_temp = data.get("d_temperature", 0.0)
 
     engine = cpp.ThinkingBatchedInferenceEngine(
         str(Path(export_dir) / "backbone.pt"),
@@ -50,6 +59,8 @@ def _run_rollouts_subprocess(export_dir: str, fens_json_path: str, results_path:
     engine.think_temperature = think_temp
     engine.policy_temperature = policy_temp
     engine.board_temperature = board_temp
+    engine.wl_temperature = wl_temp
+    engine.d_temperature = d_temp
 
     all_results = []
     for start in range(0, len(all_fens), ibs):
@@ -62,6 +73,10 @@ def _run_rollouts_subprocess(export_dir: str, fens_json_path: str, results_path:
                 "wl_entries": list(r.wl_entries),
                 "d_entries": list(r.d_entries),
                 "move_log_probs": list(r.move_log_probs),
+                "wl_bucket_indices": list(r.wl_bucket_indices),
+                "d_bucket_indices": list(r.d_bucket_indices),
+                "wl_log_probs": list(r.wl_log_probs),
+                "d_log_probs": list(r.d_log_probs),
             })
         print(f"  [rollout] {start + len(chunk)}/{len(all_fens)} done", flush=True)
 
@@ -111,6 +126,8 @@ def generate_rollouts(
             "think_temperature": config.think_temperature,
             "policy_temperature": config.policy_temperature,
             "board_temperature": config.board_temperature,
+            "wl_temperature": config.wl_temperature,
+            "d_temperature": config.d_temperature,
         }, f)
 
     # Run in subprocess with expandable_segments to avoid CUDA fragmentation.
@@ -151,6 +168,10 @@ def generate_rollouts(
             wl_entries=[tuple(e) for e in r["wl_entries"]],
             d_entries=[tuple(e) for e in r["d_entries"]],
             move_log_probs=[tuple(e) for e in r.get("move_log_probs", [])],
+            wl_bucket_indices=[tuple(e) for e in r.get("wl_bucket_indices", [])],
+            d_bucket_indices=[tuple(e) for e in r.get("d_bucket_indices", [])],
+            wl_log_probs=[tuple(e) for e in r.get("wl_log_probs", [])],
+            d_log_probs=[tuple(e) for e in r.get("d_log_probs", [])],
             num_tokens=len(r["token_ids"]),
         ))
 

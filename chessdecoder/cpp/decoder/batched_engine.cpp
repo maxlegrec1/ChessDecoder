@@ -150,23 +150,34 @@ torch::Tensor ThinkingBatchedInferenceEngine::evalBoardHead(torch::Tensor h, flo
     return sampleBatched(logits, temp);  // [B] board sub-vocab indices
 }
 
-torch::Tensor ThinkingBatchedInferenceEngine::evalWlHead(torch::Tensor h, float temp)
+ThinkingBatchedInferenceEngine::ValueSample
+ThinkingBatchedInferenceEngine::evalWlHead(torch::Tensor h, float temp)
 {
-    // h: [B, E] → MLP → [B, n_buckets] → sample → bucket center values [B]
+    // h: [B, E] → MLP → [B, n_buckets]. Sample with `temp`, but record the
+    // log-prob from the UNSCALED log_softmax (matches Python's
+    // chessdecoder/rl/log_probs.py — same convention as evalPolicyHead so
+    // current/old log-probs stay consistent for the GRPO ratio).
     auto hidden = torch::mm(h, wl_w1_t_) + wl_b1_;
     hidden = torch::mish(hidden);
     auto logits = torch::mm(hidden, wl_w2_t_) + wl_b2_;
-    auto idx = sampleBatched(logits, temp);  // [B]
-    return wl_centers_.index({idx});  // [B] float values
+    auto log_probs = torch::log_softmax(logits.to(torch::kFloat32), /*dim=*/1);
+    auto idx = sampleBatched(logits, temp);                              // [B]
+    auto idx_lp = log_probs.gather(1, idx.unsqueeze(1)).squeeze(1);      // [B]
+    auto value = wl_centers_.index({idx});                                // [B]
+    return {idx, value, idx_lp};
 }
 
-torch::Tensor ThinkingBatchedInferenceEngine::evalDHead(torch::Tensor h, float temp)
+ThinkingBatchedInferenceEngine::ValueSample
+ThinkingBatchedInferenceEngine::evalDHead(torch::Tensor h, float temp)
 {
     auto hidden = torch::mm(h, d_w1_t_) + d_b1_;
     hidden = torch::mish(hidden);
     auto logits = torch::mm(hidden, d_w2_t_) + d_b2_;
+    auto log_probs = torch::log_softmax(logits.to(torch::kFloat32), /*dim=*/1);
     auto idx = sampleBatched(logits, temp);
-    return d_centers_.index({idx});
+    auto idx_lp = log_probs.gather(1, idx.unsqueeze(1)).squeeze(1);
+    auto value = d_centers_.index({idx});
+    return {idx, value, idx_lp};
 }
 
 std::pair<torch::Tensor, torch::Tensor>
@@ -243,6 +254,8 @@ ThinkingBatchedInferenceEngine::predictMoves(
     std::vector<std::vector<int>> block_ids(B);
     std::vector<std::vector<std::pair<int, float>>> wl_entries(B), d_entries(B);
     std::vector<std::vector<std::pair<int, float>>> move_log_probs(B);
+    std::vector<std::vector<std::pair<int, int>>>   wl_bucket_indices(B), d_bucket_indices(B);
+    std::vector<std::vector<std::pair<int, float>>> wl_log_probs(B), d_log_probs(B);
     std::vector<int> next_block(B, 0);
     std::vector<int> orphan_ctr(B, 10000);
     std::vector<std::string> first_root_move(B);
@@ -422,13 +435,17 @@ ThinkingBatchedInferenceEngine::predictMoves(
         // ── Step 2b: WL_D ──────────────────────────────────────────────
         {
             // WL
-            auto wl_vals = evalWlHead(saved_h, wl_temp);
-            auto wl_cpu = wl_vals.cpu();
+            auto wl_sample = evalWlHead(saved_h, wl_temp);
+            auto wl_cpu = wl_sample.value.cpu();
             auto wl_a = wl_cpu.accessor<float, 1>();
+            auto wl_idx_cpu = wl_sample.idx.cpu();
+            auto wl_idx_a = wl_idx_cpu.accessor<int64_t, 1>();
+            auto wl_lp_cpu = wl_sample.log_prob.cpu();
+            auto wl_lp_a = wl_lp_cpu.accessor<float, 1>();
 
             auto wl_ids_t = torch::full({B, 1}, wl_value_idx, opts_int);
             auto wl_pos = makePosT();
-            auto wl_ov = wl_vals.to(torch::kFloat16).unsqueeze(1);
+            auto wl_ov = wl_sample.value.to(torch::kFloat16).unsqueeze(1);
             auto wl_om = need_move.unsqueeze(1);
             auto h_wl = backbone_->prefixIncremental(wl_ids_t, wl_pos,
                                                      wl_ov, wl_om, need_move);
@@ -440,18 +457,24 @@ ThinkingBatchedInferenceEngine::predictMoves(
                 token_ids[b].push_back(wl_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
                 wl_entries[b].push_back({seq_pos[b], wl_a[b]});
+                wl_bucket_indices[b].push_back({seq_pos[b], (int)wl_idx_a[b]});
+                wl_log_probs[b].push_back({seq_pos[b], wl_lp_a[b]});
                 seq_pos[b]++;
             }
             cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
 
             // D
-            auto d_vals = evalDHead(saved_h, d_temp);
-            auto d_cpu = d_vals.cpu();
+            auto d_sample = evalDHead(saved_h, d_temp);
+            auto d_cpu = d_sample.value.cpu();
             auto d_a = d_cpu.accessor<float, 1>();
+            auto d_idx_cpu = d_sample.idx.cpu();
+            auto d_idx_a = d_idx_cpu.accessor<int64_t, 1>();
+            auto d_lp_cpu = d_sample.log_prob.cpu();
+            auto d_lp_a = d_lp_cpu.accessor<float, 1>();
 
             auto d_ids_t = torch::full({B, 1}, d_value_idx, opts_int);
             auto d_pos = makePosT();
-            auto d_ov = d_vals.to(torch::kFloat16).unsqueeze(1);
+            auto d_ov = d_sample.value.to(torch::kFloat16).unsqueeze(1);
             auto d_om = need_move.unsqueeze(1);
             auto h_d = backbone_->prefixIncremental(d_ids_t, d_pos,
                                                     d_ov, d_om, need_move);
@@ -463,6 +486,8 @@ ThinkingBatchedInferenceEngine::predictMoves(
                 token_ids[b].push_back(d_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
                 d_entries[b].push_back({seq_pos[b], d_a[b]});
+                d_bucket_indices[b].push_back({seq_pos[b], (int)d_idx_a[b]});
+                d_log_probs[b].push_back({seq_pos[b], d_lp_a[b]});
                 seq_pos[b]++;
             }
             cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
@@ -781,6 +806,10 @@ ThinkingBatchedInferenceEngine::predictMoves(
         results[b].wl_entries = std::move(wl_entries[b]);
         results[b].d_entries = std::move(d_entries[b]);
         results[b].move_log_probs = std::move(move_log_probs[b]);
+        results[b].wl_bucket_indices = std::move(wl_bucket_indices[b]);
+        results[b].d_bucket_indices = std::move(d_bucket_indices[b]);
+        results[b].wl_log_probs = std::move(wl_log_probs[b]);
+        results[b].d_log_probs = std::move(d_log_probs[b]);
     }
 
     results.resize(B_actual);
