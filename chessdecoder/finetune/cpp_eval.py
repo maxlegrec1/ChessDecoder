@@ -22,7 +22,12 @@ from chessdecoder.utils.uci import normalize_castling
 # ──────────────────────────────────────────────────────────
 
 def _run_inference(tmp_dir, var_positions_json, pt_positions_json, results_path):
-    """Run C++ inference engine and write results to disk. Called in subprocess."""
+    """Run C++ inference engine and write results to disk. Called in subprocess.
+
+    Uses the single engine (one position at a time) so it doesn't compete with
+    the training model for GPU memory. For large-N retrospective evaluation,
+    use scripts/eval_thinking_model_cpp_metrics.py with the batched engine.
+    """
     import _decoder_inference_cpp as cpp
 
     var_positions = json.loads(var_positions_json)
@@ -123,7 +128,7 @@ def evaluate(model, config, var_positions, pt_positions, step):
             [sys.executable, "-m", "chessdecoder.finetune.cpp_eval_worker",
              str(tmp_dir), str(var_json_path), str(pt_json_path), str(results_path)],
             capture_output=False,
-            timeout=600,
+            timeout=1200,
         )
 
         if proc.returncode != 0:

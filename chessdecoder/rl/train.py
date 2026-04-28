@@ -131,7 +131,7 @@ class PositionStream:
                     f"{self._positions_served} positions served")
 
 
-def _rl_extra_state(config, position_stream):
+def _rl_extra_state(config, position_stream, eval_var_positions, eval_pt_positions):
     """Build the RL-specific extra_state for save_training_checkpoint."""
     return {
         "config": {
@@ -144,6 +144,10 @@ def _rl_extra_state(config, position_stream):
             },
         },
         "position_stream": position_stream.state_dict(),
+        "cpp_eval_positions": {
+            "var": eval_var_positions,
+            "pt": eval_pt_positions,
+        },
     }
 
 
@@ -187,6 +191,16 @@ def train():
     load_pretrained_checkpoint(model, config.finetuned_checkpoint, device)
     print_rank0(f"Loaded finetuned checkpoint: {config.finetuned_checkpoint}")
 
+    # Reach into the finetuned checkpoint dict (separately from
+    # load_pretrained_checkpoint, which only takes the model_state_dict)
+    # to inherit any cpp_eval_positions persisted there. Reusing the same
+    # eval set as finetuning makes the RL cpp_* metrics directly comparable
+    # to the finetune wandb trace.
+    _ft_ckpt_dict = torch.load(config.finetuned_checkpoint, map_location="cpu",
+                               weights_only=False)
+    _inherited_eval = _ft_ckpt_dict.get("cpp_eval_positions")
+    del _ft_ckpt_dict
+
     # Reference model (frozen copy — always from the finetuned checkpoint,
     # NOT from a resumed RL checkpoint, so KL is measured against the original)
     ref_model = _build_model()
@@ -209,6 +223,7 @@ def train():
     # ── Resume from RL checkpoint ─────────────────────────────────────────
     start_step = 0
     _resume_stream_state = None
+    _resumed_eval = None
     if config.resume_from:
         rl_ckpts = sorted(
             [f for f in os.listdir(config.resume_from)
@@ -225,6 +240,7 @@ def train():
         scaler.load_state_dict(rl_checkpoint["scaler_state_dict"])
         start_step = rl_checkpoint["step"]
         _resume_stream_state = rl_checkpoint.get("position_stream")
+        _resumed_eval = rl_checkpoint.get("cpp_eval_positions")
         # Advance scheduler to match
         for _ in range(start_step):
             scheduler.step()
@@ -256,14 +272,28 @@ def train():
     if _resume_stream_state is not None:
         position_stream.load_state_dict(_resume_stream_state)
 
-    # Eval positions (fixed set for periodic C++ evaluation)
-    eval_var_positions = load_variation_positions(
-        config.variation_parquet_dir, config.num_eval_positions, config.eval_seed + 1,
-    )
-    eval_pt_positions = load_pretrain_positions(
-        config.pretrain_parquet_dir, config.num_eval_positions, config.eval_seed + 2,
-        files=eval_pretrain_files,
-    )
+    # Eval positions (fixed set for periodic C++ evaluation).
+    # Precedence: RL resume > finetuned-checkpoint inheritance > fresh sample.
+    # Inheriting from the finetuned checkpoint keeps RL's cpp_* metrics on
+    # the same positions the finetune wandb trace was reporting on, so the
+    # two are directly comparable.
+    inherited = _resumed_eval if _resumed_eval is not None else _inherited_eval
+    if inherited is not None:
+        eval_var_positions = inherited.get("var", [])
+        eval_pt_positions = inherited.get("pt", [])
+        src = "RL checkpoint" if _resumed_eval is not None else "finetuned checkpoint"
+        print_rank0(f"Reused {len(eval_var_positions)} variation + "
+                    f"{len(eval_pt_positions)} pretrain eval positions from {src}")
+    else:
+        eval_var_positions = load_variation_positions(
+            config.variation_parquet_dir, config.num_eval_positions, config.eval_seed + 1,
+        )
+        eval_pt_positions = load_pretrain_positions(
+            config.pretrain_parquet_dir, config.num_eval_positions, config.eval_seed + 2,
+            files=eval_pretrain_files,
+        )
+        print_rank0(f"Sampled {len(eval_var_positions)} variation + "
+                    f"{len(eval_pt_positions)} pretrain eval positions (fresh)")
 
     # ── Reward function ───────────────────────────────────────────────────
     reward_fn = CompositeReward(
@@ -528,7 +558,8 @@ def train():
                 save_training_checkpoint(
                     Path(checkpoint_dir) / f"checkpoint_rl_step_{outer_step}.pt",
                     model=model, optimizer=optimizer, scaler=scaler, step=outer_step,
-                    extra_state=_rl_extra_state(config, position_stream),
+                    extra_state=_rl_extra_state(config, position_stream,
+                                                eval_var_positions, eval_pt_positions),
                 )
 
             # ── C++ evaluation ────────────────────────────────────────────
@@ -554,7 +585,8 @@ def train():
             save_training_checkpoint(
                 Path(checkpoint_dir) / f"checkpoint_rl_step_{outer_step}.pt",
                 model=model, optimizer=optimizer, scaler=scaler, step=outer_step,
-                extra_state=_rl_extra_state(config, position_stream),
+                extra_state=_rl_extra_state(config, position_stream,
+                                                eval_var_positions, eval_pt_positions),
             )
 
     finally:

@@ -124,19 +124,30 @@ def train():
         world_size=world_size,
     )
 
-    # Load fixed eval positions for C++ selfplay evaluation (rank 0 only)
+    # Load fixed eval positions for C++ selfplay evaluation (rank 0 only).
+    # If the resumed checkpoint already carries eval positions, reuse them so
+    # the cpp_* metrics track the SAME positions across every resume — without
+    # this, sample_one_per_game's PYTHONHASHSEED-affected hash randomizes the
+    # 100-position eval set on every restart and the wandb trace becomes noise.
     cpp_eval_n = config["training"].get("cpp_eval_n_positions", 0)
     cpp_eval_seed = config["training"].get("cpp_eval_seed", 42)
     cpp_var_eval_positions = []
     cpp_pt_eval_positions = []
     if is_main_process() and cpp_eval_n > 0:
-        cpp_var_eval_positions = load_cpp_variation_positions(
-            config["data"]["variation_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed,
-            files=val_variation_files)
-        cpp_pt_eval_positions = load_cpp_pretrain_positions(
-            config["data"]["pretrain_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed)
-        print_rank0(f"Loaded {len(cpp_var_eval_positions)} variation (held-out) + "
-                    f"{len(cpp_pt_eval_positions)} pretrain positions for C++ selfplay eval")
+        if resume_from and "cpp_eval_positions" in ft_checkpoint:
+            saved = ft_checkpoint["cpp_eval_positions"]
+            cpp_var_eval_positions = saved.get("var", [])
+            cpp_pt_eval_positions = saved.get("pt", [])
+            print_rank0(f"Reused {len(cpp_var_eval_positions)} variation + "
+                        f"{len(cpp_pt_eval_positions)} pretrain positions from checkpoint")
+        else:
+            cpp_var_eval_positions = load_cpp_variation_positions(
+                config["data"]["variation_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed,
+                files=val_variation_files)
+            cpp_pt_eval_positions = load_cpp_pretrain_positions(
+                config["data"]["pretrain_parquet_dir"], n=cpp_eval_n, seed=cpp_eval_seed)
+            print_rank0(f"Sampled {len(cpp_var_eval_positions)} variation (held-out) + "
+                        f"{len(cpp_pt_eval_positions)} pretrain positions for C++ selfplay eval")
 
     # Optimizer
     optimizer = optim.AdamW(
@@ -204,6 +215,14 @@ def train():
         )
 
     model.train()
+
+    # Eval positions to persist in every checkpoint (rank-0 only set; safe
+    # to include in extra_state — non-rank-0 just stores empty lists).
+    def _eval_positions_extra():
+        return {"cpp_eval_positions": {
+            "var": cpp_var_eval_positions,
+            "pt": cpp_pt_eval_positions,
+        }}
 
     # Loss weights
     final_move_weight = config["loss"]["final_move_weight"]
@@ -494,7 +513,8 @@ def train():
                 save_training_checkpoint(
                     os.path.join(run_checkpoint_dir, f"checkpoint_step_{step}.pt"),
                     model=model, optimizer=optimizer, scaler=scaler, step=step,
-                    extra_state={"epoch": epoch, "epoch_step": epoch_step, "config": config},
+                    extra_state={"epoch": epoch, "epoch_step": epoch_step, "config": config,
+                                 **_eval_positions_extra()},
                 )
 
                 # C++ selfplay evaluation (inline on rank 0)
@@ -516,7 +536,8 @@ def train():
             save_training_checkpoint(
                 os.path.join(run_checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt"),
                 model=model, optimizer=optimizer, scaler=scaler, step=step,
-                extra_state={"epoch": epoch + 1, "epoch_step": 0, "config": config},
+                extra_state={"epoch": epoch + 1, "epoch_step": 0, "config": config,
+                             **_eval_positions_extra()},
             )
         barrier()
 
