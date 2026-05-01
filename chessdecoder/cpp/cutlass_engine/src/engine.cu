@@ -1,8 +1,14 @@
 #include "cutlass_engine/engine.hpp"
 #include "cutlass_engine/check.hpp"
+#include "cutlass_engine/kernels.hpp"
 
+#include "vocab.hpp"   // existing DecoderVocab from chessdecoder/cpp/decoder/
+
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
+#include <vector>
 
 namespace cutlass_engine {
 
@@ -63,7 +69,7 @@ std::size_t estimate_arena_bytes(const ModelConfig& c) {
 
 ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
                                const std::string& weights_dir,
-                               const std::string& /*vocab_json*/,
+                               const std::string& vocab_json,
                                const std::string& config_json,
                                int batch_size) {
     cfg_ = load_model_config(config_json, batch_size);
@@ -74,9 +80,25 @@ ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
     w_ = load_weights(weights_dir, cfg_, arena_);
     kv_.allocate(cfg_, arena_);
 
-    // Worst-case workspace: prefill of 71 tokens × B.
-    const int max_M = cfg_.batch_size * 71;
+    // Worst-case workspace: prefill of `max_init_S_` tokens × B.
+    const int max_M = cfg_.batch_size * max_init_S_;
     model_.initialize(cfg_, w_, arena_, max_M);
+
+    // Per-call scratch.
+    const int B = cfg_.batch_size;
+    d_ids_buf_   = arena_.allocT<int32_t>(max_M);
+    d_pos_buf_   = arena_.allocT<int32_t>(max_M);
+    d_block_buf_ = arena_.allocT<int32_t>(max_M);
+    d_active_buf_= arena_.allocT<int32_t>(B);
+    d_hidden_buf_= arena_.allocT<__half>(max_M * cfg_.embed_dim);
+    d_last_h_buf_= arena_.allocT<__half>(B * cfg_.embed_dim);
+    d_logits_buf_= arena_.allocT<__half>(B * std::max(cfg_.move_vocab_size, cfg_.board_vocab_size));
+    d_legal_mask_= arena_.allocT<bool>(B * cfg_.move_vocab_size);
+    d_idx_out_   = arena_.allocT<int32_t>(B);
+
+    if (!vocab_json.empty()) {
+        vocab_.reset(new decoder::DecoderVocab(vocab_json));
+    }
 
     std::printf("[cutlass_engine] arena: %.2f GB used of %.2f GB reserved\n",
                 arena_.used_bytes() / 1e9, arena_.total_bytes() / 1e9);
@@ -147,30 +169,131 @@ void ThinkingEngine::forward_decode_test(std::uintptr_t ids, std::uintptr_t pos,
 }
 
 std::vector<RolloutResult> ThinkingEngine::predict_moves(
-    const std::vector<std::string>& fens, float /*fallback_temperature*/) {
-    sched_.initialize(cfg_.batch_size, (int)fens.size());
-    sched_.enqueue_all();
+    const std::vector<std::string>& fens, float fallback_temperature) {
+    if (!vocab_) {
+        throw std::runtime_error(
+            "predict_moves: engine constructed without vocab_json — vocab is required");
+    }
+    const int N = (int)fens.size();
+    const int B = cfg_.batch_size;
+    const int E = cfg_.embed_dim;
+    const int Mv = cfg_.move_vocab_size;
 
-    // SCAFFOLD: this is the entry point that drives the per-state batched
-    // engine loop. The kernels and model are in place, but the per-state
-    // dispatch + sampler-to-state-machine wiring is the bulk of Phase E.
+    std::vector<RolloutResult> results(N);
+
+    // Process FENs in chunks of B at a time.  Within each chunk, all slots
+    // run a single prefill on a [B, S=68] block, then the policy_head reads
+    // the last position's hidden, applies a per-slot legal-move mask, and
+    // samples (argmax for temp=0).
     //
-    // What's in place (wired): model.forward_decode / model.forward_prefill_block,
-    // kv_cache management, FMHA decode/prefill, all sampler kernels, head GEMMs.
-    //
-    // What remains: a host-side dispatcher that for each step (a) collects
-    // active slots by state, (b) populates per-state input tensors (ids, pos,
-    // legal_mask), (c) launches forward_decode + the head + sampler for that
-    // state, (d) reads back sampled idx + log_p (or buffers them on-device for
-    // batched D2H at end-of-rollout), (e) updates SlotInfo per slot. This
-    // dispatcher is the next session's work.
-    //
-    // For now we throw so callers see the engine is partial, not silently
-    // producing nonsense.
-    throw std::runtime_error(
-        "cutlass_engine.predict_moves: per-state dispatch not yet wired. "
-        "Phases A–C complete; Phase E (engine driver) is the next milestone. "
-        "See chessdecoder/cpp/decoder/ for the working libtorch-based engine.");
+    // This is the "no-thinking" path — equivalent to the existing
+    // libtorch engine's `fallbackMove`.  The full thinking-trace state
+    // machine is the next step (see plan).
+    constexpr int S = 68;  // tokens per FEN (start_pos + 64 squares + end_pos + castling + stm)
+
+    for (int chunk_start = 0; chunk_start < N; chunk_start += B) {
+        int chunk_n = std::min(B, N - chunk_start);
+
+        // Build per-slot CPU buffers.
+        std::vector<int32_t> ids_h(B * S, 0);
+        std::vector<int32_t> pos_h(B * S, 0);
+        std::vector<int32_t> block_h(B * S, 0);
+        std::vector<int32_t> active_h(B, 0);
+        std::vector<uint8_t> legal_h(B * Mv, 0);  // bool packed as u8
+
+        for (int b = 0; b < chunk_n; ++b) {
+            const auto& fen = fens[chunk_start + b];
+            auto tokens = vocab_->fenToTokenIds(fen);
+            if ((int)tokens.size() != S) {
+                throw std::runtime_error(
+                    "fenToTokenIds returned " + std::to_string(tokens.size()) +
+                    " tokens for FEN '" + fen + "', expected 68");
+            }
+            for (int s = 0; s < S; ++s) {
+                ids_h[b * S + s]   = tokens[s];
+                pos_h[b * S + s]   = s;
+                block_h[b * S + s] = 0;  // single block — full bidirectional within FEN
+            }
+            active_h[b] = 1;
+
+            auto legal = vocab_->legalMoveIndices(fen);
+            for (int idx : legal) {
+                if (idx >= 0 && idx < Mv) legal_h[b * Mv + idx] = 1;
+            }
+        }
+
+        // Upload.
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_ids_buf_, ids_h.data(),
+                                      B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_pos_buf_, pos_h.data(),
+                                      B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_block_buf_, block_h.data(),
+                                      B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_active_buf_, active_h.data(),
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_legal_mask_, legal_h.data(),
+                                      B * Mv * sizeof(uint8_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+
+        // Run prefill.  Output is hidden [B, S, E].
+        model_.forward_prefill_block(d_ids_buf_, d_pos_buf_, d_block_buf_,
+                                     d_active_buf_,
+                                     /*wl_pos=*/nullptr, /*d_pos=*/nullptr,
+                                     /*wl_val=*/nullptr, /*d_val=*/nullptr,
+                                     B, S, d_hidden_buf_, stream_.get());
+
+        // Extract last position [B, E] = hidden[:, S-1, :] into d_last_h_buf_.
+        // cudaMemcpy2D handles the stride cleanly.
+        CE_CUDA_CHECK(cudaMemcpy2DAsync(
+            d_last_h_buf_,                                                  // dst
+            E * sizeof(__half),                                             // dst pitch
+            d_hidden_buf_ + (S - 1) * E,                                    // src (offset to last row of slot 0)
+            S * E * sizeof(__half),                                         // src pitch (stride between slots)
+            E * sizeof(__half),                                             // width per row
+            B,                                                              // num rows
+            cudaMemcpyDeviceToDevice, stream_.get()));
+
+        // Policy head GEMM: [B, E] @ [Mv, E]^T + bias → [B, Mv].
+        gemm_fp16(d_last_h_buf_, w_.policy_head_w, w_.policy_head_b,
+                  d_logits_buf_, B, Mv, E, nullptr, 0, stream_.get());
+
+        // Apply legal mask in-place on logits.
+        apply_legal_mask_fp16(d_logits_buf_, d_legal_mask_, B, Mv, stream_.get());
+
+        // Sample.
+        if (fallback_temperature == 0.0f || policy_t_ == 0.0f) {
+            argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
+        } else {
+            // Gumbel sampling — needs philox state per slot.  For now, fall
+            // back to argmax.  Multinomial sampling will be wired with a
+            // per-slot RNG state in a follow-up commit; this path documents
+            // the call site.
+            argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
+        }
+
+        // Pull move sub-vocab idx back to host.
+        std::vector<int32_t> idx_h(B);
+        CE_CUDA_CHECK(cudaMemcpyAsync(idx_h.data(), d_idx_out_,
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyDeviceToHost, stream_.get()));
+        stream_.sync();
+
+        for (int b = 0; b < chunk_n; ++b) {
+            int sub_idx = idx_h[b];
+            int full_idx = vocab_->moveIdxToFullIdx(sub_idx);
+            std::string move_pseudo = vocab_->idxToToken(full_idx);
+            std::string move_uci = decoder::DecoderVocab::pseudoToStandardUci(move_pseudo);
+
+            auto& r = results[chunk_start + b];
+            r.move = move_uci;
+        }
+    }
+
+    return results;
 }
 
 }  // namespace cutlass_engine

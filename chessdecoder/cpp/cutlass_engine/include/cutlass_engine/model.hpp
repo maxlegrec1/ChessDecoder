@@ -43,13 +43,14 @@ public:
     // last-position K/V (or all positions) into cache via kv_scatter.
     //
     // block_id [B, S] int32 — for prefix mask
+    // active   [B] int32   — gates per-slot work
     void forward_prefill_block(const int32_t* ids,        // [B, S]
                                const int32_t* pos,        // [B, S]
                                const int32_t* block_id,   // [B, S]
+                               const int32_t* active,     // [B]
                                const bool* wl_pos, const bool* d_pos,
                                const __half* wl_val, const __half* d_val,
                                int B, int S,
-                               KvCache& kv,
                                __half* out_h,             // [B, S, E]
                                cudaStream_t stream);
 
@@ -63,6 +64,7 @@ private:
     const ModelWeights* w_{nullptr};
     LayerWorkspace ws_{};
     LayerContext ctx_{};
+    KvCache ws_kv_stub_{};  // placeholder for prefill-mode active-mask routing
 };
 
 }  // namespace cutlass_engine

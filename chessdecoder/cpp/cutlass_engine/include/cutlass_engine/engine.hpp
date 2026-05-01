@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <cstdint>
+
 #include "cutlass_engine/allocator.hpp"
 #include "cutlass_engine/config.hpp"
 #include "cutlass_engine/kv_cache.hpp"
@@ -11,6 +13,8 @@
 #include "cutlass_engine/scheduler.hpp"
 #include "cutlass_engine/stream.hpp"
 #include "cutlass_engine/weights.hpp"
+
+namespace decoder { class DecoderVocab; }
 
 namespace cutlass_engine {
 
@@ -74,6 +78,20 @@ private:
     ChessDecoderModel model_;
     KvCache kv_;
     Scheduler sched_;
+    std::unique_ptr<decoder::DecoderVocab> vocab_;
+
+    // Per-call scratch.  Sized at construction.
+    int32_t* d_ids_buf_{nullptr};       // [B, max_init_S] int32
+    int32_t* d_pos_buf_{nullptr};       // [B, max_init_S] int32
+    int32_t* d_block_buf_{nullptr};     // [B, max_init_S] int32
+    int32_t* d_active_buf_{nullptr};    // [B] int32
+    __half*  d_hidden_buf_{nullptr};    // [B, max_init_S, E]
+    __half*  d_last_h_buf_{nullptr};    // [B, E] last-position hidden
+    __half*  d_logits_buf_{nullptr};    // [B, move_vocab] (head outputs)
+    bool*    d_legal_mask_{nullptr};    // [B, move_vocab]
+    int32_t* d_idx_out_{nullptr};       // [B] int32
+
+    int max_init_S_{71};
 
     float board_t_{0.0f};
     float think_t_{0.0f};

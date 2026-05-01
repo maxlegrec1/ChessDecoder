@@ -102,10 +102,10 @@ void ChessDecoderModel::forward_decode_partial(const int32_t* ids,
 void ChessDecoderModel::forward_prefill_block(const int32_t* ids,
                                               const int32_t* pos,
                                               const int32_t* block_id,
+                                              const int32_t* active,
                                               const bool* wl_pos, const bool* d_pos,
                                               const __half* wl_val, const __half* d_val,
                                               int B, int S,
-                                              KvCache& /*kv*/,
                                               __half* out_h,
                                               cudaStream_t stream) {
     const int M = B * S;
@@ -120,23 +120,13 @@ void ChessDecoderModel::forward_prefill_block(const int32_t* ids,
     CE_CUDA_CHECK(cudaMemcpyAsync(ws_.pos, pos, M * sizeof(int32_t),
                                   cudaMemcpyDeviceToDevice, stream));
 
-    // Prefill mode: KV cache is NOT used by attention; the caller will scatter
-    // the resulting K/V into cache themselves once the block is finalized. We
-    // pass a temporary kv-like wrapper for the API contract.
-    KvCache dummy_kv;  // not allocated; only past_len/slot_active needed for active mask
-    // Reuse the caller's kv slot_active by faking it — but since prefill mode
-    // doesn't read from cache, we just need slot_active to be valid. The clean
-    // version threads it through; for now we let attention_block_forward dispatch
-    // PrefillBlock and ignore dummy_kv's K/V buffers entirely.
-    (void)dummy_kv;
-
-    // FIXME: prefill currently reuses the live kv's slot_active mask via the
-    // ForwardMode::PrefillBlock branch. The cleaner fix is a PrefillContext
-    // that carries the active mask explicitly. For now the caller must pass
-    // an externally-owned active vector; not wired in this scaffold.
+    // Prefill mode: KV cache is NOT used by attention.  We thread `active`
+    // into the per-layer call by stashing it on a tiny stack KvCache stand-in.
+    KvCache stub_kv = ws_kv_stub_;
+    stub_kv.set_slot_active_ptr(const_cast<int32_t*>(active));
 
     for (int li = 0; li < cfg_->num_layers; ++li) {
-        transformer_layer_forward(ctx_, w_->layers[li], ws_, dummy_kv, li,
+        transformer_layer_forward(ctx_, w_->layers[li], ws_, stub_kv, li,
                                   ForwardMode::PrefillBlock, B, S, block_id,
                                   stream);
     }

@@ -25,6 +25,7 @@ public:
     __half* V() { return V_; }
     int32_t* past_len() { return past_len_; }
     int32_t* slot_active() { return slot_active_; }
+    void set_slot_active_ptr(int32_t* p) { slot_active_ = p; }
 
     // Reset slot to logical zero. Caller must zero past_len[b] and active[b]
     // can be flipped accordingly.
