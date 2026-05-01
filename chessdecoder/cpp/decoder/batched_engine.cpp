@@ -345,7 +345,6 @@ ThinkingBatchedInferenceEngine::predictMoves(
 
     // Per-sequence position tracking
     std::vector<int> seq_pos(B, init_len);
-    int cur_len = init_len;
 
     // Causal hidden state saved at end of board gen loop
     torch::Tensor h_board_after_loop;
@@ -373,12 +372,6 @@ ThinkingBatchedInferenceEngine::predictMoves(
         // between_vars in their respective sections.
         auto need_move_cpu = need_move.cpu();
         auto nm_a = need_move_cpu.accessor<bool, 1>();
-
-        // Sync cur_len from per-sequence positions
-        cur_len = 0;
-        for (int b = 0; b < B; b++)
-            if (nm_a[b] && seq_pos[b] > cur_len)
-                cur_len = seq_pos[b];
 
         // Helper: build per-sequence position tensor from seq_pos + offset.
         // Build on host (cheap vector op) and do ONE H2D transfer instead of B
@@ -440,7 +433,6 @@ ThinkingBatchedInferenceEngine::predictMoves(
             saved_h = h_move.squeeze(1);
             for (int b = 0; b < B; b++)
                 if (nm_a[b]) seq_pos[b]++;
-            cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
         }
 
         // ── Step 2b: WL_D ──────────────────────────────────────────────
@@ -472,7 +464,6 @@ ThinkingBatchedInferenceEngine::predictMoves(
                 wl_log_probs[b].push_back({seq_pos[b], wl_lp_a[b]});
                 seq_pos[b]++;
             }
-            cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
 
             // D
             auto d_sample = evalDHead(saved_h, d_temp);
@@ -501,7 +492,6 @@ ThinkingBatchedInferenceEngine::predictMoves(
                 d_log_probs[b].push_back({seq_pos[b], d_lp_a[b]});
                 seq_pos[b]++;
             }
-            cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
         }
 
         // ── Step 2c: BOARD (67 autoregressive steps) ────────────────────
@@ -633,7 +623,6 @@ ThinkingBatchedInferenceEngine::predictMoves(
             h_board_after_loop = h_board.squeeze(1).contiguous();
             backbone_->syncGraphToCausal();
 
-            cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
 
             // Copy board tokens to CPU
             auto board_cpu = board_output.cpu();
