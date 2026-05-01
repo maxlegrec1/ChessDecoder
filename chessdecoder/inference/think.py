@@ -6,6 +6,8 @@ Stops when max_seq_len is reached.
 """
 
 import argparse
+from dataclasses import dataclass, field
+
 import torch
 import torch.nn.functional as F
 
@@ -15,6 +17,33 @@ from chessdecoder.models.vocab import (vocab_size, token_to_idx, idx_to_token,
                               board_token_to_idx)
 from chessdecoder.dataloader.data import fen_to_position_tokens
 from chessdecoder.utils.uci import normalize_castling
+
+
+@dataclass
+class ThinkingResult:
+    """Captured output of run_thinking().
+
+    Used by the C++/Python parity harness (scripts/verify_decoder_parity.py)
+    and by tests/test_engine_parity.py. Token indices are full-vocab.
+    final_* fields are None if generation hit max_seq_len before FINAL.
+
+    For temp=0 parity: compare token_ids and wl_bucket_indices/d_bucket_indices
+    (argmax indices) for exact match. The wl_entries/d_entries float values
+    are subject to FP16 noise.
+    """
+    token_ids: list = field(default_factory=list)
+    block_ids: list = field(default_factory=list)
+    wl_entries: list = field(default_factory=list)         # [(position, value)]
+    d_entries: list = field(default_factory=list)          # [(position, value)]
+    wl_bucket_indices: list = field(default_factory=list)  # [(position, bucket_idx)]
+    d_bucket_indices: list = field(default_factory=list)   # [(position, bucket_idx)]
+    final_move: str = None                                  # UCI string
+    final_wl: float = None
+    final_d: float = None
+    final_wl_bucket: int = None
+    final_d_bucket: int = None
+    ended_thinking: bool = False
+    truncated: bool = False                                 # hit max_seq_len
 
 _PIECE_SYMBOLS = {
     "white_king": "K", "white_queen": "Q", "white_rook": "R",
@@ -112,7 +141,26 @@ def reconstruct_wdl(wl, d):
 
 
 @torch.no_grad()
-def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
+def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024,
+                 verbose=True):
+    """Run the Python thinking-decoder state machine for a single FEN.
+
+    Args:
+        model: ChessDecoder loaded via load_model() (already half + eval).
+        fen: starting FEN.
+        temperature: sampling temperature; 0.0 = argmax (deterministic).
+        device: torch device.
+        max_seq_len: hard cap on emitted tokens; truncates mid-state.
+        verbose: print state-machine progress to stdout (CLI-style).
+                 Set False when calling from parity harnesses or tests.
+
+    Returns:
+        ThinkingResult with full-vocab token_ids, wl/d entries, final move,
+        and final wl/d (None if generation truncated before FINAL).
+    """
+    def vprint(*args, **kwargs):
+        if verbose:
+            print(*args, **kwargs)
 
     token_ids = []
     block_ids = []
@@ -120,6 +168,10 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
     d_entries = []
     next_block = [0]
     orphan_ctr = [10000]
+    final_move = None
+    final_wl = None
+    final_d = None
+    ended_thinking = False
 
     def orphan():
         orphan_ctr[0] += 1
@@ -132,14 +184,18 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
     def full():
         return len(token_ids) >= max_seq_len
 
+    # FourierEncoder weights are FP16 after model.half(); WL/D values must
+    # match dtype to avoid the FP32 @ FP16 dtype mismatch.
+    val_dtype = next(model.parameters()).dtype
+
     def prefix_forward():
         S = len(token_ids)
         inp = torch.tensor([token_ids], dtype=torch.long, device=device)
         blk = torch.tensor([block_ids], dtype=torch.long, device=device)
         wl_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
         d_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
-        wl_val = torch.zeros(1, S, device=device)
-        d_val = torch.zeros(1, S, device=device)
+        wl_val = torch.zeros(1, S, dtype=val_dtype, device=device)
+        d_val = torch.zeros(1, S, dtype=val_dtype, device=device)
         for p, v in wl_entries:
             wl_pos[0, p] = True; wl_val[0, p] = v
         for p, v in d_entries:
@@ -153,8 +209,8 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
         inp = torch.tensor([token_ids], dtype=torch.long, device=device)
         wl_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
         d_pos = torch.zeros(1, S, dtype=torch.bool, device=device)
-        wl_val = torch.zeros(1, S, device=device)
-        d_val = torch.zeros(1, S, device=device)
+        wl_val = torch.zeros(1, S, dtype=val_dtype, device=device)
+        d_val = torch.zeros(1, S, dtype=val_dtype, device=device)
         for p, v in wl_entries:
             wl_pos[0, p] = True; wl_val[0, p] = v
         for p, v in d_entries:
@@ -170,33 +226,38 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
         move_sub_idx = sample_token(logits, temperature)
         return move_idx_to_full_idx[move_sub_idx]  # full vocab idx
 
+    wl_bucket_indices = []
+    d_bucket_indices = []
+
     def predict_wl(move_pos):
         h = prefix_forward()
         logits = model.wl_head(h[0, move_pos:move_pos+1, :])
-        wl_idx = torch.argmax(logits, dim=-1)
-        return model.wl_bucket_centers[wl_idx].item()
+        wl_idx = torch.argmax(logits, dim=-1).item()
+        return wl_idx, model.wl_bucket_centers[wl_idx].item()
 
     def predict_d(wl_pos):
         h = prefix_forward()
         logits = model.d_head(h[0, wl_pos:wl_pos+1, :])
-        d_idx = torch.argmax(logits, dim=-1)
-        return model.d_bucket_centers[d_idx].item()
+        d_idx = torch.argmax(logits, dim=-1).item()
+        return d_idx, model.d_bucket_centers[d_idx].item()
 
     def emit_wl_d(move_pos):
         """Predict WL/D, append fourier tokens, print values."""
-        wl = predict_wl(move_pos)
+        wl_idx, wl = predict_wl(move_pos)
         wl_pos_idx = len(token_ids)
         append(token_to_idx["wl_value"], orphan())
         wl_entries.append((wl_pos_idx, wl))
+        wl_bucket_indices.append((wl_pos_idx, wl_idx))
 
-        d = predict_d(wl_pos_idx)
+        d_idx, d = predict_d(wl_pos_idx)
         d_pos_idx = len(token_ids)
         append(token_to_idx["d_value"], orphan())
         d_entries.append((d_pos_idx, d))
+        d_bucket_indices.append((d_pos_idx, d_idx))
 
         w, dr, l = reconstruct_wdl(wl, d)
-        print(f"  wl/d -> W={w:.2f} D={dr:.2f} L={l:.2f}")
-        return wl, d
+        vprint(f"  wl/d -> W={w:.2f} D={dr:.2f} L={l:.2f}")
+        return wl_idx, wl, d_idx, d
 
     def emit_board():
         """Generate 68 board tokens via board_head, print reconstructed FEN."""
@@ -211,8 +272,9 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
             full_idx = board_idx_to_full_idx[board_sub_idx]
             append(full_idx, bid)
             tok_strs.append(idx_to_token[full_idx])
-        fen_str = board_tokens_to_fen(tok_strs) if len(tok_strs) == 68 else "<truncated>"
-        print(f"  board: {fen_str}")
+        if verbose:
+            fen_str = board_tokens_to_fen(tok_strs) if len(tok_strs) == 68 else "<truncated>"
+            vprint(f"  board: {fen_str}")
 
     # ===== State machine =====
     #
@@ -231,14 +293,18 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
     bid = next_block[0]; next_block[0] += 1
     for t in root_tokens:
         append(token_to_idx[t], bid)
-    print(f"root: {fen}")
+    vprint(f"root: {fen}")
     if full():
-        print(f"Sequence length: {len(token_ids)} / {max_seq_len}")
-        return
+        vprint(f"Sequence length: {len(token_ids)} / {max_seq_len}")
+        return ThinkingResult(
+            token_ids=token_ids, block_ids=block_ids,
+            wl_entries=wl_entries, d_entries=d_entries,
+            truncated=True,
+        )
 
     # 2. start_think
     append(token_to_idx["start_think"], orphan())
-    print("start_think")
+    vprint("start_think")
 
     # 3. Autoregressive generation
     #    State: what we expect to generate next
@@ -251,7 +317,8 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
 
     state = "MOVE"  # first thing after start_think is a root_move
     var_idx = 0
-    ended_thinking = False
+    final_wl_bucket = None
+    final_d_bucket = None
 
     while not full():
         if state == "MOVE":
@@ -260,16 +327,17 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
             idx = sample_move(model.thinking_policy_head, pos)
             tok = idx_to_token[idx]
             append(idx, orphan())
-            if tok in _MOVE_TOKENS:
-                # Check if this is a root_move (after start_think or end_var)
-                prev_tok = idx_to_token[token_ids[-2]] if len(token_ids) >= 2 else ""
-                if prev_tok in ("start_think", "end_var"):
-                    var_idx += 1
-                    print(f"  variation {var_idx} root_move: {normalize_castling(tok)}")
+            if verbose:
+                if tok in _MOVE_TOKENS:
+                    # Check if this is a root_move (after start_think or end_var)
+                    prev_tok = idx_to_token[token_ids[-2]] if len(token_ids) >= 2 else ""
+                    if prev_tok in ("start_think", "end_var"):
+                        var_idx += 1
+                        vprint(f"  variation {var_idx} root_move: {normalize_castling(tok)}")
+                    else:
+                        vprint(f"    pv_move: {normalize_castling(tok)}")
                 else:
-                    print(f"    pv_move: {normalize_castling(tok)}")
-            else:
-                print(f"  unexpected token from thinking_policy_head: {tok}")
+                    vprint(f"  unexpected token from thinking_policy_head: {tok}")
             state = "WL_D"
 
         elif state == "WL_D":
@@ -296,7 +364,7 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
             if board_sub_idx == _BOARD_END_VAR_IDX:
                 full_idx = board_idx_to_full_idx[board_sub_idx]
                 append(full_idx, orphan())
-                print("  end_var")
+                vprint("  end_var")
                 state = "AFTER_END_VAR"
             else:
                 # continue_var (or any non-end_var): continue PV with thinking_policy_head
@@ -314,7 +382,7 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
             if board_sub_idx == _BOARD_END_THINK_IDX:
                 full_idx = board_idx_to_full_idx[board_sub_idx]
                 append(full_idx, orphan())
-                print("end_think")
+                vprint("end_think")
                 ended_thinking = True
                 state = "FINAL"
             else:
@@ -329,16 +397,32 @@ def run_thinking(model, fen, temperature=0.0, device="cuda", max_seq_len=1024):
             idx = sample_move(model.policy_head, pos)
             tok = idx_to_token[idx]
             append(idx, orphan())
-            print(f"final_move: {normalize_castling(tok)}")
+            final_move = normalize_castling(tok)
+            vprint(f"final_move: {final_move}")
 
             if not full():
                 move_pos = len(token_ids) - 1
-                wl, d = emit_wl_d(move_pos)
-                w, dr, l = reconstruct_wdl(wl, d)
-                print(f"\nFinal WDL: W={w:.3f} D={dr:.3f} L={l:.3f}")
+                wl_idx, wl, d_idx, d = emit_wl_d(move_pos)
+                final_wl = wl
+                final_d = d
+                final_wl_bucket = wl_idx
+                final_d_bucket = d_idx
+                if verbose:
+                    w, dr, l = reconstruct_wdl(wl, d)
+                    vprint(f"\nFinal WDL: W={w:.3f} D={dr:.3f} L={l:.3f}")
             break
 
-    print(f"Sequence length: {len(token_ids)} / {max_seq_len}")
+    vprint(f"Sequence length: {len(token_ids)} / {max_seq_len}")
+    return ThinkingResult(
+        token_ids=token_ids, block_ids=block_ids,
+        wl_entries=wl_entries, d_entries=d_entries,
+        wl_bucket_indices=wl_bucket_indices,
+        d_bucket_indices=d_bucket_indices,
+        final_move=final_move, final_wl=final_wl, final_d=final_d,
+        final_wl_bucket=final_wl_bucket, final_d_bucket=final_d_bucket,
+        ended_thinking=ended_thinking,
+        truncated=(len(token_ids) >= max_seq_len) and final_move is None,
+    )
 
 
 def main():

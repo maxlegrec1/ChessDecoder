@@ -1,0 +1,72 @@
+{
+  "gpu": "NVIDIA B200",
+  "checkpoint": "checkpoints/finetune-thinking-v1_20260422_135004/checkpoint_step_326000.pt",
+  "temperature": 0.8,
+  "num_fens": 256,
+  "results": [
+    {
+      "batch_size": 16,
+      "n_fens": 256,
+      "n_batches": 16,
+      "elapsed_s": 105.73152208328247,
+      "tok_per_s": 2420.5175046890304,
+      "fen_per_s": 2.4212268484923,
+      "total_tokens": 255925,
+      "avg_tok_per_fen": 999.70703125,
+      "ms_per_fen_p50": 429.51931059360504,
+      "ms_per_fen_p95": 470.9901809692383,
+      "torch_peak_mb": 4056.50390625,
+      "nvsmi_peak_mb": 55140.0,
+      "nvsmi_jitter_mb": 23628.0,
+      "nvsmi_n_samples": 881
+    },
+    {
+      "batch_size": 32,
+      "n_fens": 256,
+      "n_batches": 8,
+      "elapsed_s": 83.1543219089508,
+      "tok_per_s": 3097.481815581675,
+      "fen_per_s": 3.078613283387787,
+      "total_tokens": 257569,
+      "avg_tok_per_fen": 1006.12890625,
+      "ms_per_fen_p50": 317.34688952565193,
+      "ms_per_fen_p95": 352.40843147039413,
+      "torch_peak_mb": 7472.0234375,
+      "nvsmi_peak_mb": 172516.0,
+      "nvsmi_jitter_mb": 158892.0,
+      "nvsmi_n_samples": 690
+    },
+    {
+      "batch_size": 64,
+      "n_fens": 256,
+      "n_batches": 4,
+      "elapsed_s": 79.83826184272766,
+      "tok_per_s": 3339.7019655217787,
+      "fen_per_s": 3.206482632403634,
+      "total_tokens": 266636,
+      "avg_tok_per_fen": 1041.546875,
+      "ms_per_fen_p50": 311.20909191668034,
+      "ms_per_fen_p95": 328.81757616996765,
+      "torch_peak_mb": 14622.50146484375,
+      "nvsmi_peak_mb": 170178.0,
+      "nvsmi_jitter_mb": 155818.0,
+      "nvsmi_n_samples": 663
+    },
+    {
+      "batch_size": 128,
+      "n_fens": 256,
+      "n_batches": 2,
+      "elapsed_s": 76.67994284629822,
+      "tok_per_s": 3485.6051019201163,
+      "fen_per_s": 3.3385523058245026,
+      "total_tokens": 267276,
+      "avg_tok_per_fen": 1044.046875,
+      "ms_per_fen_p50": 299.5193162932992,
+      "ms_per_fen_p95": 299.5560020208359,
+      "torch_peak_mb": 29019.2568359375,
+      "nvsmi_peak_mb": 82670.0,
+      "nvsmi_jitter_mb": 4130.0,
+      "nvsmi_n_samples": 640
+    }
+  ]
+}
