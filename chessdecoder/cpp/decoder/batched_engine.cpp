@@ -367,18 +367,29 @@ ThinkingBatchedInferenceEngine::predictMoves(
         if (!need_move.any().item<bool>())
             break;
 
+        // Sync need_move to host ONCE per iteration. All per-element checks
+        // below use nm_a[b] instead of need_move[b].item<bool>() — turns B
+        // syncs per loop into 1 per iter. Same pattern applied to active and
+        // between_vars in their respective sections.
+        auto need_move_cpu = need_move.cpu();
+        auto nm_a = need_move_cpu.accessor<bool, 1>();
+
         // Sync cur_len from per-sequence positions
         cur_len = 0;
         for (int b = 0; b < B; b++)
-            if (need_move[b].item<bool>() && seq_pos[b] > cur_len)
+            if (nm_a[b] && seq_pos[b] > cur_len)
                 cur_len = seq_pos[b];
 
-        // Helper: build per-sequence position tensor from seq_pos + offset
+        // Helper: build per-sequence position tensor from seq_pos + offset.
+        // Build on host (cheap vector op) and do ONE H2D transfer instead of B
+        // per-element scalar writes to a CUDA tensor (each was ~10us — called
+        // 67×B per board-gen plus several per outer iter).
         auto makePosT = [&](int off = 0) {
-            auto p = torch::zeros({B, 1}, opts_int);
+            auto p_cpu = torch::empty({B, 1}, torch::TensorOptions().dtype(torch::kInt64));
+            auto p_a = p_cpu.accessor<int64_t, 2>();
             for (int b = 0; b < B; b++)
-                p[b][0] = seq_pos[b] + off;
-            return p;
+                p_a[b][0] = seq_pos[b] + off;
+            return p_cpu.to(torch::kCUDA);
         };
 
         // ── Step 2a: MOVE ──────────────────────────────────────────────
@@ -404,7 +415,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
             auto full_idx_a = full_idx_cpu.accessor<int64_t, 1>();
             for (int b = 0; b < B; b++)
             {
-                if (!need_move[b].item<bool>()) continue;
+                if (!nm_a[b]) continue;
                 int tok = full_idx_a[b];
                 // seq_pos[b] is the position about to receive the move token.
                 // The hidden state that produced the move lives at seq_pos[b] - 1
@@ -428,7 +439,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
                                                        move_ov, move_om, need_move);
             saved_h = h_move.squeeze(1);
             for (int b = 0; b < B; b++)
-                if (need_move[b].item<bool>()) seq_pos[b]++;
+                if (nm_a[b]) seq_pos[b]++;
             cur_len = *std::max_element(seq_pos.begin(), seq_pos.end());
         }
 
@@ -453,7 +464,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
 
             for (int b = 0; b < B; b++)
             {
-                if (!need_move[b].item<bool>()) continue;
+                if (!nm_a[b]) continue;
                 token_ids[b].push_back(wl_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
                 wl_entries[b].push_back({seq_pos[b], wl_a[b]});
@@ -482,7 +493,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
 
             for (int b = 0; b < B; b++)
             {
-                if (!need_move[b].item<bool>()) continue;
+                if (!nm_a[b]) continue;
                 token_ids[b].push_back(d_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
                 d_entries[b].push_back({seq_pos[b], d_a[b]});
@@ -541,7 +552,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
                 // Set override for WL/D positions
                 for (int b = 0; b < B; b++)
                 {
-                    if (!need_move[b].item<bool>()) continue;
+                    if (!nm_a[b]) continue;
                     if (!wl_entries[b].empty())
                     {
                         auto& wl_e = wl_entries[b].back();
@@ -581,7 +592,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
 
             for (int b = 0; b < B; b++)
             {
-                if (!need_move[b].item<bool>()) continue;
+                if (!nm_a[b]) continue;
                 int bid = next_block[b]++;
                 token_ids[b].push_back(start_pos_idx);
                 block_ids[b].push_back(bid);
@@ -596,8 +607,12 @@ ThinkingBatchedInferenceEngine::predictMoves(
             auto h_board = backbone_->causalIncremental(first_tok, first_pos,
                                                         first_ov, first_om, need_move);
 
-            // Board gen: 67 autoregressive steps
+            // Board gen: 67 autoregressive steps. Maintain `cur_pos` on GPU and
+            // increment it via add_() each step instead of rebuilding via
+            // makePosT (saves 67 H2D transfers per board cycle).
             auto board_output = torch::zeros({B, 67}, opts_int);
+            auto cur_pos = first_pos.clone();
+            auto inc_active = need_move.to(torch::kInt64).unsqueeze(1);  // [B, 1]
 
             for (int step = 0; step < 67; step++)
             {
@@ -608,10 +623,10 @@ ThinkingBatchedInferenceEngine::predictMoves(
                 board_output.index_put_({torch::indexing::Slice(), step}, full_idx);
 
                 auto next_ids = full_idx.unsqueeze(1);
-                auto next_pos = makePosT();
+                cur_pos = cur_pos + inc_active;  // GPU op, no sync, no H2D
                 for (int b = 0; b < B; b++)
-                    if (need_move[b].item<bool>()) seq_pos[b]++;
-                h_board = backbone_->causalIncremental(next_ids, next_pos,
+                    if (nm_a[b]) seq_pos[b]++;
+                h_board = backbone_->causalIncremental(next_ids, cur_pos,
                                                       first_ov, first_om, need_move);
             }
 
@@ -625,7 +640,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
             auto board_acc = board_cpu.accessor<int64_t, 2>();
             for (int b = 0; b < B; b++)
             {
-                if (!need_move[b].item<bool>()) continue;
+                if (!nm_a[b]) continue;
                 int bid = next_block[b] - 1;
                 for (int j = 0; j < 67; j++)
                 {
@@ -669,7 +684,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
 
             for (int b = 0; b < B; b++)
             {
-                if (!need_move[b].item<bool>()) continue;
+                if (!nm_a[b]) continue;
 
                 if (sub_a[b] == board_end_var_sub)
                 {
@@ -702,6 +717,10 @@ ThinkingBatchedInferenceEngine::predictMoves(
             auto between_vars = active & ~in_variation;
             if (between_vars.any().item<bool>())
             {
+                // Sync between_vars to host once for the per-element loops
+                auto bv_cpu = between_vars.cpu();
+                auto bv_a = bv_cpu.accessor<bool, 1>();
+
                 auto ev_tok = torch::zeros({B, 1}, opts_int);
                 for (int b = 0; b < B; b++)
                     ev_tok[b][0] = token_ids[b].back();
@@ -721,7 +740,7 @@ ThinkingBatchedInferenceEngine::predictMoves(
                 std::vector<int> end_think_seqs;
                 for (int b = 0; b < B; b++)
                 {
-                    if (!between_vars[b].item<bool>()) continue;
+                    if (!bv_a[b]) continue;
 
                     if (sub2_a[b] == board_end_think_sub)
                     {
@@ -761,10 +780,13 @@ ThinkingBatchedInferenceEngine::predictMoves(
             }
         }
 
-        // Check max sequence length
+        // Check max sequence length. Sync `active` to host once for the
+        // B-element scan instead of per-element .item<bool>() syncs.
+        auto active_cpu_for_maxcheck = active.cpu();
+        auto act_a = active_cpu_for_maxcheck.accessor<bool, 1>();
         for (int b = 0; b < B; b++)
         {
-            if (active[b].item<bool>() && (int)token_ids[b].size() >= max_seq_len_ - 5)
+            if (act_a[b] && (int)token_ids[b].size() >= max_seq_len_ - 5)
                 active[b] = false;
         }
     }
