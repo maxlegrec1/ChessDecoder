@@ -114,6 +114,7 @@ private:
     __half*  d_th_d_val_{nullptr};
     __half*  d_th_hidden_{nullptr};   // [B, max_S, E]
     __half*  d_th_last_h_{nullptr};   // [B, E] gather of hidden at chosen position
+    __half*  d_th_last_h_bkp_{nullptr};  // [B, E] backup before forward_decode (inactive-slot preserve)
 
     float board_t_{0.0f};
     float think_t_{0.0f};

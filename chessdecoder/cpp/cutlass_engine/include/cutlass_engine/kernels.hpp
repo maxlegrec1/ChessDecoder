@@ -178,4 +178,10 @@ void gather_bucket_center(const float* centers, const int32_t* idx,
 // FP32 -> FP16 cast (used by misc paths).
 void cast_fp32_to_fp16(const float* in, __half* out, int N, cudaStream_t stream);
 
+// For each slot b where active[b]==0, restore dst[b, :] from backup[b, :].
+// Used after a batched forward to preserve inactive slots' last_h.
+void restore_inactive_last_h(__half* dst, const __half* backup,
+                             const int32_t* active, int B, int E,
+                             cudaStream_t stream);
+
 }  // namespace cutlass_engine

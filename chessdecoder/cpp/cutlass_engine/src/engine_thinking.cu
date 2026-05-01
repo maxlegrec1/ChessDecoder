@@ -1,17 +1,18 @@
 // Full thinking-trace state machine for ThinkingEngine.
 //
-// Mirrors chessdecoder/inference/think.py:run_thinking() — same state
-// machine (MOVE → WL_D → BOARD → AFTER_BOARD → AFTER_END_VAR → FINAL),
-// but batched (lockstep over B slots) and on-GPU.
+// Phase E.2: rewritten to use forward_decode (causal, S=1, KV cache) for
+// every state-machine step.  Init prefill writes K/V to the cache once
+// (via forward_prefill_block(kv_for_write=&kv_)).  Subsequent appends are
+// O(S) instead of O(S^2).
 //
-// Strategy: re-run forward_prefill_block over the full sequence at every
-// state-machine step.  Matches Python's behavior exactly (no KV-cache
-// shortcut).  Slow but correct.  Optimization (incremental cache, kernel
-// fusion) is a follow-up.
-//
-// Each step's per-slot active mask gates work for slots that are still
-// in-variation / awaiting end_var resolution / awaiting end_think.
-// Inactive slots' tokens are ignored on output.
+// Mathematical equivalence to Python's run_thinking (which uses prefix
+// mode for MOVE/WL/D and causal mode for BOARD): in this model, every
+// position the engine reads (start_think, move, wl_value, d_value,
+// end_think, end_var) is in its own unique orphan block.  Prefix-mode
+// attention at an orphan position is identical to causal-mode attention
+// at the same position (no within-block bidirectional companions exist).
+// So forward_decode (causal) gives the same hidden state Python's
+// prefix_forward gives at these positions.
 
 #include "cutlass_engine/engine.hpp"
 #include "cutlass_engine/check.hpp"
@@ -22,6 +23,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <vector>
 
@@ -29,21 +31,12 @@ namespace cutlass_engine {
 
 namespace {
 
-// Pull a single FP16 value from device.
-__half d2h_half(const __half* dptr) {
-    __half h;
-    cudaMemcpy(&h, dptr, sizeof(__half), cudaMemcpyDeviceToHost);
-    return h;
-}
-
-// Copy a [B] FP32 vector to host.
 std::vector<float> d2h_fp32(const float* dptr, int B) {
     std::vector<float> out(B);
     cudaMemcpy(out.data(), dptr, B * sizeof(float), cudaMemcpyDeviceToHost);
     return out;
 }
 
-// Copy a [B] int32 vector to host.
 std::vector<int32_t> d2h_int32(const int32_t* dptr, int B) {
     std::vector<int32_t> out(B);
     cudaMemcpy(out.data(), dptr, B * sizeof(int32_t), cudaMemcpyDeviceToHost);
@@ -53,7 +46,7 @@ std::vector<int32_t> d2h_int32(const int32_t* dptr, int B) {
 }  // namespace
 
 std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
-    const std::vector<std::string>& fens, float temperature,
+    const std::vector<std::string>& fens, float /*temperature*/,
     int max_seq_len_cap, int max_iters) {
 
     if (!vocab_) {
@@ -69,26 +62,16 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
     const int H = cfg_.value_hidden_size;
     const int max_S = std::min(max_seq_len_cap, cfg_.max_seq_len);
 
-    if (max_S > max_init_S_ * 64) {
-        // Our scratch buffers are sized for max_init_S * batch_size; the
-        // thinking path needs much larger scratch.  We reuse d_th_* below,
-        // sized at construction for cfg_.max_seq_len.
-    }
-
-    // Per-process special token IDs (full-vocab + sub-vocab).
+    // Special-token IDs.
     const int wl_value_idx       = vocab_->wlValueIdx();
     const int d_value_idx        = vocab_->dValueIdx();
     const int start_think_idx    = vocab_->startThinkIdx();
-    const int end_think_idx      = vocab_->endThinkIdx();
-    const int end_var_idx        = vocab_->endVarIdx();
     const int board_end_var_sub  = vocab_->boardEndVarIdx();
     const int board_end_think_sub= vocab_->boardEndThinkIdx();
 
-    // Pull bucket centers to host (for setting wl_entries / d_entries values).
     std::vector<float> wl_centers_h = d2h_fp32(w_.wl_bucket_centers, Kb);
     std::vector<float> d_centers_h  = d2h_fp32(w_.d_bucket_centers, Kb);
 
-    // Pull move/board sub-to-full LUTs to host.
     std::vector<int> move_sub_to_full(Mv);
     for (int i = 0; i < Mv; ++i) move_sub_to_full[i] = vocab_->moveIdxToFullIdx(i);
     std::vector<int> board_sub_to_full(Bv);
@@ -96,9 +79,7 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
 
     std::vector<RolloutResult> all_results(N);
 
-    // ============= Continuous-batched scheduler (mid-flight refill) =============
-    // Per-slot bookkeeping; slots are refilled from `pending` whenever a
-    // slot reaches FINAL.  New slots join the next iteration in lockstep.
+    // Per-slot host state.
     std::vector<std::vector<int32_t>> token_ids(B);
     std::vector<std::vector<int32_t>> block_ids(B);
     std::vector<int> next_block(B, 0);
@@ -108,7 +89,30 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
     std::vector<bool> ended_thinking(B, false);
     std::vector<bool> truncated(B, false);
     std::vector<int> slot_to_fen(B, -1);
-    std::vector<std::vector<uint8_t>> legal_masks(B, std::vector<uint8_t>(Mv, 0));
+    std::vector<int> slot_iter_count(B, 0);
+    std::vector<int32_t> slot_past_len_h(B, 0);  // host mirror of kv_.past_len()
+
+    // For the refill path, we track which slots were just initialized and
+    // skip them in the main step (so they only contribute to MOVE going forward).
+
+    // Allocate a small slot-init scratch (per-slot 1 token) on host that we
+    // reuse each step.
+    std::vector<int32_t> step_ids(B, 0);
+    std::vector<int32_t> step_pos(B, 0);
+    std::vector<int32_t> step_active(B, 0);
+    std::vector<uint8_t> step_wl_pos(B, 0);
+    std::vector<uint8_t> step_d_pos(B, 0);
+    std::vector<__half> step_wl_val(B, __float2half(0.0f));
+    std::vector<__half> step_d_val(B, __float2half(0.0f));
+
+    // Pending queue (LIFO over reversed inputs → submission-order pops).
+    std::vector<int> pending;
+    pending.reserve(N);
+    for (int i = N - 1; i >= 0; --i) pending.push_back(i);
+    auto pop_pending = [&]() -> int {
+        if (pending.empty()) return -1;
+        int fid = pending.back(); pending.pop_back(); return fid;
+    };
 
     auto reset_slot = [&](int b, int fid) {
         token_ids[b].clear();
@@ -119,8 +123,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         in_variation[b] = false;
         ended_thinking[b] = false;
         truncated[b] = false;
-        std::fill(legal_masks[b].begin(), legal_masks[b].end(), 0);
-
+        slot_iter_count[b] = 0;
+        slot_past_len_h[b] = 0;
         if (fid < 0) {
             slot_to_fen[b] = -1;
             return;
@@ -141,408 +145,411 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         active[b] = true;
         in_variation[b] = true;
         slot_to_fen[b] = fid;
-        auto legal = vocab_->legalMoveIndices(fen);
-        for (int idx : legal) if (idx >= 0 && idx < Mv) legal_masks[b][idx] = 1;
     };
 
-    // Pending queue: FEN ids waiting for a slot.
-    std::vector<int> pending;
-    pending.reserve(N);
-    for (int i = N - 1; i >= 0; --i) pending.push_back(i);  // pop_back = earliest first
+    // ---------- Init prefill helper ----------
+    // Runs forward_prefill_block on slots flagged in `init_slots[B]`, writing
+    // K/V into the causal cache for those slots only.  Other slots' active=0
+    // for this pass; their cache and past_len are untouched.
+    //
+    // After: slot b's past_len is advanced by 69 (init length); the last
+    // position's hidden state ([B, E]) is gathered into d_th_last_h_.
+    auto run_init_prefill = [&](const std::vector<int>& init_slots) {
+        if (init_slots.empty()) return;
+        const int S = 69;  // 68 board + start_think
 
-    auto pop_pending = [&]() -> int {
-        if (pending.empty()) return -1;
-        int fid = pending.back();
-        pending.pop_back();
-        return fid;
+        std::vector<int32_t> ids_h(B * S, 0);
+        std::vector<int32_t> pos_h(B * S, 0);
+        std::vector<int32_t> block_h(B * S, 0);
+        std::vector<int32_t> active_h(B, 0);
+        for (int b : init_slots) {
+            for (int s = 0; s < S; ++s) {
+                ids_h[b * S + s] = token_ids[b][s];
+                pos_h[b * S + s] = s;
+                block_h[b * S + s] = block_ids[b][s];
+            }
+            active_h[b] = 1;
+        }
+
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_ids_, ids_h.data(),
+                                      B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_pos_, pos_h.data(),
+                                      B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_block_, block_h.data(),
+                                      B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(kv_.slot_active(), active_h.data(),
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        // Set past_len[b] = 0 for the slots we're about to init.
+        std::vector<int32_t> past_len_buf(B);
+        CE_CUDA_CHECK(cudaMemcpyAsync(past_len_buf.data(), kv_.past_len(),
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyDeviceToHost, stream_.get()));
+        stream_.sync();
+        for (int b : init_slots) past_len_buf[b] = 0;
+        CE_CUDA_CHECK(cudaMemcpyAsync(kv_.past_len(), past_len_buf.data(),
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+
+        // Zero wl/d injection (no overrides during init).
+        CE_CUDA_CHECK(cudaMemsetAsync(d_th_wl_pos_, 0, B * S * sizeof(bool),
+                                      stream_.get()));
+        CE_CUDA_CHECK(cudaMemsetAsync(d_th_d_pos_, 0, B * S * sizeof(bool),
+                                      stream_.get()));
+
+        // Run prefill with cache write.
+        model_.forward_prefill_block(
+            d_th_ids_, d_th_pos_, d_th_block_, kv_.slot_active(),
+            d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
+            B, S, d_th_hidden_, stream_.get(), &kv_);
+
+        // Gather hidden at position S-1 (start_think) for inited slots
+        // into d_th_last_h_.  Other slots' last_h is untouched.
+        for (int b : init_slots) {
+            CE_CUDA_CHECK(cudaMemcpyAsync(
+                d_th_last_h_ + b * E,
+                d_th_hidden_ + (b * S + (S - 1)) * E,
+                E * sizeof(__half),
+                cudaMemcpyDeviceToDevice, stream_.get()));
+        }
+        // Sync slot_past_len_h.
+        for (int b : init_slots) slot_past_len_h[b] = S;
     };
 
-    // Refill all idle slots from the queue.
+    // ---------- Forward-decode helper (one step over all active slots) ----------
+    // Inputs: per-slot new token id and (optional) wl/d injection flag+value.
+    // Effects: K/V scattered into cache at past_len[b]; past_len[b] += 1 for
+    // active slots; new hidden state at the input position written to
+    // d_th_last_h_[b, :] for active slots.
+    auto run_decode_step = [&](const std::vector<int32_t>& new_ids,
+                               const std::vector<uint8_t>& wl_pos,
+                               const std::vector<uint8_t>& d_pos,
+                               const std::vector<__half>& wl_val,
+                               const std::vector<__half>& d_val,
+                               const std::vector<int32_t>& act_mask) {
+        // Build per-slot pos = past_len[b].
+        std::vector<int32_t> pos_h(B, 0);
+        for (int b = 0; b < B; ++b) pos_h[b] = slot_past_len_h[b];
+
+        // Upload per-slot scalars.  Strided as [B, 1].
+        // We use d_th_ids_, d_th_pos_, etc., which are [B, max_S].  Since
+        // S=1, layout is just [B] in those buffers' first column.
+        // Build [B*1] buffer with one element per slot.
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_ids_, new_ids.data(),
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_pos_, pos_h.data(),
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_wl_pos_, wl_pos.data(),
+                                      B * sizeof(uint8_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_d_pos_, d_pos.data(),
+                                      B * sizeof(uint8_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_wl_val_, wl_val.data(),
+                                      B * sizeof(__half),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_d_val_, d_val.data(),
+                                      B * sizeof(__half),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(kv_.slot_active(), act_mask.data(),
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+
+        // Backup last_h before the forward (so we can preserve it for slots
+        // that don't run this step — forward_decode writes zeros for inactive
+        // slots, which would clobber their stale-but-valid last_h).
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_last_h_bkp_, d_th_last_h_,
+                                      B * E * sizeof(__half),
+                                      cudaMemcpyDeviceToDevice, stream_.get()));
+
+        model_.forward_decode(
+            d_th_ids_, d_th_pos_,
+            d_th_wl_pos_, d_th_d_pos_,
+            d_th_wl_val_, d_th_d_val_,
+            kv_, d_th_last_h_, stream_.get());
+
+        // Restore last_h for inactive slots from the backup.
+        restore_inactive_last_h(d_th_last_h_, d_th_last_h_bkp_,
+                                kv_.slot_active(), B, E, stream_.get());
+
+        // forward_decode internally calls past_len_increment after all layers,
+        // so kv_.past_len()[b] is now slot_past_len_h[b] + 1 for active slots.
+        for (int b = 0; b < B; ++b) {
+            if (act_mask[b]) slot_past_len_h[b] += 1;
+        }
+    };
+
+    // ---------- Helpers to run one head + argmax ----------
+    auto run_head_argmax_move_vocab = [&](const __half* head_w, const __half* head_b) {
+        // [B, E] @ [Mv, E]^T + bias -> [B, Mv], argmax -> [B] int32.
+        gemm_fp16(d_th_last_h_, head_w, head_b, d_logits_buf_,
+                  B, Mv, E, nullptr, 0, stream_.get());
+        argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
+        stream_.sync();
+        return d2h_int32(d_idx_out_, B);
+    };
+    auto run_head_argmax_board_vocab = [&]() {
+        gemm_fp16(d_th_last_h_, w_.board_head_w, w_.board_head_b, d_logits_buf_,
+                  B, Bv, E, nullptr, 0, stream_.get());
+        argmax_fp16(d_logits_buf_, d_idx_out_, B, Bv, stream_.get());
+        stream_.sync();
+        return d2h_int32(d_idx_out_, B);
+    };
+    auto run_value_head_argmax = [&](const __half* w1_w, const __half* w1_b,
+                                     const __half* w2_w, const __half* w2_b) {
+        // [B, E] @ [H, E]^T + b -> [B, H] -> mish -> [B, H] @ [Kb, H]^T + b -> [B, Kb] -> argmax
+        gemm_fp16(d_th_last_h_, w1_w, w1_b, d_logits_buf_,
+                  B, H, E, nullptr, 0, stream_.get());
+        mish_inplace_fp16(d_logits_buf_, B * H, stream_.get());
+        gemm_fp16(d_logits_buf_, w2_w, w2_b, d_logits_buf_ + B * H,
+                  B, Kb, H, nullptr, 0, stream_.get());
+        argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
+        stream_.sync();
+        return d2h_int32(d_idx_out_, B);
+    };
+
+    // ---------- Initial fill + init prefill ----------
     auto refill_idle = [&]() {
+        std::vector<int> just_filled;
         for (int b = 0; b < B; ++b) {
             if (!active[b]) {
                 int fid = pop_pending();
-                if (fid >= 0) reset_slot(b, fid);
+                if (fid >= 0) {
+                    reset_slot(b, fid);
+                    just_filled.push_back(b);
+                }
             }
         }
+        if (!just_filled.empty()) run_init_prefill(just_filled);
     };
 
     // Initial fill.
     refill_idle();
 
-    {
-        // Outer scope to keep variable defs aligned with the original block.
+    // Build helper-buffer factory.
+    auto zero_uint8 = [&](std::vector<uint8_t>& v) { std::fill(v.begin(), v.end(), 0); };
+    auto zero_half = [&](std::vector<__half>& v) {
+        std::fill(v.begin(), v.end(), __float2half(0.0f));
+    };
 
-        // Helper: build [B, S] device tensors from per-slot state at length S.
-        // Stores into d_th_ids_, d_th_pos_, d_th_block_, d_th_wl_pos_, etc.
-        // Returns S (= max active slot length, capped at max_S).
-        auto build_step = [&](bool use_block_aware,
-                              std::vector<int32_t>& active_h_out) {
-            // S = max of active token_ids lengths.
-            int S = 0;
-            for (int b = 0; b < B; ++b)
-                if (active[b]) S = std::max(S, (int)token_ids[b].size());
-            if (S == 0) S = 1;
-            S = std::min(S, max_S);
+    auto active_mask = [&](std::function<bool(int)> pred) {
+        std::vector<int32_t> m(B, 0);
+        for (int b = 0; b < B; ++b) m[b] = pred(b) ? 1 : 0;
+        return m;
+    };
 
-            // Build CPU staging buffers (one alloc per step — small, B*S*~6 bytes).
-            std::vector<int32_t> ids_h(B * S, 0);
-            std::vector<int32_t> pos_h(B * S, 0);
-            std::vector<int32_t> block_h(B * S, 0);
-            std::vector<uint8_t> wlpos_h(B * S, 0);
-            std::vector<uint8_t> dpos_h(B * S, 0);
-            std::vector<__half> wlval_h(B * S, __float2half(0.0f));
-            std::vector<__half> dval_h(B * S, __float2half(0.0f));
-            active_h_out.assign(B, 0);
+    // ---------- Main loop ----------
+    while (true) {
+        bool any_active = false;
+        for (int b = 0; b < B; ++b) if (active[b]) { any_active = true; break; }
+        if (!any_active && pending.empty()) break;
+        if (!any_active) { refill_idle(); continue; }
 
-            for (int b = 0; b < B; ++b) {
-                int slot_S = (int)token_ids[b].size();
-                if (slot_S > S) slot_S = S;  // truncate (should not happen — S is max)
-                for (int s = 0; s < slot_S; ++s) {
-                    ids_h[b * S + s]   = token_ids[b][s];
-                    pos_h[b * S + s]   = s;
-                    block_h[b * S + s] = use_block_aware ? block_ids[b][s] : (1000000 + s);
-                    // ↑ unique-per-token block ids → mask becomes purely causal
-                }
-                if (active[b]) active_h_out[b] = 1;
-            }
-            // Inject WL/D values from per-slot entries.  We store them on the
-            // RolloutResult during sampling (hand off below).  For now
-            // re-derive from results vector (we set them below in MOVE/WL_D).
-            // We use all_results[fen_id] as the canonical store.
-            for (int b = 0; b < B; ++b) {
-                int fid = slot_to_fen[b];
-                if (fid < 0) continue;
-                const auto& r = all_results[fid];
-                for (size_t i = 0; i < r.wl_positions.size(); ++i) {
-                    int p = r.wl_positions[i];
-                    if (p >= 0 && p < S) {
-                        wlpos_h[b * S + p] = 1;
-                        wlval_h[b * S + p] = __float2half(r.wl_values[i]);
-                    }
-                }
-                for (size_t i = 0; i < r.d_positions.size(); ++i) {
-                    int p = r.d_positions[i];
-                    if (p >= 0 && p < S) {
-                        dpos_h[b * S + p] = 1;
-                        dval_h[b * S + p] = __float2half(r.d_values[i]);
-                    }
-                }
-            }
+        // ===== MOVE state (active * in_variation) =====
+        // Sample move from thinking_policy_head(last_h).
+        auto move_sub_h = run_head_argmax_move_vocab(
+            w_.thinking_policy_head_w, w_.thinking_policy_head_b);
 
-            // Upload.
-            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_ids_, ids_h.data(),
-                                          B * S * sizeof(int32_t),
-                                          cudaMemcpyHostToDevice, stream_.get()));
-            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_pos_, pos_h.data(),
-                                          B * S * sizeof(int32_t),
-                                          cudaMemcpyHostToDevice, stream_.get()));
-            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_block_, block_h.data(),
-                                          B * S * sizeof(int32_t),
-                                          cudaMemcpyHostToDevice, stream_.get()));
-            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_wl_pos_, wlpos_h.data(),
-                                          B * S * sizeof(uint8_t),
-                                          cudaMemcpyHostToDevice, stream_.get()));
-            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_d_pos_, dpos_h.data(),
-                                          B * S * sizeof(uint8_t),
-                                          cudaMemcpyHostToDevice, stream_.get()));
-            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_wl_val_, wlval_h.data(),
-                                          B * S * sizeof(__half),
-                                          cudaMemcpyHostToDevice, stream_.get()));
-            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_d_val_, dval_h.data(),
-                                          B * S * sizeof(__half),
-                                          cudaMemcpyHostToDevice, stream_.get()));
-            CE_CUDA_CHECK(cudaMemcpyAsync(d_active_buf_, active_h_out.data(),
-                                          B * sizeof(int32_t),
-                                          cudaMemcpyHostToDevice, stream_.get()));
-            return S;
-        };
-
-        // Helper: run forward_prefill_block and gather hidden at per-slot pos.
-        // gather_pos[b] = position whose hidden we want.  Out: d_th_last_h_ [B, E].
-        auto run_forward_and_gather = [&](bool use_block_aware,
-                                          const std::vector<int32_t>& gather_pos) {
-            std::vector<int32_t> active_h;
-            int S = build_step(use_block_aware, active_h);
-
-            model_.forward_prefill_block(
-                d_th_ids_, d_th_pos_, d_th_block_, d_active_buf_,
-                d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
-                B, S, d_th_hidden_, stream_.get());
-
-            // Gather hidden[b, gather_pos[b], :] into d_th_last_h_[b, :].
-            // We do this with B small cudaMemcpyAsyncs (B ≤ 256, so ~64 us total).
-            for (int b = 0; b < B; ++b) {
-                int p = (gather_pos[b] >= 0 && gather_pos[b] < S) ? gather_pos[b] : 0;
-                CE_CUDA_CHECK(cudaMemcpyAsync(
-                    d_th_last_h_ + b * E,
-                    d_th_hidden_ + (b * S + p) * E,
-                    E * sizeof(__half),
-                    cudaMemcpyDeviceToDevice, stream_.get()));
-            }
-            return S;
-        };
-
-        // -------------- Main per-iteration loop --------------
-        // CB: each iteration's slots may include freshly-refilled slots
-        // (after a previous iteration's FINAL state).  No per-iteration
-        // chunk; we just keep going until pending is empty AND all slots
-        // are inactive.
-        std::vector<int> slot_iter_count(B, 0);
-        // Also track per-slot iter count so we cap each slot at max_iters.
-        for (int outer_step = 0; outer_step < N * (max_iters + 4); ++outer_step) {
-            // Bail when no work left.
-            bool any_active = false;
-            for (int b = 0; b < B; ++b) if (active[b]) any_active = true;
-            if (!any_active && pending.empty()) break;
-            if (!any_active) {
-                refill_idle();
-                continue;
-            }
-
-            // ---- MOVE state ----
-            // Sample move from thinking_policy_head at the LAST position
-            // (current end of token_ids for active slots).
-            std::vector<int32_t> gather_pos(B, 0);
-            for (int b = 0; b < B; ++b) {
-                gather_pos[b] = (int)token_ids[b].size() - 1;
-                if (gather_pos[b] < 0) gather_pos[b] = 0;
-            }
-            run_forward_and_gather(/*use_block_aware=*/true, gather_pos);
-
-            // Run thinking_policy_head GEMM: [B, E] @ [Mv, E]^T + bias
-            gemm_fp16(d_th_last_h_, w_.thinking_policy_head_w, w_.thinking_policy_head_b,
-                      d_logits_buf_, B, Mv, E, nullptr, 0, stream_.get());
-
-            // No legal-mask filter for intermediate moves — matches
-            // chessdecoder/inference/think.py:run_thinking, which trusts the
-            // model to output legal-looking moves.
-
-            // Argmax (temp=0).
-            argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
-            stream_.sync();
-            auto move_idx_h = d2h_int32(d_idx_out_, B);
-            for (int b = 0; b < B; ++b) {
-                if (!(active[b] && in_variation[b])) continue;
-                int sub = move_idx_h[b];
+        // For active*in_variation slots: append the sampled move, then
+        // forward_decode it to advance the cache and get hidden at move pos.
+        std::vector<int32_t> step_ids_v(B, 0);
+        std::vector<int32_t> act_in_var(B, 0);
+        zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
+        zero_half(step_wl_val); zero_half(step_d_val);
+        for (int b = 0; b < B; ++b) {
+            if (active[b] && in_variation[b]) {
+                int sub = move_sub_h[b];
                 int full = move_sub_to_full[sub];
                 token_ids[b].push_back(full);
                 block_ids[b].push_back(orphan_ctr[b]++);
+                step_ids_v[b] = full;
+                act_in_var[b] = 1;
             }
+        }
+        run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                        act_in_var);
 
-            // ---- WL_D state ----
-            // (1) predict WL from move position via wl_head.
-            for (int b = 0; b < B; ++b) {
-                gather_pos[b] = (int)token_ids[b].size() - 1;  // move position
-                if (gather_pos[b] < 0) gather_pos[b] = 0;
-            }
-            run_forward_and_gather(true, gather_pos);
-            // wl_head: [B, E] -> [B, H] via w1+bias, then mish, then [B, Kb] via w2+bias.
-            gemm_fp16(d_th_last_h_, w_.wl_w1_w, w_.wl_w1_b,
-                      d_logits_buf_, B, H, E, nullptr, 0, stream_.get());
-            mish_inplace_fp16(d_logits_buf_, B * H, stream_.get());
-            gemm_fp16(d_logits_buf_, w_.wl_w2_w, w_.wl_w2_b,
-                      d_logits_buf_ + B * H, B, Kb, H, nullptr, 0, stream_.get());
-            argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
-            stream_.sync();
-            auto wl_idx_h = d2h_int32(d_idx_out_, B);
-
-            // Append wl_value placeholder + record entry.
-            for (int b = 0; b < B; ++b) {
-                if (!(active[b] && in_variation[b])) continue;
+        // ===== WL state =====
+        // Predict WL at MOVE position from current last_h (which is move's hidden).
+        auto wl_idx_h = run_value_head_argmax(w_.wl_w1_w, w_.wl_w1_b,
+                                              w_.wl_w2_w, w_.wl_w2_b);
+        // Append wl_value placeholder + record entry, then forward_decode w/ fourier(wl).
+        std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
+        zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
+        zero_half(step_wl_val); zero_half(step_d_val);
+        std::fill(act_in_var.begin(), act_in_var.end(), 0);
+        for (int b = 0; b < B; ++b) {
+            if (active[b] && in_variation[b]) {
                 int wl_pos_idx = (int)token_ids[b].size();
                 token_ids[b].push_back(wl_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
-
                 int fid = slot_to_fen[b];
-                if (fid >= 0 && fid < (int)all_results.size()) {
-                    all_results[fid].wl_positions.push_back(wl_pos_idx);
-                    all_results[fid].wl_indices.push_back(wl_idx_h[b]);
-                    all_results[fid].wl_values.push_back(wl_centers_h[wl_idx_h[b]]);
+                if (fid >= 0) {
+                    auto& r = all_results[fid];
+                    r.wl_positions.push_back(wl_pos_idx);
+                    r.wl_indices.push_back(wl_idx_h[b]);
+                    r.wl_values.push_back(wl_centers_h[wl_idx_h[b]]);
                 }
+                step_ids_v[b] = wl_value_idx;
+                step_wl_pos[b] = 1;
+                step_wl_val[b] = __float2half(wl_centers_h[wl_idx_h[b]]);
+                act_in_var[b] = 1;
             }
+        }
+        run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                        act_in_var);
 
-            // (2) predict D from wl_value position via d_head (with WL injected).
-            for (int b = 0; b < B; ++b) {
-                gather_pos[b] = (int)token_ids[b].size() - 1;  // wl_value position
-                if (gather_pos[b] < 0) gather_pos[b] = 0;
-            }
-            run_forward_and_gather(true, gather_pos);
-            gemm_fp16(d_th_last_h_, w_.d_w1_w, w_.d_w1_b,
-                      d_logits_buf_, B, H, E, nullptr, 0, stream_.get());
-            mish_inplace_fp16(d_logits_buf_, B * H, stream_.get());
-            gemm_fp16(d_logits_buf_, w_.d_w2_w, w_.d_w2_b,
-                      d_logits_buf_ + B * H, B, Kb, H, nullptr, 0, stream_.get());
-            argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
-            stream_.sync();
-            auto d_idx_h = d2h_int32(d_idx_out_, B);
-
-            for (int b = 0; b < B; ++b) {
-                if (!(active[b] && in_variation[b])) continue;
+        // ===== D state =====
+        // Predict D from current last_h (wl's hidden, with fourier injected).
+        auto d_idx_h = run_value_head_argmax(w_.d_w1_w, w_.d_w1_b,
+                                             w_.d_w2_w, w_.d_w2_b);
+        std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
+        zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
+        zero_half(step_wl_val); zero_half(step_d_val);
+        std::fill(act_in_var.begin(), act_in_var.end(), 0);
+        for (int b = 0; b < B; ++b) {
+            if (active[b] && in_variation[b]) {
                 int d_pos_idx = (int)token_ids[b].size();
                 token_ids[b].push_back(d_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
-
                 int fid = slot_to_fen[b];
-                if (fid >= 0 && fid < (int)all_results.size()) {
-                    all_results[fid].d_positions.push_back(d_pos_idx);
-                    all_results[fid].d_indices.push_back(d_idx_h[b]);
-                    all_results[fid].d_values.push_back(d_centers_h[d_idx_h[b]]);
+                if (fid >= 0) {
+                    auto& r = all_results[fid];
+                    r.d_positions.push_back(d_pos_idx);
+                    r.d_indices.push_back(d_idx_h[b]);
+                    r.d_values.push_back(d_centers_h[d_idx_h[b]]);
                 }
+                step_ids_v[b] = d_value_idx;
+                step_d_pos[b] = 1;
+                step_d_val[b] = __float2half(d_centers_h[d_idx_h[b]]);
+                act_in_var[b] = 1;
             }
+        }
+        run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                        act_in_var);
 
-            // ---- BOARD state ----
-            // 68 causal-mode iterations, each appending one board token.
-            int board_bid;  // single block_id for this board's 68 tokens
-            (void)board_bid;
-            // Each slot gets its own board block_id:
-            std::vector<int> this_board_bid(B, 0);
-            for (int b = 0; b < B; ++b) {
-                if (active[b] && in_variation[b]) this_board_bid[b] = next_block[b]++;
-            }
-            for (int step = 0; step < 68; ++step) {
-                // Truncate check.
-                bool any_can_continue = false;
-                for (int b = 0; b < B; ++b) {
-                    if (active[b] && in_variation[b] && (int)token_ids[b].size() < max_S) {
-                        any_can_continue = true;
-                    } else if (active[b] && (int)token_ids[b].size() >= max_S) {
-                        truncated[b] = true; active[b] = false;
-                    }
-                }
-                if (!any_can_continue) break;
+        // ===== BOARD state (68 steps) =====
+        // Each step: read last_h (hidden at d_value or previous board token),
+        // sample board token via board_head, append, forward_decode that token.
+        std::vector<int> this_board_bid(B, 0);
+        for (int b = 0; b < B; ++b) {
+            if (active[b] && in_variation[b]) this_board_bid[b] = next_block[b]++;
+        }
+        for (int step = 0; step < 68; ++step) {
+            auto sub_h = run_head_argmax_board_vocab();
 
-                for (int b = 0; b < B; ++b) {
-                    gather_pos[b] = (int)token_ids[b].size() - 1;
-                    if (gather_pos[b] < 0) gather_pos[b] = 0;
-                }
-                run_forward_and_gather(/*use_block_aware=*/false, gather_pos);
-
-                // board_head: [B, E] -> [B, Bv]
-                gemm_fp16(d_th_last_h_, w_.board_head_w, w_.board_head_b,
-                          d_logits_buf_, B, Bv, E, nullptr, 0, stream_.get());
-                argmax_fp16(d_logits_buf_, d_idx_out_, B, Bv, stream_.get());
-                stream_.sync();
-                auto sub_h = d2h_int32(d_idx_out_, B);
-
-                for (int b = 0; b < B; ++b) {
-                    if (!(active[b] && in_variation[b])) continue;
-                    int full = board_sub_to_full[sub_h[b]];
-                    token_ids[b].push_back(full);
-                    block_ids[b].push_back(this_board_bid[b]);
-                }
-            }
-
-            // ---- AFTER_BOARD state ----
-            // Run causal forward, board_head, sample, decide end_var per slot.
-            for (int b = 0; b < B; ++b) {
-                gather_pos[b] = (int)token_ids[b].size() - 1;
-                if (gather_pos[b] < 0) gather_pos[b] = 0;
-            }
-            run_forward_and_gather(false, gather_pos);
-            gemm_fp16(d_th_last_h_, w_.board_head_w, w_.board_head_b,
-                      d_logits_buf_, B, Bv, E, nullptr, 0, stream_.get());
-            argmax_fp16(d_logits_buf_, d_idx_out_, B, Bv, stream_.get());
-            stream_.sync();
-            auto ab_sub_h = d2h_int32(d_idx_out_, B);
-
-            std::vector<bool> ended_var(B, false);
+            std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
+            zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
+            zero_half(step_wl_val); zero_half(step_d_val);
+            std::fill(act_in_var.begin(), act_in_var.end(), 0);
             for (int b = 0; b < B; ++b) {
                 if (!(active[b] && in_variation[b])) continue;
-                if (ab_sub_h[b] == board_end_var_sub) {
-                    ended_var[b] = true;
-                    int full = board_sub_to_full[ab_sub_h[b]];
+                if ((int)token_ids[b].size() >= max_S) {
+                    truncated[b] = true; active[b] = false;
+                    continue;
+                }
+                int sub = sub_h[b];
+                int full = board_sub_to_full[sub];
+                token_ids[b].push_back(full);
+                block_ids[b].push_back(this_board_bid[b]);
+                step_ids_v[b] = full;
+                act_in_var[b] = 1;
+            }
+            run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                            act_in_var);
+        }
+
+        // ===== AFTER_BOARD state =====
+        // last_h is hidden at the 68th board token; sample via board_head.
+        auto ab_sub_h = run_head_argmax_board_vocab();
+        std::vector<bool> ended_var(B, false);
+        std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
+        std::fill(act_in_var.begin(), act_in_var.end(), 0);
+        for (int b = 0; b < B; ++b) {
+            if (!(active[b] && in_variation[b])) continue;
+            if (ab_sub_h[b] == board_end_var_sub) {
+                ended_var[b] = true;
+                int full = board_sub_to_full[ab_sub_h[b]];
+                token_ids[b].push_back(full);
+                block_ids[b].push_back(orphan_ctr[b]++);
+                step_ids_v[b] = full;
+                act_in_var[b] = 1;
+            }
+            // else: continue_var — don't append, don't forward_decode for this slot.
+        }
+        run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                        act_in_var);
+
+        // ===== AFTER_END_VAR state (gated by ended_var) =====
+        bool any_ended_var = false;
+        for (bool e : ended_var) if (e) { any_ended_var = true; break; }
+        if (any_ended_var) {
+            auto aev_sub_h = run_head_argmax_board_vocab();
+            std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
+            std::fill(act_in_var.begin(), act_in_var.end(), 0);
+            for (int b = 0; b < B; ++b) {
+                if (!ended_var[b]) continue;
+                if (aev_sub_h[b] == board_end_think_sub) {
+                    int full = board_sub_to_full[aev_sub_h[b]];
                     token_ids[b].push_back(full);
                     block_ids[b].push_back(orphan_ctr[b]++);
+                    ended_thinking[b] = true;
+                    in_variation[b] = false;
+                    step_ids_v[b] = full;
+                    act_in_var[b] = 1;
                 }
-                // else: continue_var (or unexpected) — don't append; in_variation
-                // stays true; will sample next move at next iter's MOVE state.
+                // else: new_variation — don't append, don't forward_decode.
             }
+            run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                            act_in_var);
+        }
 
-            // ---- AFTER_END_VAR state ----
-            // Only for slots with ended_var: probe end_think.
-            bool any_ended_var = false;
-            for (int b = 0; b < B; ++b) if (ended_var[b]) any_ended_var = true;
-            if (any_ended_var) {
-                for (int b = 0; b < B; ++b) {
-                    gather_pos[b] = (int)token_ids[b].size() - 1;
-                    if (gather_pos[b] < 0) gather_pos[b] = 0;
-                }
-                run_forward_and_gather(false, gather_pos);
-                gemm_fp16(d_th_last_h_, w_.board_head_w, w_.board_head_b,
-                          d_logits_buf_, B, Bv, E, nullptr, 0, stream_.get());
-                argmax_fp16(d_logits_buf_, d_idx_out_, B, Bv, stream_.get());
-                stream_.sync();
-                auto aev_sub_h = d2h_int32(d_idx_out_, B);
-
-                for (int b = 0; b < B; ++b) {
-                    if (!ended_var[b]) continue;
-                    if (aev_sub_h[b] == board_end_think_sub) {
-                        // Append end_think, transition to FINAL.
-                        int full = board_sub_to_full[aev_sub_h[b]];
-                        token_ids[b].push_back(full);
-                        block_ids[b].push_back(orphan_ctr[b]++);
-                        ended_thinking[b] = true;
-                        in_variation[b] = false;
-                    } else {
-                        // new_variation — don't append; in_variation stays true,
-                        // next iter starts a new variation root_move.
-                    }
-                }
-            }
-
-            // ---- FINAL state (gated by ended_thinking) ----
-            bool any_final = false;
-            for (int b = 0; b < B; ++b) if (ended_thinking[b] && active[b]) any_final = true;
-            if (any_final) {
-                // (1) Sample final move via policy_head from last-pos hidden.
-                for (int b = 0; b < B; ++b) {
-                    gather_pos[b] = (int)token_ids[b].size() - 1;
-                    if (gather_pos[b] < 0) gather_pos[b] = 0;
-                }
-                run_forward_and_gather(true, gather_pos);
-                gemm_fp16(d_th_last_h_, w_.policy_head_w, w_.policy_head_b,
-                          d_logits_buf_, B, Mv, E, nullptr, 0, stream_.get());
-                // Match Python: no legal-mask filter on the final move either.
-                argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
-                stream_.sync();
-                auto final_idx_h = d2h_int32(d_idx_out_, B);
-
-                for (int b = 0; b < B; ++b) {
-                    if (!(ended_thinking[b] && active[b])) continue;
-                    int sub = final_idx_h[b];
-                    int full = move_sub_to_full[sub];
-                    token_ids[b].push_back(full);
-                    block_ids[b].push_back(orphan_ctr[b]++);
-                    int fid = slot_to_fen[b];
-                    if (fid < 0) continue;
+        // ===== FINAL state (gated by ended_thinking) =====
+        bool any_final = false;
+        for (int b = 0; b < B; ++b) if (ended_thinking[b] && active[b]) { any_final = true; break; }
+        if (any_final) {
+            // Sample final move from policy_head(last_h).
+            auto fm_sub_h = run_head_argmax_move_vocab(
+                w_.policy_head_w, w_.policy_head_b);
+            std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
+            std::fill(act_in_var.begin(), act_in_var.end(), 0);
+            for (int b = 0; b < B; ++b) {
+                if (!(ended_thinking[b] && active[b])) continue;
+                int sub = fm_sub_h[b];
+                int full = move_sub_to_full[sub];
+                token_ids[b].push_back(full);
+                block_ids[b].push_back(orphan_ctr[b]++);
+                int fid = slot_to_fen[b];
+                if (fid >= 0) {
                     auto& r = all_results[fid];
                     std::string mp = vocab_->idxToToken(full);
                     r.move = decoder::DecoderVocab::pseudoToStandardUci(mp);
                 }
+                step_ids_v[b] = full;
+                act_in_var[b] = 1;
+            }
+            run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                            act_in_var);
 
-                // (2) Final WL via wl_head from final_move position.
-                for (int b = 0; b < B; ++b) {
-                    gather_pos[b] = (int)token_ids[b].size() - 1;
-                    if (gather_pos[b] < 0) gather_pos[b] = 0;
-                }
-                run_forward_and_gather(true, gather_pos);
-                gemm_fp16(d_th_last_h_, w_.wl_w1_w, w_.wl_w1_b,
-                          d_logits_buf_, B, H, E, nullptr, 0, stream_.get());
-                mish_inplace_fp16(d_logits_buf_, B * H, stream_.get());
-                gemm_fp16(d_logits_buf_, w_.wl_w2_w, w_.wl_w2_b,
-                          d_logits_buf_ + B * H, B, Kb, H, nullptr, 0, stream_.get());
-                argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
-                stream_.sync();
-                auto fwl_h = d2h_int32(d_idx_out_, B);
-
-                for (int b = 0; b < B; ++b) {
-                    if (!(ended_thinking[b] && active[b])) continue;
-                    int wl_pos_idx = (int)token_ids[b].size();
-                    token_ids[b].push_back(wl_value_idx);
-                    block_ids[b].push_back(orphan_ctr[b]++);
-                    int fid = slot_to_fen[b];
-                    if (fid < 0) continue;
+            // Final WL.
+            auto fwl_h = run_value_head_argmax(w_.wl_w1_w, w_.wl_w1_b,
+                                               w_.wl_w2_w, w_.wl_w2_b);
+            std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
+            zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
+            zero_half(step_wl_val); zero_half(step_d_val);
+            std::fill(act_in_var.begin(), act_in_var.end(), 0);
+            for (int b = 0; b < B; ++b) {
+                if (!(ended_thinking[b] && active[b])) continue;
+                int wl_pos_idx = (int)token_ids[b].size();
+                token_ids[b].push_back(wl_value_idx);
+                block_ids[b].push_back(orphan_ctr[b]++);
+                int fid = slot_to_fen[b];
+                if (fid >= 0) {
                     auto& r = all_results[fid];
                     r.wl_positions.push_back(wl_pos_idx);
                     r.wl_indices.push_back(fwl_h[b]);
@@ -550,29 +557,28 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     r.final_wl_index = fwl_h[b];
                     r.final_wl_value = wl_centers_h[fwl_h[b]];
                 }
+                step_ids_v[b] = wl_value_idx;
+                step_wl_pos[b] = 1;
+                step_wl_val[b] = __float2half(wl_centers_h[fwl_h[b]]);
+                act_in_var[b] = 1;
+            }
+            run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                            act_in_var);
 
-                // (3) Final D via d_head from wl position (with WL injected).
-                for (int b = 0; b < B; ++b) {
-                    gather_pos[b] = (int)token_ids[b].size() - 1;
-                    if (gather_pos[b] < 0) gather_pos[b] = 0;
-                }
-                run_forward_and_gather(true, gather_pos);
-                gemm_fp16(d_th_last_h_, w_.d_w1_w, w_.d_w1_b,
-                          d_logits_buf_, B, H, E, nullptr, 0, stream_.get());
-                mish_inplace_fp16(d_logits_buf_, B * H, stream_.get());
-                gemm_fp16(d_logits_buf_, w_.d_w2_w, w_.d_w2_b,
-                          d_logits_buf_ + B * H, B, Kb, H, nullptr, 0, stream_.get());
-                argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
-                stream_.sync();
-                auto fd_h = d2h_int32(d_idx_out_, B);
-
-                for (int b = 0; b < B; ++b) {
-                    if (!(ended_thinking[b] && active[b])) continue;
-                    int d_pos_idx = (int)token_ids[b].size();
-                    token_ids[b].push_back(d_value_idx);
-                    block_ids[b].push_back(orphan_ctr[b]++);
-                    int fid = slot_to_fen[b];
-                    if (fid < 0) continue;
+            // Final D.
+            auto fd_h = run_value_head_argmax(w_.d_w1_w, w_.d_w1_b,
+                                              w_.d_w2_w, w_.d_w2_b);
+            std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
+            zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
+            zero_half(step_wl_val); zero_half(step_d_val);
+            std::fill(act_in_var.begin(), act_in_var.end(), 0);
+            for (int b = 0; b < B; ++b) {
+                if (!(ended_thinking[b] && active[b])) continue;
+                int d_pos_idx = (int)token_ids[b].size();
+                token_ids[b].push_back(d_value_idx);
+                block_ids[b].push_back(orphan_ctr[b]++);
+                int fid = slot_to_fen[b];
+                if (fid >= 0) {
                     auto& r = all_results[fid];
                     r.d_positions.push_back(d_pos_idx);
                     r.d_indices.push_back(fd_h[b]);
@@ -580,55 +586,46 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     r.final_d_index = fd_h[b];
                     r.final_d_value = d_centers_h[fd_h[b]];
                     r.ended_thinking = true;
-
-                    // Mark slot done.
-                    active[b] = false;
                 }
+                step_ids_v[b] = d_value_idx;
+                step_d_pos[b] = 1;
+                step_d_val[b] = __float2half(d_centers_h[fd_h[b]]);
+                act_in_var[b] = 1;
+
+                active[b] = false;  // mark slot done
+            }
+            run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
+                            act_in_var);
+        }
+
+        // ===== Iter cap + truncation + commit + refill =====
+        for (int b = 0; b < B; ++b) {
+            if (slot_to_fen[b] < 0) continue;
+
+            slot_iter_count[b]++;
+            bool slot_done = false;
+
+            if (active[b] && (int)token_ids[b].size() >= max_S) {
+                truncated[b] = true; active[b] = false; slot_done = true;
+            }
+            if (!active[b]) slot_done = true;
+            if (slot_iter_count[b] >= max_iters && active[b]) {
+                truncated[b] = true; active[b] = false; slot_done = true;
             }
 
-            // Truncation / iter-count check, plus FINAL commit + refill.
-            for (int b = 0; b < B; ++b) {
-                if (!active[b] && slot_to_fen[b] < 0) continue;
-
-                slot_iter_count[b]++;
-                bool slot_done = false;
-
-                if (active[b] && (int)token_ids[b].size() >= max_S) {
-                    truncated[b] = true;
-                    active[b] = false;
-                    slot_done = true;
+            if (slot_done) {
+                int fid = slot_to_fen[b];
+                if (fid >= 0 && fid < (int)all_results.size()) {
+                    auto& r = all_results[fid];
+                    r.token_ids = token_ids[b];
+                    r.block_ids = block_ids[b];
+                    r.truncated = truncated[b];
                 }
-                if (!active[b] && slot_to_fen[b] >= 0) {
-                    // Slot finished this iteration (via FINAL or truncation).
-                    slot_done = true;
-                }
-                if (slot_iter_count[b] >= max_iters && active[b]) {
-                    // Hit per-slot iter cap.
-                    truncated[b] = true;
-                    active[b] = false;
-                    slot_done = true;
-                }
-
-                if (slot_done) {
-                    // Commit results to all_results[slot_to_fen[b]].
-                    int fid = slot_to_fen[b];
-                    if (fid >= 0 && fid < (int)all_results.size()) {
-                        auto& r = all_results[fid];
-                        r.token_ids = token_ids[b];
-                        r.block_ids = block_ids[b];
-                        r.truncated = truncated[b];
-                    }
-                    // Try to refill from queue.
-                    int next_fid = pop_pending();
-                    if (next_fid >= 0) {
-                        reset_slot(b, next_fid);
-                        slot_iter_count[b] = 0;
-                    } else {
-                        slot_to_fen[b] = -1;  // mark fully idle
-                    }
-                }
+                slot_to_fen[b] = -1;
             }
         }
+        // Refill any newly-idle slots.
+        refill_idle();
     }
 
     return all_results;

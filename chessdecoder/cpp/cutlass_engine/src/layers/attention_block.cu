@@ -51,7 +51,8 @@ void allocate_layer_workspace(LayerWorkspace& ws, const ModelConfig& cfg,
 void attention_block_forward(const LayerContext& ctx, const LayerWeights& Lw,
                              LayerWorkspace& ws, KvCache& kv, int layer_idx,
                              ForwardMode mode, int B, int S,
-                             const int32_t* block_id, cudaStream_t stream) {
+                             const int32_t* block_id, cudaStream_t stream,
+                             bool write_kv_in_prefill) {
     const auto& cfg = *ctx.cfg;
     const auto& w   = *ctx.w;
     const int M = B * S;
@@ -83,11 +84,18 @@ void attention_block_forward(const LayerContext& ctx, const LayerWeights& Lw,
                              ws.attn_out, B, NH, HD, cfg.max_seq_len,
                              layer_idx, scale, stream);
     } else {
+        if (write_kv_in_prefill) {
+            // Init / refill prefill: also populate the KV cache so subsequent
+            // forward_decode calls can read these positions.  Writes at
+            // past_len[b]..past_len[b]+S for active slots.
+            kv_scatter_fp16(ws.k_buf, ws.v_buf, kv.K(), kv.V(),
+                            kv.past_len(), kv.slot_active(),
+                            B, S, NH, HD, cfg.max_seq_len, layer_idx,
+                            cfg.num_layers, stream);
+        }
         fmha_prefill_dispatch(ws.q_buf, ws.k_buf, ws.v_buf, block_id,
                               kv.slot_active(), ws.attn_out,
                               B, S, NH, HD, scale, stream);
-        // After prefill, the caller (model.cu) decides whether to copy K/V
-        // into the cache (only for the FEN-init prefill).
     }
 
     gemm_fp16(ws.attn_out, Lw.out_w, nullptr,
@@ -116,8 +124,10 @@ void mlp_block_forward(const LayerContext& ctx, const LayerWeights& Lw,
 void transformer_layer_forward(const LayerContext& ctx, const LayerWeights& Lw,
                                LayerWorkspace& ws, KvCache& kv, int layer_idx,
                                ForwardMode mode, int B, int S,
-                               const int32_t* block_id, cudaStream_t stream) {
-    attention_block_forward(ctx, Lw, ws, kv, layer_idx, mode, B, S, block_id, stream);
+                               const int32_t* block_id, cudaStream_t stream,
+                               bool write_kv_in_prefill) {
+    attention_block_forward(ctx, Lw, ws, kv, layer_idx, mode, B, S, block_id,
+                            stream, write_kv_in_prefill);
     mlp_block_forward(ctx, Lw, ws, B * S, stream);
 }
 

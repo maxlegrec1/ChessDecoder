@@ -41,7 +41,9 @@ struct LayerContext {
 };
 
 // Run one attention block.  After this:
-//   - kv cache (K/V) is updated for `layer_idx` in Decode mode
+//   - kv cache (K/V) is updated for `layer_idx` in Decode mode (always),
+//     or in PrefillBlock mode if `write_kv_in_prefill` is true (used for
+//     init prefill / refill, populating positions [past_len, past_len+S)).
 //   - ws.h_in    contains attn_out @ W_out  (delta, to be residual-added by MLP)
 //   - ws.residual contains the residual stream up to (but not including) this delta
 void attention_block_forward(const LayerContext& ctx,
@@ -52,7 +54,8 @@ void attention_block_forward(const LayerContext& ctx,
                              ForwardMode mode,
                              int B, int S,
                              const int32_t* block_id,
-                             cudaStream_t stream);
+                             cudaStream_t stream,
+                             bool write_kv_in_prefill = false);
 
 void mlp_block_forward(const LayerContext& ctx,
                        const LayerWeights& Lw,
@@ -68,6 +71,7 @@ void transformer_layer_forward(const LayerContext& ctx,
                                ForwardMode mode,
                                int B, int S,
                                const int32_t* block_id,
-                               cudaStream_t stream);
+                               cudaStream_t stream,
+                               bool write_kv_in_prefill = false);
 
 }  // namespace cutlass_engine

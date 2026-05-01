@@ -107,7 +107,8 @@ void ChessDecoderModel::forward_prefill_block(const int32_t* ids,
                                               const __half* wl_val, const __half* d_val,
                                               int B, int S,
                                               __half* out_h,
-                                              cudaStream_t stream) {
+                                              cudaStream_t stream,
+                                              KvCache* kv_for_write) {
     const int M = B * S;
     const int E = cfg_->embed_dim;
 
@@ -120,18 +121,32 @@ void ChessDecoderModel::forward_prefill_block(const int32_t* ids,
     CE_CUDA_CHECK(cudaMemcpyAsync(ws_.pos, pos, M * sizeof(int32_t),
                                   cudaMemcpyDeviceToDevice, stream));
 
-    // Prefill mode: KV cache is NOT used by attention.  We thread `active`
-    // into the per-layer call by stashing it on a tiny stack KvCache stand-in.
-    KvCache stub_kv = ws_kv_stub_;
-    stub_kv.set_slot_active_ptr(const_cast<int32_t*>(active));
+    KvCache* kv = kv_for_write;
+    KvCache local_stub = ws_kv_stub_;
+    if (kv == nullptr) {
+        // No cache write requested: use stub for active-mask plumbing.
+        local_stub.set_slot_active_ptr(const_cast<int32_t*>(active));
+        kv = &local_stub;
+    } else {
+        // For cache-write path: caller-provided KvCache must already have
+        // its slot_active pointing at the appropriate gate (typically
+        // == `active` here), and past_len[b] set to the destination
+        // start offset.
+    }
 
+    bool write_kv = (kv_for_write != nullptr);
     for (int li = 0; li < cfg_->num_layers; ++li) {
-        transformer_layer_forward(ctx_, w_->layers[li], ws_, stub_kv, li,
+        transformer_layer_forward(ctx_, w_->layers[li], ws_, *kv, li,
                                   ForwardMode::PrefillBlock, B, S, block_id,
-                                  stream);
+                                  stream, write_kv);
     }
     rmsnorm_residual_fp16(ws_.h_in, ws_.residual, w_->final_norm,
                           out_h, ws_.residual, M, E, 1e-6f, stream);
+
+    if (write_kv) {
+        // Advance past_len[b] += S for active slots.
+        past_len_increment(kv->past_len(), kv->slot_active(), S, B, stream);
+    }
 }
 
 }  // namespace cutlass_engine

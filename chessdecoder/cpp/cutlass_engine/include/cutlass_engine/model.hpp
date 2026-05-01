@@ -39,8 +39,10 @@ public:
                                 cudaStream_t stream);
 
     // Prefill forward over a [B, S] block (init or refill). Self-attention
-    // only — does NOT update the cache. Caller post-processes by copying the
-    // last-position K/V (or all positions) into cache via kv_scatter.
+    // only.  When write_kv=true, ALSO populates the causal KV cache at
+    // positions [past_len[b], past_len[b]+S) for active slots, AND advances
+    // past_len[b] += S — letting subsequent forward_decode calls read these
+    // positions seamlessly.
     //
     // block_id [B, S] int32 — for prefix mask
     // active   [B] int32   — gates per-slot work
@@ -52,7 +54,8 @@ public:
                                const __half* wl_val, const __half* d_val,
                                int B, int S,
                                __half* out_h,             // [B, S, E]
-                               cudaStream_t stream);
+                               cudaStream_t stream,
+                               KvCache* kv_for_write = nullptr);
 
     int batch_size() const { return cfg_->batch_size; }
     int embed_dim() const { return cfg_->embed_dim; }

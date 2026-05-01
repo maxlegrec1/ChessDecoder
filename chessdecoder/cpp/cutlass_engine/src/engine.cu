@@ -121,6 +121,7 @@ ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
     d_th_d_val_ = arena_.allocT<__half>(B * max_S_th);
     d_th_hidden_= arena_.allocT<__half>(B * max_S_th * cfg_.embed_dim);
     d_th_last_h_= arena_.allocT<__half>(B * cfg_.embed_dim);
+    d_th_last_h_bkp_ = arena_.allocT<__half>(B * cfg_.embed_dim);
     d_legal_mask_= arena_.allocT<bool>(B * cfg_.move_vocab_size);
     d_idx_out_   = arena_.allocT<int32_t>(B);
 

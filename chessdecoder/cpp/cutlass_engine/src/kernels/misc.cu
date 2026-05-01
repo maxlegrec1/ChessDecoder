@@ -22,6 +22,20 @@ __global__ void cast_fp32_fp16_kernel(const float* __restrict__ in,
     out[i] = __float2half_rn(in[i]);
 }
 
+// For each slot b: if active[b]==0, restore dst[b, :] from backup[b, :].
+// Used after a batched forward to preserve inactive slots' hidden state.
+__global__ void restore_inactive_kernel(__half* __restrict__ dst,
+                                        const __half* __restrict__ backup,
+                                        const int32_t* __restrict__ active,
+                                        int B, int E) {
+    int b = blockIdx.y;
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B || e >= E) return;
+    if (active[b] == 0) {
+        dst[b * E + e] = backup[b * E + e];
+    }
+}
+
 }  // namespace
 
 void gather_bucket_center(const float* centers, const int32_t* idx,
@@ -34,6 +48,16 @@ void gather_bucket_center(const float* centers, const int32_t* idx,
 void cast_fp32_to_fp16(const float* in, __half* out, int N, cudaStream_t stream) {
     int blocks = (N + 255) / 256;
     cast_fp32_fp16_kernel<<<blocks, 256, 0, stream>>>(in, out, N);
+    CE_CUDA_LAST();
+}
+
+void restore_inactive_last_h(__half* dst, const __half* backup,
+                             const int32_t* active, int B, int E,
+                             cudaStream_t stream) {
+    constexpr int TX = 128;
+    dim3 block(TX);
+    dim3 grid((E + TX - 1) / TX, B);
+    restore_inactive_kernel<<<grid, block, 0, stream>>>(dst, backup, active, B, E);
     CE_CUDA_LAST();
 }
 
