@@ -96,46 +96,82 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
 
     std::vector<RolloutResult> all_results(N);
 
-    // Process FENs in chunks of B.
-    for (int chunk_start = 0; chunk_start < N; chunk_start += B) {
-        const int chunk_n = std::min(B, N - chunk_start);
+    // ============= Continuous-batched scheduler (mid-flight refill) =============
+    // Per-slot bookkeeping; slots are refilled from `pending` whenever a
+    // slot reaches FINAL.  New slots join the next iteration in lockstep.
+    std::vector<std::vector<int32_t>> token_ids(B);
+    std::vector<std::vector<int32_t>> block_ids(B);
+    std::vector<int> next_block(B, 0);
+    std::vector<int> orphan_ctr(B, 10000);
+    std::vector<bool> active(B, false);
+    std::vector<bool> in_variation(B, false);
+    std::vector<bool> ended_thinking(B, false);
+    std::vector<bool> truncated(B, false);
+    std::vector<int> slot_to_fen(B, -1);
+    std::vector<std::vector<uint8_t>> legal_masks(B, std::vector<uint8_t>(Mv, 0));
 
-        // Per-slot state (host).
-        std::vector<std::vector<int32_t>> token_ids(B);
-        std::vector<std::vector<int32_t>> block_ids(B);
-        std::vector<int> next_block(B, 0);
-        std::vector<int> orphan_ctr(B, 10000);
-        std::vector<bool> active(B, false);
-        std::vector<bool> in_variation(B, false);
-        std::vector<bool> ended_thinking(B, false);
-        std::vector<bool> truncated(B, false);
-        // Per-slot legal-move mask (host bool).
-        std::vector<std::vector<uint8_t>> legal_masks(B, std::vector<uint8_t>(Mv, 0));
+    auto reset_slot = [&](int b, int fid) {
+        token_ids[b].clear();
+        block_ids[b].clear();
+        next_block[b] = 0;
+        orphan_ctr[b] = 10000;
+        active[b] = false;
+        in_variation[b] = false;
+        ended_thinking[b] = false;
+        truncated[b] = false;
+        std::fill(legal_masks[b].begin(), legal_masks[b].end(), 0);
 
-        // Init each slot.
-        for (int b = 0; b < chunk_n; ++b) {
-            const auto& fen = fens[chunk_start + b];
-            auto root = vocab_->fenToTokenIds(fen);
-            if ((int)root.size() != 68) {
-                throw std::runtime_error("init: expected 68 root tokens, got " +
-                                         std::to_string(root.size()));
-            }
-            int bid = next_block[b]++;
-            for (int t : root) {
-                token_ids[b].push_back(t);
-                block_ids[b].push_back(bid);
-            }
-            token_ids[b].push_back(start_think_idx);
-            block_ids[b].push_back(orphan_ctr[b]++);
-            active[b] = true;
-            in_variation[b] = true;
-            auto legal = vocab_->legalMoveIndices(fen);
-            for (int idx : legal) if (idx >= 0 && idx < Mv) legal_masks[b][idx] = 1;
+        if (fid < 0) {
+            slot_to_fen[b] = -1;
+            return;
         }
-        // Padded slots beyond chunk_n: stay inactive.
-        for (int b = chunk_n; b < B; ++b) {
-            // Token vectors empty; padding handled in build_step().
+        const auto& fen = fens[fid];
+        auto root = vocab_->fenToTokenIds(fen);
+        if ((int)root.size() != 68) {
+            throw std::runtime_error("init: expected 68 root tokens, got " +
+                                     std::to_string(root.size()));
         }
+        int bid = next_block[b]++;
+        for (int t : root) {
+            token_ids[b].push_back(t);
+            block_ids[b].push_back(bid);
+        }
+        token_ids[b].push_back(start_think_idx);
+        block_ids[b].push_back(orphan_ctr[b]++);
+        active[b] = true;
+        in_variation[b] = true;
+        slot_to_fen[b] = fid;
+        auto legal = vocab_->legalMoveIndices(fen);
+        for (int idx : legal) if (idx >= 0 && idx < Mv) legal_masks[b][idx] = 1;
+    };
+
+    // Pending queue: FEN ids waiting for a slot.
+    std::vector<int> pending;
+    pending.reserve(N);
+    for (int i = N - 1; i >= 0; --i) pending.push_back(i);  // pop_back = earliest first
+
+    auto pop_pending = [&]() -> int {
+        if (pending.empty()) return -1;
+        int fid = pending.back();
+        pending.pop_back();
+        return fid;
+    };
+
+    // Refill all idle slots from the queue.
+    auto refill_idle = [&]() {
+        for (int b = 0; b < B; ++b) {
+            if (!active[b]) {
+                int fid = pop_pending();
+                if (fid >= 0) reset_slot(b, fid);
+            }
+        }
+    };
+
+    // Initial fill.
+    refill_idle();
+
+    {
+        // Outer scope to keep variable defs aligned with the original block.
 
         // Helper: build [B, S] device tensors from per-slot state at length S.
         // Stores into d_th_ids_, d_th_pos_, d_th_block_, d_th_wl_pos_, etc.
@@ -174,8 +210,9 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
             // RolloutResult during sampling (hand off below).  For now
             // re-derive from results vector (we set them below in MOVE/WL_D).
             // We use all_results[fen_id] as the canonical store.
-            for (int b = 0; b < chunk_n; ++b) {
-                int fid = chunk_start + b;
+            for (int b = 0; b < B; ++b) {
+                int fid = slot_to_fen[b];
+                if (fid < 0) continue;
                 const auto& r = all_results[fid];
                 for (size_t i = 0; i < r.wl_positions.size(); ++i) {
                     int p = r.wl_positions[i];
@@ -247,11 +284,21 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         };
 
         // -------------- Main per-iteration loop --------------
-        for (int iter = 0; iter < max_iters; ++iter) {
-            // Bail out if no slots active.
+        // CB: each iteration's slots may include freshly-refilled slots
+        // (after a previous iteration's FINAL state).  No per-iteration
+        // chunk; we just keep going until pending is empty AND all slots
+        // are inactive.
+        std::vector<int> slot_iter_count(B, 0);
+        // Also track per-slot iter count so we cap each slot at max_iters.
+        for (int outer_step = 0; outer_step < N * (max_iters + 4); ++outer_step) {
+            // Bail when no work left.
             bool any_active = false;
             for (int b = 0; b < B; ++b) if (active[b]) any_active = true;
-            if (!any_active) break;
+            if (!any_active && pending.empty()) break;
+            if (!any_active) {
+                refill_idle();
+                continue;
+            }
 
             // ---- MOVE state ----
             // Sample move from thinking_policy_head at the LAST position
@@ -307,8 +354,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                 token_ids[b].push_back(wl_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
 
-                int fid = chunk_start + b;
-                if (fid < (int)all_results.size()) {
+                int fid = slot_to_fen[b];
+                if (fid >= 0 && fid < (int)all_results.size()) {
                     all_results[fid].wl_positions.push_back(wl_pos_idx);
                     all_results[fid].wl_indices.push_back(wl_idx_h[b]);
                     all_results[fid].wl_values.push_back(wl_centers_h[wl_idx_h[b]]);
@@ -336,8 +383,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                 token_ids[b].push_back(d_value_idx);
                 block_ids[b].push_back(orphan_ctr[b]++);
 
-                int fid = chunk_start + b;
-                if (fid < (int)all_results.size()) {
+                int fid = slot_to_fen[b];
+                if (fid >= 0 && fid < (int)all_results.size()) {
                     all_results[fid].d_positions.push_back(d_pos_idx);
                     all_results[fid].d_indices.push_back(d_idx_h[b]);
                     all_results[fid].d_values.push_back(d_centers_h[d_idx_h[b]]);
@@ -467,7 +514,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     int full = move_sub_to_full[sub];
                     token_ids[b].push_back(full);
                     block_ids[b].push_back(orphan_ctr[b]++);
-                    int fid = chunk_start + b;
+                    int fid = slot_to_fen[b];
+                    if (fid < 0) continue;
                     auto& r = all_results[fid];
                     std::string mp = vocab_->idxToToken(full);
                     r.move = decoder::DecoderVocab::pseudoToStandardUci(mp);
@@ -493,7 +541,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     int wl_pos_idx = (int)token_ids[b].size();
                     token_ids[b].push_back(wl_value_idx);
                     block_ids[b].push_back(orphan_ctr[b]++);
-                    int fid = chunk_start + b;
+                    int fid = slot_to_fen[b];
+                    if (fid < 0) continue;
                     auto& r = all_results[fid];
                     r.wl_positions.push_back(wl_pos_idx);
                     r.wl_indices.push_back(fwl_h[b]);
@@ -522,7 +571,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     int d_pos_idx = (int)token_ids[b].size();
                     token_ids[b].push_back(d_value_idx);
                     block_ids[b].push_back(orphan_ctr[b]++);
-                    int fid = chunk_start + b;
+                    int fid = slot_to_fen[b];
+                    if (fid < 0) continue;
                     auto& r = all_results[fid];
                     r.d_positions.push_back(d_pos_idx);
                     r.d_indices.push_back(fd_h[b]);
@@ -536,23 +586,48 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                 }
             }
 
-            // Truncation check.
+            // Truncation / iter-count check, plus FINAL commit + refill.
             for (int b = 0; b < B; ++b) {
+                if (!active[b] && slot_to_fen[b] < 0) continue;
+
+                slot_iter_count[b]++;
+                bool slot_done = false;
+
                 if (active[b] && (int)token_ids[b].size() >= max_S) {
                     truncated[b] = true;
                     active[b] = false;
+                    slot_done = true;
+                }
+                if (!active[b] && slot_to_fen[b] >= 0) {
+                    // Slot finished this iteration (via FINAL or truncation).
+                    slot_done = true;
+                }
+                if (slot_iter_count[b] >= max_iters && active[b]) {
+                    // Hit per-slot iter cap.
+                    truncated[b] = true;
+                    active[b] = false;
+                    slot_done = true;
+                }
+
+                if (slot_done) {
+                    // Commit results to all_results[slot_to_fen[b]].
+                    int fid = slot_to_fen[b];
+                    if (fid >= 0 && fid < (int)all_results.size()) {
+                        auto& r = all_results[fid];
+                        r.token_ids = token_ids[b];
+                        r.block_ids = block_ids[b];
+                        r.truncated = truncated[b];
+                    }
+                    // Try to refill from queue.
+                    int next_fid = pop_pending();
+                    if (next_fid >= 0) {
+                        reset_slot(b, next_fid);
+                        slot_iter_count[b] = 0;
+                    } else {
+                        slot_to_fen[b] = -1;  // mark fully idle
+                    }
                 }
             }
-        }
-
-        // Commit results: fill token_ids/block_ids/truncated for each slot.
-        for (int b = 0; b < chunk_n; ++b) {
-            int fid = chunk_start + b;
-            auto& r = all_results[fid];
-            r.token_ids = token_ids[b];
-            r.block_ids = block_ids[b];
-            r.truncated = truncated[b];
-            // r.move was set in FINAL state (or stays empty if truncated before FINAL).
         }
     }
 
