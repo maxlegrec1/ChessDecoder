@@ -1,0 +1,38 @@
+{
+  "config": {
+    "n": 512,
+    "large": true,
+    "warmup": 2,
+    "repeats": 5
+  },
+  "results": [
+    {
+      "B": 32,
+      "fen_per_s": 3150.970883606,
+      "ms_per_fen": 0.31736250093672425,
+      "engine_init_mb": 8302.0,
+      "peak_run_mb": 70.0
+    },
+    {
+      "B": 64,
+      "fen_per_s": 3220.0559439076696,
+      "ms_per_fen": 0.3105536106886575,
+      "engine_init_mb": 16104.0,
+      "peak_run_mb": 2.0
+    },
+    {
+      "B": 128,
+      "fen_per_s": 4049.886395814111,
+      "ms_per_fen": 0.24692050646990538,
+      "engine_init_mb": 31708.0,
+      "peak_run_mb": 0.0
+    }
+  ],
+  "best": {
+    "B": 128,
+    "fen_per_s": 4049.886395814111,
+    "ms_per_fen": 0.24692050646990538,
+    "engine_init_mb": 31708.0,
+    "peak_run_mb": 0.0
+  }
+}
