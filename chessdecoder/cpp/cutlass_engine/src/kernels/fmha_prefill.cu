@@ -123,6 +123,20 @@ void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
                            float scale, cudaStream_t stream) {
     dim3 grid(B, NH);
     std::size_t shmem = sizeof(float) * (2 * S * HD) + sizeof(int32_t) * S;
+
+    // sm_100 default shared mem is 48 KB; for larger S we opt into the
+    // hardware max (~228 KB on Blackwell).  Set the function attribute once.
+    static thread_local bool attr_set = false;
+    if (!attr_set) {
+        if (HD == 32)  cudaFuncSetAttribute((const void*)&fmha_prefill_kernel<32>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, 200000);
+        if (HD == 64)  cudaFuncSetAttribute((const void*)&fmha_prefill_kernel<64>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, 200000);
+        if (HD == 128) cudaFuncSetAttribute((const void*)&fmha_prefill_kernel<128>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, 200000);
+        attr_set = true;
+    }
+
     if (HD == 32) {
         dim3 block(32);
         fmha_prefill_kernel<32><<<grid, block, shmem, stream>>>(

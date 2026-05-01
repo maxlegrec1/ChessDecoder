@@ -38,9 +38,19 @@ public:
     void set_d_temperature(float t)       { d_t_ = t; }
 
     // Run rollouts on `fens`. Returns one result per FEN, in submission order.
-    // N can exceed batch_size — continuous batching kicks in.
+    // N can exceed batch_size — chunked continuous batching kicks in.
     std::vector<RolloutResult> predict_moves(const std::vector<std::string>& fens,
                                              float fallback_temperature);
+
+    // Full thinking-trace inference (state machine: MOVE → WL_D → BOARD → ...
+    // → AFTER_END_VAR → FINAL).  Each FEN produces a full ThinkingResult-like
+    // payload (token_ids, block_ids, wl/d entries, final_move + final wl/d).
+    //
+    // temp=0 → argmax (deterministic, matches Python run_thinking).
+    // max_iters caps the number of variation iterations to avoid runaway.
+    std::vector<RolloutResult> predict_moves_thinking(
+        const std::vector<std::string>& fens, float temperature,
+        int max_seq_len_cap, int max_iters);
 
     // Hot-swap weights without reallocation (RL update path).
     void update_weights(const std::string& weights_dir);
@@ -92,6 +102,18 @@ private:
     int32_t* d_idx_out_{nullptr};       // [B] int32
 
     int max_init_S_{71};
+
+    // Thinking-path scratch: max-S sized [B, max_S] tensors for the variable-
+    // length forward calls.  Sized at construction; reused across calls.
+    int32_t* d_th_ids_{nullptr};
+    int32_t* d_th_pos_{nullptr};
+    int32_t* d_th_block_{nullptr};
+    bool*    d_th_wl_pos_{nullptr};
+    bool*    d_th_d_pos_{nullptr};
+    __half*  d_th_wl_val_{nullptr};
+    __half*  d_th_d_val_{nullptr};
+    __half*  d_th_hidden_{nullptr};   // [B, max_S, E]
+    __half*  d_th_last_h_{nullptr};   // [B, E] gather of hidden at chosen position
 
     float board_t_{0.0f};
     float think_t_{0.0f};

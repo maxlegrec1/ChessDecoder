@@ -15,6 +15,7 @@ namespace cutlass_engine {
 struct RolloutResult {
     std::string move;
     std::vector<int32_t> token_ids;
+    std::vector<int32_t> block_ids;       // matches Python ThinkingResult
     std::vector<float> log_probs;
     // Value bookkeeping (same as existing engine):
     std::vector<int32_t> wl_positions;
@@ -25,10 +26,12 @@ struct RolloutResult {
     std::vector<int32_t> d_indices;
     std::vector<float>   d_values;
     std::vector<float>   d_log_probs;
-    int32_t final_wl_index{0};
+    int32_t final_wl_index{-1};
     float   final_wl_value{0};
-    int32_t final_d_index{0};
+    int32_t final_d_index{-1};
     float   final_d_value{0};
+    bool ended_thinking{false};
+    bool truncated{false};
 };
 
 // Per-slot scheduling state. CPU-only — the engine reads state[B] each step

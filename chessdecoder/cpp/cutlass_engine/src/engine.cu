@@ -49,16 +49,28 @@ std::size_t estimate_arena_bytes(const ModelConfig& c) {
     bytes += 2 * NL * Bs * NH * MAX * HD * sizeof(__half);
     bytes += Bs * sizeof(int32_t) * 2;  // past_len, slot_active
 
-    // LayerWorkspace at max_M=Bs*max_seq_len (worst case for prefill init).
-    // We size for max_M = Bs*71 (a reasonable upper bound for init prefill —
-    // 68 board tokens + move + wl + d). Refills use the same buffer.
-    const std::size_t max_M = Bs * 71;
+    // LayerWorkspace at max_M = Bs * max_seq_len (worst case for the
+    // thinking-trace prefill which re-runs over the full growing sequence).
+    const std::size_t max_M = Bs * MAX;
     bytes += max_M * E * sizeof(__half) * 6;            // h_in/h_out/residual + 3 buffers
     bytes += max_M * 3 * E * sizeof(__half);            // qkv
     bytes += max_M * E * sizeof(__half);                // attn_out
     bytes += max_M * 2 * d_ff * sizeof(__half);
     bytes += max_M * d_ff * sizeof(__half);
     bytes += max_M * sizeof(int32_t);                   // pos
+
+    // Thinking-path scratch buffers (per-call, [B, max_S] sized).
+    bytes += Bs * MAX * sizeof(int32_t) * 3;            // ids, pos, block_id
+    bytes += Bs * MAX * sizeof(bool) * 2;               // wl_pos, d_pos
+    bytes += Bs * MAX * sizeof(__half) * 2;             // wl_val, d_val
+    bytes += Bs * MAX * E * sizeof(__half);             // hidden buffer
+    bytes += Bs * E * sizeof(__half);                   // last-h gather
+
+    // Per-call scratch (no-thinking path).
+    bytes += Bs * (Mv > Bv ? Mv : Bv) * sizeof(__half); // logits
+    bytes += Bs * H * sizeof(__half);                   // value-head intermediate
+    bytes += Bs * Mv * sizeof(bool);                    // legal mask
+    bytes += Bs * 71 * sizeof(int32_t) * 4;             // ids/pos/block/active
 
     // 25% headroom for alignment/padding.
     bytes = bytes + bytes / 4;
@@ -80,8 +92,8 @@ ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
     w_ = load_weights(weights_dir, cfg_, arena_);
     kv_.allocate(cfg_, arena_);
 
-    // Worst-case workspace: prefill of `max_init_S_` tokens × B.
-    const int max_M = cfg_.batch_size * max_init_S_;
+    // Worst-case workspace: thinking-trace re-prefills over the full max_seq_len.
+    const int max_M = cfg_.batch_size * cfg_.max_seq_len;
     model_.initialize(cfg_, w_, arena_, max_M);
 
     // Per-call scratch.
@@ -92,7 +104,23 @@ ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
     d_active_buf_= arena_.allocT<int32_t>(B);
     d_hidden_buf_= arena_.allocT<__half>(max_M * cfg_.embed_dim);
     d_last_h_buf_= arena_.allocT<__half>(B * cfg_.embed_dim);
-    d_logits_buf_= arena_.allocT<__half>(B * std::max(cfg_.move_vocab_size, cfg_.board_vocab_size));
+    // Logits buffer needs room for B * max(Mv, Bv) plus B*H scratch for the
+    // value-head two-stage MLP (used by predict_moves_thinking).
+    d_logits_buf_= arena_.allocT<__half>(
+        B * (std::max(cfg_.move_vocab_size, cfg_.board_vocab_size) +
+             cfg_.value_hidden_size));
+
+    // Thinking-path scratch: sized for full max_seq_len * batch_size.
+    const int max_S_th = cfg_.max_seq_len;
+    d_th_ids_   = arena_.allocT<int32_t>(B * max_S_th);
+    d_th_pos_   = arena_.allocT<int32_t>(B * max_S_th);
+    d_th_block_ = arena_.allocT<int32_t>(B * max_S_th);
+    d_th_wl_pos_= arena_.allocT<bool>(B * max_S_th);
+    d_th_d_pos_ = arena_.allocT<bool>(B * max_S_th);
+    d_th_wl_val_= arena_.allocT<__half>(B * max_S_th);
+    d_th_d_val_ = arena_.allocT<__half>(B * max_S_th);
+    d_th_hidden_= arena_.allocT<__half>(B * max_S_th * cfg_.embed_dim);
+    d_th_last_h_= arena_.allocT<__half>(B * cfg_.embed_dim);
     d_legal_mask_= arena_.allocT<bool>(B * cfg_.move_vocab_size);
     d_idx_out_   = arena_.allocT<int32_t>(B);
 

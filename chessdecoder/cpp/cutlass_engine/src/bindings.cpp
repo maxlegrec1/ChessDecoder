@@ -129,6 +129,7 @@ PYBIND11_MODULE(_cutlass_decoder_cpp, m) {
     py::class_<cutlass_engine::RolloutResult>(m, "RolloutResult")
         .def_readonly("move", &cutlass_engine::RolloutResult::move)
         .def_readonly("token_ids", &cutlass_engine::RolloutResult::token_ids)
+        .def_readonly("block_ids", &cutlass_engine::RolloutResult::block_ids)
         .def_readonly("log_probs", &cutlass_engine::RolloutResult::log_probs)
         .def_readonly("wl_positions", &cutlass_engine::RolloutResult::wl_positions)
         .def_readonly("wl_indices",   &cutlass_engine::RolloutResult::wl_indices)
@@ -141,7 +142,9 @@ PYBIND11_MODULE(_cutlass_decoder_cpp, m) {
         .def_readonly("final_wl_index", &cutlass_engine::RolloutResult::final_wl_index)
         .def_readonly("final_wl_value", &cutlass_engine::RolloutResult::final_wl_value)
         .def_readonly("final_d_index",  &cutlass_engine::RolloutResult::final_d_index)
-        .def_readonly("final_d_value",  &cutlass_engine::RolloutResult::final_d_value);
+        .def_readonly("final_d_value",  &cutlass_engine::RolloutResult::final_d_value)
+        .def_readonly("ended_thinking",&cutlass_engine::RolloutResult::ended_thinking)
+        .def_readonly("truncated",     &cutlass_engine::RolloutResult::truncated);
 
     py::class_<cutlass_engine::ThinkingEngine>(m, "ThinkingEngine")
         .def(py::init<const std::string&, const std::string&,
@@ -162,6 +165,11 @@ PYBIND11_MODULE(_cutlass_decoder_cpp, m) {
         .def("predict_moves",
              &cutlass_engine::ThinkingEngine::predict_moves,
              py::arg("fens"), py::arg("temperature") = 1.0f)
+        .def("predict_moves_thinking",
+             &cutlass_engine::ThinkingEngine::predict_moves_thinking,
+             py::arg("fens"), py::arg("temperature") = 0.0f,
+             py::arg("max_seq_len_cap") = 1024,
+             py::arg("max_iters") = 16)
         .def("update_weights",
              &cutlass_engine::ThinkingEngine::update_weights,
              py::arg("weights_dir"))
