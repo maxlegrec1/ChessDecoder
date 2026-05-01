@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ATen/cuda/CUDAGraph.h>
 #include <torch/script.h>
 #include <cstdint>
 #include <memory>
@@ -69,6 +70,49 @@ public:
     void markCausalValidRange(int start, int count, torch::Tensor active);
     void markPrefixValidRange(int start, int count, torch::Tensor active);
 
+    // ==================== Phase 5: CUDA graph capture =====================
+
+    /// Capture a CUDA graph for a single board-generation step:
+    ///   forward_new (S=1, causal) + board_head matmul + argmax + LUT lookup
+    ///   + ids feedback (in-place write into the graph's static input).
+    /// Replay via boardStepGraph(...) is launch-overhead-free — eliminates
+    /// ~80 kernel launches per step (the dominant cost on B200 at small B
+    /// per-token compute).
+    ///
+    /// Caller-owned head tensors (board_w_t [E, board_vocab] FP16 transposed,
+    /// board_b [board_vocab] FP16, board_lut [board_vocab] int64) are
+    /// referenced by the captured graph. They must outlive the engine.
+    void captureBoardStepGraph(torch::Tensor board_w_t,
+                               torch::Tensor board_b,
+                               torch::Tensor board_lut);
+
+    /// Replay the captured board-step graph for one new board token.
+    /// `active` [B] bool — slots where the new K/V's mask position should
+    /// be marked valid for the NEXT replay (inactive slots stay -inf so
+    /// they don't attend to the freshly-written K of an unused rollout).
+    torch::Tensor boardStepGraph(torch::Tensor active);
+
+    /// Initialize board_step_ids_ to a per-slot start token (e.g. start_pos)
+    /// before the first boardStepGraph() call of a 67-step run.
+    void setBoardStepInitToken(torch::Tensor full_idx_b1);
+
+    /// Initialize board_step_pos_ to the per-slot starting RoPE position
+    /// (e.g. seq_pos[b]) before the first boardStepGraph() call.
+    void setBoardStepInitPos(torch::Tensor pos_b1);
+
+    /// Pre-mark mask valid at [causal_len_, causal_len_+count) for active
+    /// slots before a sequence of boardStepGraph() replays. (Mirrors
+    /// markCausalValidRange but the graph itself doesn't update mask.)
+    /// Called once per board-gen run with count=68.
+    void prepareBoardStepMask(int count, torch::Tensor active);
+
+    /// Whether captureBoardStepGraph has run successfully.
+    bool boardStepGraphReady() const { return board_step_ready_; }
+
+    /// Hidden state from the most recent boardStepGraph() replay.
+    /// Shape [B, 1, E] FP16. Caller .squeeze(1) for [B, E].
+    torch::Tensor boardStepLastH() const { return board_step_out_h_; }
+
     /// Phase 4: refill finished slots in place without disturbing other slots.
     ///
     /// For each `slot_active[b]==true` slot:
@@ -135,6 +179,32 @@ private:
     /// The mask for any incremental step is just a slice — zero allocations.
     torch::Tensor causal_mask_buf_;
     torch::Tensor prefix_mask_buf_;
+
+    // ==================== CUDA graph state (Phase 5) ====================
+    /// Past-K size used by the captured board-step graph. Capped well below
+    /// max_seq_len_ to keep attn_weights' M dim small (per-step compute and
+    /// memory traffic scale linearly with M; on B200 the difference between
+    /// M=4096 and M=1500 is ~3x in attention cost). Rollouts that exceed
+    /// this past size fall back to the non-graph causalIncremental path.
+    static constexpr int kBoardStepGraphM = 1536;
+    bool board_step_ready_{false};
+    at::cuda::CUDAGraph board_step_graph_;
+    torch::Tensor board_step_ids_;          // [B, 1] int64 — graph input + feedback
+    torch::Tensor board_step_pos_;          // [B, 1] int64 — graph input, in-place add
+    torch::Tensor board_step_inc_;          // [B, 1] int64 — increment (1)
+    torch::Tensor board_step_ov_;           // [B, 1] FP16
+    torch::Tensor board_step_om_;           // [B, 1] bool
+    torch::Tensor board_step_mask_;         // [B, 1, 1, kBoardStepGraphM+1] FP32
+    torch::Tensor board_step_past_k_;       // [NL, B, NH, kBoardStepGraphM, HD] FP16
+    torch::Tensor board_step_past_v_;       // (graph-owned past KV cache)
+    torch::Tensor board_step_out_h_;        // [B, 1, E] FP16
+    torch::Tensor board_step_out_kn_;       // [NL, B, NH, 1, HD] FP16
+    torch::Tensor board_step_out_vn_;       // [NL, B, NH, 1, HD] FP16
+    torch::Tensor board_step_out_full_idx_; // [B] int64 — sampled full-vocab token
+    /// Held alive for the lifetime of the captured graph.
+    torch::Tensor board_step_w_t_;
+    torch::Tensor board_step_b_;
+    torch::Tensor board_step_lut_;
 };
 
 } // namespace decoder

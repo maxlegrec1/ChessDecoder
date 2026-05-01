@@ -1,6 +1,8 @@
 #include "batched_backbone.hpp"
 
+#include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <iostream>
 
 namespace decoder
@@ -344,6 +346,171 @@ torch::Tensor BatchedBackbone::prefixProbe(
 
     return forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, prefix_len_, ov, om,
                        false, false);
+}
+
+// ============================================================================
+// Phase 5: CUDA graph capture for board-step inner loop
+// ============================================================================
+
+void BatchedBackbone::captureBoardStepGraph(
+    torch::Tensor board_w_t, torch::Tensor board_b, torch::Tensor board_lut)
+{
+    if (board_step_ready_) return;
+    torch::NoGradGuard no_grad;
+
+    auto opts_int = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    auto opts_fp16 = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA);
+    auto opts_bool = torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA);
+
+    // Hold head tensors alive — graph references them by address.
+    board_step_w_t_ = board_w_t;
+    board_step_b_ = board_b;
+    board_step_lut_ = board_lut;
+
+    // Static graph inputs / outputs. Caller updates board_step_ids_ /
+    // board_step_pos_ before the FIRST replay; subsequent replays inherit
+    // the in-place feedback inside the graph.
+    board_step_ids_ = torch::zeros({B_, 1}, opts_int);
+    board_step_pos_ = torch::zeros({B_, 1}, opts_int);
+    board_step_inc_ = torch::ones({B_, 1}, opts_int);  // increment = 1
+    board_step_ov_ = torch::zeros({B_, 1}, opts_fp16);
+    board_step_om_ = torch::zeros({B_, 1}, opts_bool);
+
+    // Graph past-K is capped to kBoardStepGraphM (well below max_seq_len_)
+    // so attn_weights' M dim stays small. The graph reads from
+    // causal_k_.slice(3, 0, M) — a view sharing storage with causal_k_,
+    // so writes to causal_k_'s first M positions are observable to replays
+    // without copying. Rollouts whose past exceeds M fall back to non-graph.
+    auto opts_fp32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    const int M = kBoardStepGraphM;
+    board_step_mask_ = torch::full({B_, 1, 1, M + 1}, -1e9f, opts_fp32);
+    board_step_mask_.index_put_(
+        {torch::indexing::Slice(), 0, 0, M}, 0.0f);
+
+    // Capture-time past-K view: first M positions of causal_k_/v_.
+    auto past_k_view = causal_k_.slice(3, 0, M).contiguous();
+    auto past_v_view = causal_v_.slice(3, 0, M).contiguous();
+    // Persist these contiguous tensors so the graph references stable
+    // memory. We keep them as the AUTHORITATIVE storage for graph past;
+    // boardStepGraph copies updates back into causal_k_/v_ for non-graph
+    // consumers (prefixBlockForward, etc.).
+    board_step_past_k_ = past_k_view;
+    board_step_past_v_ = past_v_view;
+
+    auto pool = at::cuda::graph_pool_handle();
+    auto capture_stream = at::cuda::getStreamFromPool(/*isHighPriority=*/false);
+    {
+        c10::cuda::CUDAStreamGuard guard(capture_stream);
+
+        for (int i = 0; i < 3; i++)
+        {
+            std::vector<torch::IValue> inputs{
+                board_step_ids_, board_step_pos_, board_step_mask_,
+                board_step_past_k_, board_step_past_v_,
+                board_step_ov_, board_step_om_
+            };
+            auto result = (*forward_new_method_)(inputs);
+            auto outs = result.toTuple()->elements();
+            auto h = outs[0].toTensor();
+            auto h2d = h.view({B_, embed_dim_});
+            auto logits = torch::mm(h2d, board_step_w_t_) + board_step_b_;
+            auto sub_idx = torch::argmax(logits, /*dim=*/1);
+            auto full_idx = board_step_lut_.index({sub_idx});
+        }
+        capture_stream.synchronize();
+
+        board_step_graph_.capture_begin(pool);
+        {
+            std::vector<torch::IValue> inputs{
+                board_step_ids_, board_step_pos_, board_step_mask_,
+                board_step_past_k_, board_step_past_v_,
+                board_step_ov_, board_step_om_
+            };
+            auto result = (*forward_new_method_)(inputs);
+            auto outs = result.toTuple()->elements();
+            board_step_out_h_ = outs[0].toTensor();   // [B, 1, E]
+            board_step_out_kn_ = outs[1].toTensor();  // [NL, B, NH, 1, HD]
+            board_step_out_vn_ = outs[2].toTensor();
+
+            auto h2d = board_step_out_h_.view({B_, embed_dim_});
+            auto logits = torch::mm(h2d, board_step_w_t_) + board_step_b_;
+            auto sub_idx = torch::argmax(logits, /*dim=*/1);
+            auto full_idx = board_step_lut_.index({sub_idx});
+            board_step_out_full_idx_ = full_idx;
+
+            // Feedback for next replay (all in-place GPU writes).
+            board_step_ids_.copy_(full_idx.unsqueeze(1));
+            board_step_pos_.add_(board_step_inc_);
+        }
+        board_step_graph_.capture_end();
+    }
+    c10::cuda::getCurrentCUDAStream().synchronize();
+
+    board_step_ready_ = true;
+    std::cout << "[BatchedBackbone] Captured board-step CUDA graph (B="
+              << B_ << ", max_seq_len=" << max_seq_len_ << ")" << std::endl;
+}
+
+torch::Tensor BatchedBackbone::boardStepGraph(torch::Tensor active)
+{
+    torch::NoGradGuard no_grad;
+
+    board_step_graph_.replay();
+
+    // Write new K/V to BOTH:
+    //   board_step_past_k_/v_ at position causal_len_ — so the next replay's
+    //     past_k (the graph-owned buffer) sees this token.
+    //   causal_k_/v_ at position causal_len_ — so non-graph forwards after
+    //     the board run (prefixBlockForward, etc.) see consistent state.
+    board_step_past_k_.select(3, causal_len_).copy_(board_step_out_kn_.select(3, 0));
+    board_step_past_v_.select(3, causal_len_).copy_(board_step_out_vn_.select(3, 0));
+    causal_k_.select(3, causal_len_).copy_(board_step_out_kn_.select(3, 0));
+    causal_v_.select(3, causal_len_).copy_(board_step_out_vn_.select(3, 0));
+
+    // Mark position valid for active slots in BOTH the graph mask (next
+    // replay reads this) and causal_mask_buf_ (non-graph forwards do).
+    auto bs_slice = board_step_mask_.select(3, causal_len_)
+                        .squeeze(2).squeeze(1);
+    bs_slice.masked_fill_(active, 0.0f);
+    auto cb_slice = causal_mask_buf_.select(3, causal_len_)
+                        .squeeze(2).squeeze(1);
+    cb_slice.masked_fill_(active, 0.0f);
+
+    causal_len_++;
+    return board_step_out_full_idx_;
+}
+
+void BatchedBackbone::setBoardStepInitToken(torch::Tensor full_idx_b1)
+{
+    board_step_ids_.copy_(full_idx_b1);
+}
+
+void BatchedBackbone::setBoardStepInitPos(torch::Tensor pos_b1)
+{
+    board_step_pos_.copy_(pos_b1);
+}
+
+void BatchedBackbone::prepareBoardStepMask(int count, torch::Tensor active)
+{
+    const int M = kBoardStepGraphM;
+
+    // Snapshot causal_mask_buf_'s first M positions into board_step_mask_.
+    // boardStepGraph() will incrementally mark new positions valid AFTER
+    // each replay (so the model never attends to not-yet-written cache slots).
+    board_step_mask_.slice(3, 0, M).copy_(causal_mask_buf_.slice(3, 0, M));
+
+    // Trailing position M is the new K/V's self-attention slot — always valid.
+    board_step_mask_.index_put_(
+        {torch::indexing::Slice(), 0, 0, M}, 0.0f);
+
+    // Copy current valid past K/V from causal_k_/v_ into the graph-owned
+    // past buffers, so the captured graph sees up-to-date past data on the
+    // first replay.
+    board_step_past_k_.copy_(causal_k_.slice(3, 0, M));
+    board_step_past_v_.copy_(causal_v_.slice(3, 0, M));
+
+    (void)count;
+    (void)active;
 }
 
 // ============================================================================

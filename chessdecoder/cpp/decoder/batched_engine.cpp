@@ -114,6 +114,14 @@ ThinkingBatchedInferenceEngine::ThinkingBatchedInferenceEngine(
             {n_buckets}, torch::kFloat32).to(torch::kCUDA);
     }
 
+    // Phase 5: capture the board-step CUDA graph (forward + head + sample +
+    // LUT + ids feedback). This is the inner-most loop of the state machine
+    // (67 calls per board iter × 14 iters per rollout ≈ 80% of forward calls)
+    // — eliminating launch overhead here is the dominant Phase 5 win.
+    // Set DECODER_NO_GRAPH=1 to disable for debugging.
+    if (!std::getenv("DECODER_NO_GRAPH"))
+        backbone_->captureBoardStepGraph(board_w_t_, board_b_, board_lut_);
+
     std::cout << "[BatchedEngine] Ready: batch=" << max_batch_size
               << ", embed=" << embed_dim_ << ", max_seq=" << max_seq_len_
               << std::endl;
@@ -611,35 +619,84 @@ ThinkingBatchedInferenceEngine::predictMoves(
                 seq_pos[b]++;
             }
 
-            // Pre-mark all 68 board positions as valid in one kernel launch,
-            // so the 68 causalIncremental calls below skip redundant marking.
-            int board_cache_start = backbone_->causalLen();
-            backbone_->markCausalValidRange(board_cache_start, 68, need_move);
-
-            auto h_board = backbone_->causalIncremental(first_tok, first_pos,
-                                                        first_ov, first_om, need_move);
-
-            // Board gen: 67 autoregressive steps. Maintain `cur_pos` on GPU and
-            // increment it via add_() each step instead of rebuilding via
-            // makePosT (saves 67 H2D transfers per board cycle).
             auto board_output = torch::zeros({B, 67}, opts_int);
-            auto cur_pos = first_pos.clone();
             auto inc_active = need_move.to(torch::kInt64).unsqueeze(1);  // [B, 1]
+            torch::Tensor h_board;
 
-            for (int step = 0; step < 67; step++)
+            // Graph budget check: the captured graph caps past at
+            // kBoardStepGraphM positions. If this board run would write past
+            // the cap, fall back to non-graph causalIncremental.
+            int budget_after_board = backbone_->causalLen() + 68;
+            bool use_graph = backbone_->boardStepGraphReady()
+                             && budget_after_board <= 1536;
+
+            if (use_graph)
             {
-                auto h_last = h_board.squeeze(1);
-                auto board_logits = torch::mm(h_last, board_w_t_) + board_b_;
-                auto sub_idx = sampleBatched(board_logits, 0.0f);
-                auto full_idx = board_lut_.index({sub_idx});
-                board_output.index_put_({torch::indexing::Slice(), step}, full_idx);
+                // Phase 5 graph path. board_step_mask_ tracks validity
+                // incrementally — positions are marked valid only AFTER
+                // their K/V is written, so the model never attends to
+                // not-yet-written cache slots.
 
-                auto next_ids = full_idx.unsqueeze(1);
-                cur_pos = cur_pos + inc_active;  // GPU op, no sync, no H2D
+                // Step 0: forward(start_pos) via causalIncremental — its
+                // markCausalValid(causal_len_) updates causal_mask_buf_ AND
+                // advances causal_len_. Run this FIRST so the snapshot
+                // below includes start_pos's validity.
+                h_board = backbone_->causalIncremental(first_tok, first_pos,
+                                                       first_ov, first_om, need_move);
+
+                // Snapshot causal_mask_buf_ → board_step_mask_ + copy past
+                // K/V into graph-owned buffers (now that start_pos is in).
+                backbone_->prepareBoardStepMask(0, need_move);
+
+                auto h0 = h_board.squeeze(1);
+                auto logits0 = torch::mm(h0, board_w_t_) + board_b_;
+                auto sub_idx0 = sampleBatched(logits0, 0.0f);
+                auto full_idx0 = board_lut_.index({sub_idx0});
+                board_output.index_put_({torch::indexing::Slice(), 0}, full_idx0);
                 for (int b = 0; b < B; b++)
                     if (nm_a[b]) seq_pos[b]++;
-                h_board = backbone_->causalIncremental(next_ids, cur_pos,
-                                                      first_ov, first_om, need_move);
+
+                backbone_->setBoardStepInitToken(full_idx0.unsqueeze(1));
+                backbone_->setBoardStepInitPos(first_pos + inc_active);
+
+                // 67 replays. Replay #step forwards s_step, samples s_{step+1}.
+                // Replay 67 forwards s67 (needed for K/V at causal_len_) but
+                // samples s68 (unused — wasted head matmul, negligible).
+                for (int step = 1; step <= 67; step++)
+                {
+                    auto full_idx = backbone_->boardStepGraph(need_move);
+                    if (step < 67)
+                    {
+                        board_output.index_put_({torch::indexing::Slice(), step}, full_idx);
+                        for (int b = 0; b < B; b++)
+                            if (nm_a[b]) seq_pos[b]++;
+                    }
+                }
+                h_board = backbone_->boardStepLastH();
+            }
+            else
+            {
+                // Non-graph fallback path: original lockstep loop.
+                int board_cache_start = backbone_->causalLen();
+                backbone_->markCausalValidRange(board_cache_start, 68, need_move);
+                h_board = backbone_->causalIncremental(first_tok, first_pos,
+                                                       first_ov, first_om, need_move);
+                auto cur_pos = first_pos.clone();
+                for (int step = 0; step < 67; step++)
+                {
+                    auto h_last = h_board.squeeze(1);
+                    auto board_logits = torch::mm(h_last, board_w_t_) + board_b_;
+                    auto sub_idx = sampleBatched(board_logits, 0.0f);
+                    auto full_idx = board_lut_.index({sub_idx});
+                    board_output.index_put_({torch::indexing::Slice(), step}, full_idx);
+
+                    auto next_ids = full_idx.unsqueeze(1);
+                    cur_pos = cur_pos + inc_active;
+                    for (int b = 0; b < B; b++)
+                        if (nm_a[b]) seq_pos[b]++;
+                    h_board = backbone_->causalIncremental(next_ids, cur_pos,
+                                                          first_ov, first_om, need_move);
+                }
             }
 
             h_board_after_loop = h_board.squeeze(1).contiguous();
