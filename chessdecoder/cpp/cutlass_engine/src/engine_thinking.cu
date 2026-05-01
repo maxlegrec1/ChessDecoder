@@ -270,11 +270,23 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                                       B * E * sizeof(__half),
                                       cudaMemcpyDeviceToDevice, stream_.get()));
 
-        model_.forward_decode(
-            d_th_ids_, d_th_pos_,
-            d_th_wl_pos_, d_th_d_pos_,
-            d_th_wl_val_, d_th_d_val_,
-            kv_, d_th_last_h_, stream_.get());
+        // Phase I: graph captures forward_decode reading d_th_full_idx_ as
+        // the input id buffer.  For run_decode_step, we have new_ids in
+        // d_th_ids_ — copy to d_th_full_idx_ before launching the graph,
+        // OR just call forward_decode directly when ids come from a different
+        // buffer.  Simplest correct path: copy ids → full_idx, then graph.
+        if (decode_graph_ready_) {
+            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_full_idx_, d_th_ids_,
+                                          B * sizeof(int32_t),
+                                          cudaMemcpyDeviceToDevice, stream_.get()));
+            CE_CUDA_CHECK(cudaGraphLaunch(decode_graph_exec_, stream_.get()));
+        } else {
+            model_.forward_decode(
+                d_th_ids_, d_th_pos_,
+                d_th_wl_pos_, d_th_d_pos_,
+                d_th_wl_val_, d_th_d_val_,
+                kv_, d_th_last_h_, stream_.get());
+        }
 
         // Restore last_h for inactive slots from the backup.
         restore_inactive_last_h(d_th_last_h_, d_th_last_h_bkp_,
@@ -616,10 +628,16 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                                           B * E * sizeof(__half),
                                           cudaMemcpyDeviceToDevice, stream_.get()));
             // 5. Forward_decode reading d_th_full_idx_ as input.
-            model_.forward_decode(
-                d_th_full_idx_, d_th_pos_,
-                d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
-                kv_, d_th_last_h_, stream_.get());
+            //    Phase I: replay the captured graph if available (saves ~135
+            //    kernel launches per step over the BOARD loop's 68 iterations).
+            if (decode_graph_ready_) {
+                CE_CUDA_CHECK(cudaGraphLaunch(decode_graph_exec_, stream_.get()));
+            } else {
+                model_.forward_decode(
+                    d_th_full_idx_, d_th_pos_,
+                    d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
+                    kv_, d_th_last_h_, stream_.get());
+            }
             // 6. Restore last_h for inactive slots.
             restore_inactive_last_h(d_th_last_h_, d_th_last_h_bkp_,
                                     kv_.slot_active(), B, E, stream_.get());

@@ -148,9 +148,66 @@ ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
 
     std::printf("[cutlass_engine] arena: %.2f GB used of %.2f GB reserved\n",
                 arena_.used_bytes() / 1e9, arena_.total_bytes() / 1e9);
+
+    // Phase I: capture the S=1 forward_decode graph.  Disable via env var
+    // CUTLASS_NO_GRAPH=1 for debugging.
+    const char* env_no_graph = std::getenv("CUTLASS_NO_GRAPH");
+    if (!env_no_graph || std::string(env_no_graph) != "1") {
+        try {
+            capture_decode_graph();
+        } catch (const std::exception& e) {
+            std::printf("[cutlass_engine] decode graph capture failed: %s "
+                        "(falling back to non-captured path)\n", e.what());
+            decode_graph_ready_ = false;
+        }
+    }
 }
 
-ThinkingEngine::~ThinkingEngine() = default;
+ThinkingEngine::~ThinkingEngine() {
+    if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
+    if (decode_graph_)      cudaGraphDestroy(decode_graph_);
+}
+
+void ThinkingEngine::capture_decode_graph() {
+    if (decode_graph_ready_) return;
+    const int B = cfg_.batch_size;
+
+    // Pre-flight the captured kernels once (warm cuBLAS algo selection,
+    // the FMHA dynamic-shmem attribute set, etc.).
+    // Use d_th_full_idx_ as the input ids buffer and d_th_pos_ as the pos.
+    // These are fixed device addresses (arena-allocated), so the graph's
+    // captured pointer references stay valid across replays.
+    model_.forward_decode(
+        d_th_full_idx_, d_th_pos_,
+        d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
+        kv_, d_th_last_h_, stream_.get());
+    stream_.sync();
+
+    // Now capture.
+    CE_CUDA_CHECK(cudaStreamBeginCapture(stream_.get(),
+                                         cudaStreamCaptureModeThreadLocal));
+    model_.forward_decode(
+        d_th_full_idx_, d_th_pos_,
+        d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
+        kv_, d_th_last_h_, stream_.get());
+    CE_CUDA_CHECK(cudaStreamEndCapture(stream_.get(), &decode_graph_));
+    CE_CUDA_CHECK(cudaGraphInstantiate(&decode_graph_exec_, decode_graph_,
+                                       nullptr, nullptr, 0));
+    decode_graph_ready_ = true;
+    std::printf("[cutlass_engine] decode graph captured (S=1, B=%d)\n", B);
+}
+
+void ThinkingEngine::launch_decode_graph() {
+    if (!decode_graph_ready_) {
+        // Fallback: run forward_decode directly (no capture overhead saved).
+        model_.forward_decode(
+            d_th_full_idx_, d_th_pos_,
+            d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
+            kv_, d_th_last_h_, stream_.get());
+        return;
+    }
+    CE_CUDA_CHECK(cudaGraphLaunch(decode_graph_exec_, stream_.get()));
+}
 
 void ThinkingEngine::update_weights(const std::string& weights_dir) {
     reupload_weights(weights_dir, cfg_, w_);

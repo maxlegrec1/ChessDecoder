@@ -55,6 +55,12 @@ public:
     // Hot-swap weights without reallocation (RL update path).
     void update_weights(const std::string& weights_dir);
 
+    // Phase I: capture the per-step S=1 forward_decode as a CUDA graph.
+    // Called once after construction; replays via launch_decode_graph().
+    void capture_decode_graph();
+    void launch_decode_graph();
+    bool decode_graph_ready() const { return decode_graph_ready_; }
+
     int batch_size() const { return cfg_.batch_size; }
 
     // ---- Test/debug surface ----------------------------------------------
@@ -123,6 +129,17 @@ private:
     // Per-step on-device output buffers (used by BOARD chained loop).
     int32_t* d_th_sub_idx_log_{nullptr};      // [B, 68] sub-vocab samples per step (host reads at end)
     int32_t* d_th_full_idx_{nullptr};         // [B] current step's full-vocab id (chained input)
+
+    // Phase I: CUDA graph capture for the high-frequency S=1 forward_decode.
+    // The graph reads inputs from fixed device pointers (d_th_full_idx_ for
+    // the input token, d_th_pos_ for per-slot RoPE position, kv_.* for the
+    // cache, etc.) and writes the per-step hidden state to d_th_last_h_.
+    // Past-len in cache is per-slot, runtime-varying — graph captures the
+    // S=1 kernel grid (fixed) but the buffer content (changing per replay)
+    // is read at launch time.
+    bool decode_graph_ready_{false};
+    cudaGraph_t decode_graph_{nullptr};
+    cudaGraphExec_t decode_graph_exec_{nullptr};
 
     float board_t_{0.0f};
     float think_t_{0.0f};
