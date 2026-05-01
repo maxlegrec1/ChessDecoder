@@ -1,0 +1,3 @@
+# cutlass is a vendored snapshot of NVIDIA/cutlass v3.9.0 (sm_100 supported)
+# trimmed: docs/, media/, test/, .git/ removed
+# Keep include/, examples/77_blackwell_fmha/ (FMHA reference), tools/util/include/

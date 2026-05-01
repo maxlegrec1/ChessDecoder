@@ -68,3 +68,7 @@ chessdecoder/cpp/mcts/uv.lock
 
 # Verification cache
 scripts/.verify_cache/
+chessdecoder/cpp/cutlass_engine/build/
+chessdecoder/cpp/cutlass_engine/src/*.so
+chessdecoder/cpp/cutlass_engine/.venv/
+chessdecoder/cpp/cutlass_engine/*.egg-info/
