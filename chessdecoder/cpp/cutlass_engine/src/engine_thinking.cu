@@ -166,7 +166,10 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
             for (int s = 0; s < S; ++s) {
                 ids_h[b * S + s] = token_ids[b][s];
                 pos_h[b * S + s] = s;
-                block_h[b * S + s] = block_ids[b][s];
+                // E.5: kv_ is the CAUSAL cache. Use unique-per-token block_ids
+                // so forward_prefill_block runs in causal mode (mask = j<=i),
+                // populating causal-chain K/V at every layer.
+                block_h[b * S + s] = 1000000 + s;
             }
             active_h[b] = 1;
         }
@@ -285,25 +288,25 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
     };
 
     // ---------- Helpers to run one head + argmax ----------
-    auto run_head_argmax_move_vocab = [&](const __half* head_w, const __half* head_b) {
-        // [B, E] @ [Mv, E]^T + bias -> [B, Mv], argmax -> [B] int32.
-        gemm_fp16(d_th_last_h_, head_w, head_b, d_logits_buf_,
+    // Two variants per head: one reading the CAUSAL last_h (used for
+    // BOARD/AFTER_*), one reading the PREFIX last_h (used for MOVE/WL/D/FINAL).
+    auto run_head_argmax_move_vocab_prefix = [&](const __half* head_w, const __half* head_b) {
+        gemm_fp16(d_th_last_h_prefix_, head_w, head_b, d_logits_buf_,
                   B, Mv, E, nullptr, 0, stream_.get());
         argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
         stream_.sync();
         return d2h_int32(d_idx_out_, B);
     };
-    auto run_head_argmax_board_vocab = [&]() {
+    auto run_head_argmax_board_vocab_causal = [&]() {
         gemm_fp16(d_th_last_h_, w_.board_head_w, w_.board_head_b, d_logits_buf_,
                   B, Bv, E, nullptr, 0, stream_.get());
         argmax_fp16(d_logits_buf_, d_idx_out_, B, Bv, stream_.get());
         stream_.sync();
         return d2h_int32(d_idx_out_, B);
     };
-    auto run_value_head_argmax = [&](const __half* w1_w, const __half* w1_b,
-                                     const __half* w2_w, const __half* w2_b) {
-        // [B, E] @ [H, E]^T + b -> [B, H] -> mish -> [B, H] @ [Kb, H]^T + b -> [B, Kb] -> argmax
-        gemm_fp16(d_th_last_h_, w1_w, w1_b, d_logits_buf_,
+    auto run_value_head_argmax_prefix = [&](const __half* w1_w, const __half* w1_b,
+                                            const __half* w2_w, const __half* w2_b) {
+        gemm_fp16(d_th_last_h_prefix_, w1_w, w1_b, d_logits_buf_,
                   B, H, E, nullptr, 0, stream_.get());
         mish_inplace_fp16(d_logits_buf_, B * H, stream_.get());
         gemm_fp16(d_logits_buf_, w2_w, w2_b, d_logits_buf_ + B * H,
@@ -311,6 +314,101 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
         stream_.sync();
         return d2h_int32(d_idx_out_, B);
+    };
+
+    // ---------- Prefix re-prefill helper (E.5 quality path) ----------
+    // Build a [B, max_S_active] tensor from per-slot host state, run
+    // forward_prefill_block in PREFIX mode (block-aware mask, real block_ids),
+    // and gather hidden at gather_pos[b] into d_th_last_h_prefix_.
+    //
+    // gather_pos[b] = -1 means "last position of this slot" (size-1).
+    auto run_prefix_prefill_and_gather = [&](const std::vector<int32_t>& gather_pos_slot) {
+        // S = max active token_ids length (capped at max_S).
+        int S = 0;
+        for (int b = 0; b < B; ++b) {
+            if (active[b]) S = std::max(S, (int)token_ids[b].size());
+        }
+        if (S == 0) return;
+        if (S > max_S) S = max_S;
+
+        std::vector<int32_t> ids_h(B * S, 0);
+        std::vector<int32_t> pos_h(B * S, 0);
+        std::vector<int32_t> block_h(B * S, 0);
+        std::vector<uint8_t> wlpos_h(B * S, 0);
+        std::vector<uint8_t> dpos_h(B * S, 0);
+        std::vector<__half> wlval_h(B * S, __float2half(0.0f));
+        std::vector<__half> dval_h(B * S, __float2half(0.0f));
+        std::vector<int32_t> active_h(B, 0);
+
+        for (int b = 0; b < B; ++b) {
+            int slot_S = std::min((int)token_ids[b].size(), S);
+            for (int s = 0; s < slot_S; ++s) {
+                ids_h[b * S + s]   = token_ids[b][s];
+                pos_h[b * S + s]   = s;
+                block_h[b * S + s] = block_ids[b][s];
+            }
+            if (active[b]) active_h[b] = 1;
+
+            int fid = slot_to_fen[b];
+            if (fid >= 0) {
+                const auto& r = all_results[fid];
+                for (size_t i = 0; i < r.wl_positions.size(); ++i) {
+                    int p = r.wl_positions[i];
+                    if (p >= 0 && p < S) {
+                        wlpos_h[b * S + p] = 1;
+                        wlval_h[b * S + p] = __float2half(r.wl_values[i]);
+                    }
+                }
+                for (size_t i = 0; i < r.d_positions.size(); ++i) {
+                    int p = r.d_positions[i];
+                    if (p >= 0 && p < S) {
+                        dpos_h[b * S + p] = 1;
+                        dval_h[b * S + p] = __float2half(r.d_values[i]);
+                    }
+                }
+            }
+        }
+
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_ids_,   ids_h.data(),   B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_pos_,   pos_h.data(),   B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_block_, block_h.data(), B * S * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_wl_pos_, wlpos_h.data(), B * S * sizeof(uint8_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_d_pos_,  dpos_h.data(),  B * S * sizeof(uint8_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_wl_val_, wlval_h.data(), B * S * sizeof(__half),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_d_val_,  dval_h.data(),  B * S * sizeof(__half),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+
+        // Use a stub KvCache (active mask only — no cache write).
+        KvCache stub_kv;
+        std::vector<int32_t> active_h_dev = active_h;  // upload to a temp device pointer
+        // Simpler: reuse kv_.slot_active() (we'll restore later — actually the
+        // BOARD path will re-upload active_mask at its start, so this is fine).
+        CE_CUDA_CHECK(cudaMemcpyAsync(kv_.slot_active(), active_h.data(),
+                                      B * sizeof(int32_t), cudaMemcpyHostToDevice,
+                                      stream_.get()));
+
+        model_.forward_prefill_block(
+            d_th_ids_, d_th_pos_, d_th_block_, kv_.slot_active(),
+            d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
+            B, S, d_th_hidden_, stream_.get(), /*kv_for_write=*/nullptr);
+
+        // Gather hidden[b, gather_pos[b], :] into d_th_last_h_prefix_.
+        for (int b = 0; b < B; ++b) {
+            int p = gather_pos_slot[b];
+            if (p < 0) p = std::max(0, (int)token_ids[b].size() - 1);
+            if (p >= S) p = S - 1;
+            CE_CUDA_CHECK(cudaMemcpyAsync(
+                d_th_last_h_prefix_ + b * E,
+                d_th_hidden_ + (b * S + p) * E,
+                E * sizeof(__half),
+                cudaMemcpyDeviceToDevice, stream_.get()));
+        }
     };
 
     // ---------- Initial fill + init prefill ----------
@@ -351,8 +449,13 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         if (!any_active) { refill_idle(); continue; }
 
         // ===== MOVE state (active * in_variation) =====
-        // Sample move from thinking_policy_head(last_h).
-        auto move_sub_h = run_head_argmax_move_vocab(
+        // E.5: re-run prefix prefill over full sequence to get prefix-mode hidden
+        // at last position (matches Python's prefix_forward).
+        {
+            std::vector<int32_t> gp(B, -1);  // last position
+            run_prefix_prefill_and_gather(gp);
+        }
+        auto move_sub_h = run_head_argmax_move_vocab_prefix(
             w_.thinking_policy_head_w, w_.thinking_policy_head_b);
 
         // For active*in_variation slots: append the sampled move, then
@@ -375,9 +478,17 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                         act_in_var);
 
         // ===== WL state =====
-        // Predict WL at MOVE position from current last_h (which is move's hidden).
-        auto wl_idx_h = run_value_head_argmax(w_.wl_w1_w, w_.wl_w1_b,
-                                              w_.wl_w2_w, w_.wl_w2_b);
+        // E.5: prefix prefill at MOVE position (last appended).
+        {
+            std::vector<int32_t> gp(B, -1);
+            for (int b = 0; b < B; ++b) {
+                if (active[b] && in_variation[b])
+                    gp[b] = (int)token_ids[b].size() - 1;  // move position
+            }
+            run_prefix_prefill_and_gather(gp);
+        }
+        auto wl_idx_h = run_value_head_argmax_prefix(w_.wl_w1_w, w_.wl_w1_b,
+                                                     w_.wl_w2_w, w_.wl_w2_b);
         // Append wl_value placeholder + record entry, then forward_decode w/ fourier(wl).
         std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
         zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
@@ -405,9 +516,17 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                         act_in_var);
 
         // ===== D state =====
-        // Predict D from current last_h (wl's hidden, with fourier injected).
-        auto d_idx_h = run_value_head_argmax(w_.d_w1_w, w_.d_w1_b,
-                                             w_.d_w2_w, w_.d_w2_b);
+        // E.5: prefix prefill at WL_VALUE position (with WL fourier injected).
+        {
+            std::vector<int32_t> gp(B, -1);
+            for (int b = 0; b < B; ++b) {
+                if (active[b] && in_variation[b])
+                    gp[b] = (int)token_ids[b].size() - 1;  // wl_value position
+            }
+            run_prefix_prefill_and_gather(gp);
+        }
+        auto d_idx_h = run_value_head_argmax_prefix(w_.d_w1_w, w_.d_w1_b,
+                                                    w_.d_w2_w, w_.d_w2_b);
         std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
         zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
         zero_half(step_wl_val); zero_half(step_d_val);
@@ -534,7 +653,7 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
 
         // ===== AFTER_BOARD state =====
         // last_h is hidden at the 68th board token; sample via board_head.
-        auto ab_sub_h = run_head_argmax_board_vocab();
+        auto ab_sub_h = run_head_argmax_board_vocab_causal();
         std::vector<bool> ended_var(B, false);
         std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
         std::fill(act_in_var.begin(), act_in_var.end(), 0);
@@ -557,7 +676,7 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         bool any_ended_var = false;
         for (bool e : ended_var) if (e) { any_ended_var = true; break; }
         if (any_ended_var) {
-            auto aev_sub_h = run_head_argmax_board_vocab();
+            auto aev_sub_h = run_head_argmax_board_vocab_causal();
             std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
             std::fill(act_in_var.begin(), act_in_var.end(), 0);
             for (int b = 0; b < B; ++b) {
@@ -581,8 +700,12 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         bool any_final = false;
         for (int b = 0; b < B; ++b) if (ended_thinking[b] && active[b]) { any_final = true; break; }
         if (any_final) {
-            // Sample final move from policy_head(last_h).
-            auto fm_sub_h = run_head_argmax_move_vocab(
+            // E.5: prefix prefill at end_think position (last appended).
+            {
+                std::vector<int32_t> gp(B, -1);
+                run_prefix_prefill_and_gather(gp);
+            }
+            auto fm_sub_h = run_head_argmax_move_vocab_prefix(
                 w_.policy_head_w, w_.policy_head_b);
             std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
             std::fill(act_in_var.begin(), act_in_var.end(), 0);
@@ -604,9 +727,17 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
             run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
                             act_in_var);
 
-            // Final WL.
-            auto fwl_h = run_value_head_argmax(w_.wl_w1_w, w_.wl_w1_b,
-                                               w_.wl_w2_w, w_.wl_w2_b);
+            // Final WL: prefix prefill at final-move position.
+            {
+                std::vector<int32_t> gp(B, -1);
+                for (int b = 0; b < B; ++b) {
+                    if (ended_thinking[b])
+                        gp[b] = (int)token_ids[b].size() - 1;
+                }
+                run_prefix_prefill_and_gather(gp);
+            }
+            auto fwl_h = run_value_head_argmax_prefix(w_.wl_w1_w, w_.wl_w1_b,
+                                                      w_.wl_w2_w, w_.wl_w2_b);
             std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
             zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
             zero_half(step_wl_val); zero_half(step_d_val);
@@ -633,9 +764,17 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
             run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
                             act_in_var);
 
-            // Final D.
-            auto fd_h = run_value_head_argmax(w_.d_w1_w, w_.d_w1_b,
-                                              w_.d_w2_w, w_.d_w2_b);
+            // Final D: prefix prefill at wl_value position (with WL fourier).
+            {
+                std::vector<int32_t> gp(B, -1);
+                for (int b = 0; b < B; ++b) {
+                    if (ended_thinking[b])
+                        gp[b] = (int)token_ids[b].size() - 1;
+                }
+                run_prefix_prefill_and_gather(gp);
+            }
+            auto fd_h = run_value_head_argmax_prefix(w_.d_w1_w, w_.d_w1_b,
+                                                     w_.d_w2_w, w_.d_w2_b);
             std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
             zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
             zero_half(step_wl_val); zero_half(step_d_val);

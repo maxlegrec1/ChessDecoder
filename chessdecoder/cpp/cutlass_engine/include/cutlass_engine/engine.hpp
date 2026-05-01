@@ -115,6 +115,7 @@ private:
     __half*  d_th_hidden_{nullptr};   // [B, max_S, E]
     __half*  d_th_last_h_{nullptr};   // [B, E] gather of hidden at chosen position
     __half*  d_th_last_h_bkp_{nullptr};  // [B, E] backup before forward_decode (inactive-slot preserve)
+    __half*  d_th_last_h_prefix_{nullptr}; // [B, E] prefix-mode last_h (E.5 hybrid path)
 
     // On-device sub→full LUTs for chained sampling (BOARD loop).
     int32_t* d_board_sub_to_full_{nullptr};   // [board_vocab]
