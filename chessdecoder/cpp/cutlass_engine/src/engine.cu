@@ -125,8 +125,24 @@ ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
     d_legal_mask_= arena_.allocT<bool>(B * cfg_.move_vocab_size);
     d_idx_out_   = arena_.allocT<int32_t>(B);
 
+    d_board_sub_to_full_ = arena_.allocT<int32_t>(cfg_.board_vocab_size);
+    d_move_sub_to_full_  = arena_.allocT<int32_t>(cfg_.move_vocab_size);
+    d_th_sub_idx_log_    = arena_.allocT<int32_t>(B * 68);
+    d_th_full_idx_       = arena_.allocT<int32_t>(B);
+
     if (!vocab_json.empty()) {
         vocab_.reset(new decoder::DecoderVocab(vocab_json));
+        // Upload sub→full LUTs for on-device chained sampling.
+        std::vector<int32_t> board_lut(cfg_.board_vocab_size);
+        for (int i = 0; i < cfg_.board_vocab_size; ++i)
+            board_lut[i] = vocab_->boardIdxToFullIdx(i);
+        std::vector<int32_t> move_lut(cfg_.move_vocab_size);
+        for (int i = 0; i < cfg_.move_vocab_size; ++i)
+            move_lut[i] = vocab_->moveIdxToFullIdx(i);
+        cudaMemcpy(d_board_sub_to_full_, board_lut.data(),
+                   board_lut.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_move_sub_to_full_, move_lut.data(),
+                   move_lut.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
     }
 
     std::printf("[cutlass_engine] arena: %.2f GB used of %.2f GB reserved\n",

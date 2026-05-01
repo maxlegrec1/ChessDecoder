@@ -99,6 +99,13 @@ void past_len_increment(int32_t* past_len, const int32_t* slot_active,
 void argmax_fp16(const __half* logits, int32_t* idx_out,
                  int B, int V, cudaStream_t stream);
 
+// Fused argmax + LUT lookup. sub_idx_out gets the argmax sub-vocab idx;
+// full_idx_out gets lut[sub_idx_out]. Used to chain sampling on-device
+// without a host roundtrip (the BOARD loop's 68-step generation).
+void argmax_lut_scatter_fp16(const __half* logits, const int32_t* lut,
+                             int32_t* sub_idx_out, int32_t* full_idx_out,
+                             int B, int V, cudaStream_t stream);
+
 // Multinomial via Gumbel-max:
 //   g[i] = logits[i]/T + (-log(-log(u[i])))     (u uniform in (0,1))
 //   idx = argmax_i g[i]

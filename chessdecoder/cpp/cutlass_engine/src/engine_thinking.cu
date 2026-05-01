@@ -433,35 +433,103 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
                         act_in_var);
 
-        // ===== BOARD state (68 steps) =====
-        // Each step: read last_h (hidden at d_value or previous board token),
-        // sample board token via board_head, append, forward_decode that token.
+        // ===== BOARD state (68 steps, chained on-device) =====
+        // Each step: argmax + LUT-gather to write the full-vocab id directly
+        // into d_th_full_idx_ (device).  Next step's forward_decode reads
+        // from d_th_full_idx_ — no host roundtrip.  At end of BOARD, we
+        // batch-d2h the 68 sub-vocab samples for host bookkeeping.
         std::vector<int> this_board_bid(B, 0);
         for (int b = 0; b < B; ++b) {
             if (active[b] && in_variation[b]) this_board_bid[b] = next_block[b]++;
         }
-        for (int step = 0; step < 68; ++step) {
-            auto sub_h = run_head_argmax_board_vocab();
+        // active mask for the entire BOARD loop: same for all 68 steps for
+        // a given slot (truncation is checked only at the end).
+        std::vector<int32_t> board_act(B, 0);
+        for (int b = 0; b < B; ++b) {
+            if (active[b] && in_variation[b]
+                && (int)token_ids[b].size() + 68 <= max_S) {
+                board_act[b] = 1;
+            }
+        }
+        // Zero wl_pos / d_pos / wl_val / d_val for BOARD steps (no fourier).
+        zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
+        zero_half(step_wl_val); zero_half(step_d_val);
+        // Upload buffers that don't change across the 68 steps.
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_wl_pos_, step_wl_pos.data(),
+                                      B * sizeof(uint8_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_d_pos_, step_d_pos.data(),
+                                      B * sizeof(uint8_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_wl_val_, step_wl_val.data(),
+                                      B * sizeof(__half),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(d_th_d_val_, step_d_val.data(),
+                                      B * sizeof(__half),
+                                      cudaMemcpyHostToDevice, stream_.get()));
+        CE_CUDA_CHECK(cudaMemcpyAsync(kv_.slot_active(), board_act.data(),
+                                      B * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, stream_.get()));
 
-            std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
-            zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
-            zero_half(step_wl_val); zero_half(step_d_val);
-            std::fill(act_in_var.begin(), act_in_var.end(), 0);
+        for (int step = 0; step < 68; ++step) {
+            // 1. Run board_head GEMM on current last_h.
+            gemm_fp16(d_th_last_h_, w_.board_head_w, w_.board_head_b,
+                      d_logits_buf_, B, Bv, E, nullptr, 0, stream_.get());
+            // 2. Fused argmax + LUT scatter → writes both sub_idx and full_idx
+            //    for this step.  full_idx becomes the next step's input token.
+            argmax_lut_scatter_fp16(d_logits_buf_, d_board_sub_to_full_,
+                                    d_th_sub_idx_log_ + step * B,    // [B] sub log
+                                    d_th_full_idx_,                  // [B] full
+                                    B, Bv, stream_.get());
+            // 3. Build per-slot pos buffer (= slot_past_len_h[b]).
+            // We don't need a host-side build: forward_decode reads pos from
+            // d_th_pos_, which we update once per step using the per-slot
+            // past_len (already in slot_past_len_h on host).  TODO: this is a
+            // small H2D each step; could be eliminated by computing pos
+            // on-device from past_len.  For now, accept it.
+            std::vector<int32_t> pos_h(B, 0);
+            for (int b = 0; b < B; ++b) pos_h[b] = slot_past_len_h[b];
+            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_pos_, pos_h.data(),
+                                          B * sizeof(int32_t),
+                                          cudaMemcpyHostToDevice, stream_.get()));
+            // 4. Backup last_h (so inactive slots' state is preserved).
+            CE_CUDA_CHECK(cudaMemcpyAsync(d_th_last_h_bkp_, d_th_last_h_,
+                                          B * E * sizeof(__half),
+                                          cudaMemcpyDeviceToDevice, stream_.get()));
+            // 5. Forward_decode reading d_th_full_idx_ as input.
+            model_.forward_decode(
+                d_th_full_idx_, d_th_pos_,
+                d_th_wl_pos_, d_th_d_pos_, d_th_wl_val_, d_th_d_val_,
+                kv_, d_th_last_h_, stream_.get());
+            // 6. Restore last_h for inactive slots.
+            restore_inactive_last_h(d_th_last_h_, d_th_last_h_bkp_,
+                                    kv_.slot_active(), B, E, stream_.get());
+            // 7. Advance host past_len mirror.
             for (int b = 0; b < B; ++b) {
-                if (!(active[b] && in_variation[b])) continue;
-                if ((int)token_ids[b].size() >= max_S) {
-                    truncated[b] = true; active[b] = false;
+                if (board_act[b]) slot_past_len_h[b] += 1;
+            }
+        }
+        // Batch d2h all 68 steps' sub-vocab samples for host bookkeeping.
+        std::vector<int32_t> sub_log(B * 68);
+        CE_CUDA_CHECK(cudaMemcpyAsync(sub_log.data(), d_th_sub_idx_log_,
+                                      B * 68 * sizeof(int32_t),
+                                      cudaMemcpyDeviceToHost, stream_.get()));
+        stream_.sync();
+        // Append to per-slot token_ids.
+        for (int step = 0; step < 68; ++step) {
+            for (int b = 0; b < B; ++b) {
+                if (!board_act[b]) {
+                    if (step == 0 && active[b] && in_variation[b]
+                        && (int)token_ids[b].size() + 68 > max_S) {
+                        truncated[b] = true; active[b] = false;
+                    }
                     continue;
                 }
-                int sub = sub_h[b];
+                int sub = sub_log[step * B + b];
                 int full = board_sub_to_full[sub];
                 token_ids[b].push_back(full);
                 block_ids[b].push_back(this_board_bid[b]);
-                step_ids_v[b] = full;
-                act_in_var[b] = 1;
             }
-            run_decode_step(step_ids_v, step_wl_pos, step_d_pos, step_wl_val, step_d_val,
-                            act_in_var);
         }
 
         // ===== AFTER_BOARD state =====

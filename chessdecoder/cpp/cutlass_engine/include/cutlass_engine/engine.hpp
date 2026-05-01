@@ -116,6 +116,13 @@ private:
     __half*  d_th_last_h_{nullptr};   // [B, E] gather of hidden at chosen position
     __half*  d_th_last_h_bkp_{nullptr};  // [B, E] backup before forward_decode (inactive-slot preserve)
 
+    // On-device sub→full LUTs for chained sampling (BOARD loop).
+    int32_t* d_board_sub_to_full_{nullptr};   // [board_vocab]
+    int32_t* d_move_sub_to_full_{nullptr};    // [move_vocab]
+    // Per-step on-device output buffers (used by BOARD chained loop).
+    int32_t* d_th_sub_idx_log_{nullptr};      // [B, 68] sub-vocab samples per step (host reads at end)
+    int32_t* d_th_full_idx_{nullptr};         // [B] current step's full-vocab id (chained input)
+
     float board_t_{0.0f};
     float think_t_{0.0f};
     float policy_t_{0.0f};

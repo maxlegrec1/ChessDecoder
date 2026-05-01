@@ -95,6 +95,46 @@ __global__ void gumbel_argmax_kernel(const __half* __restrict__ logits,
     }
 }
 
+// Fused argmax + LUT-gather + write full-vocab id to device.
+// Used for chained on-device sampling in the BOARD generation loop —
+// avoids per-step host sync.  sub_idx_out is also written for end-of-loop
+// host bookkeeping.
+template <int BLOCK>
+__global__ void argmax_lut_scatter_kernel(const __half* __restrict__ logits,
+                                          const int32_t* __restrict__ lut,
+                                          int32_t* __restrict__ sub_idx_out,
+                                          int32_t* __restrict__ full_idx_out,
+                                          int V) {
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const __half* row = logits + b * V;
+
+    float best_v = -3.4e38f;
+    int best_i = 0;
+    for (int i = tid; i < V; i += BLOCK) {
+        float v = __half2float(row[i]);
+        if (v > best_v) { best_v = v; best_i = i; }
+    }
+    __shared__ float sval[BLOCK];
+    __shared__ int   sidx[BLOCK];
+    sval[tid] = best_v;
+    sidx[tid] = best_i;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            float vo = sval[tid + off];
+            int   io = sidx[tid + off];
+            if (vo > sval[tid]) { sval[tid] = vo; sidx[tid] = io; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        int sub = sidx[0];
+        sub_idx_out[b] = sub;
+        full_idx_out[b] = lut[sub];
+    }
+}
+
 __global__ void apply_legal_mask_kernel(__half* __restrict__ logits,
                                         const bool* __restrict__ legal,
                                         int V) {
@@ -163,6 +203,15 @@ void argmax_fp16(const __half* logits, int32_t* idx_out,
                  int B, int V, cudaStream_t stream) {
     constexpr int BLOCK = 256;
     argmax_kernel<BLOCK><<<B, BLOCK, 0, stream>>>(logits, idx_out, V);
+    CE_CUDA_LAST();
+}
+
+void argmax_lut_scatter_fp16(const __half* logits, const int32_t* lut,
+                             int32_t* sub_idx_out, int32_t* full_idx_out,
+                             int B, int V, cudaStream_t stream) {
+    constexpr int BLOCK = 256;
+    argmax_lut_scatter_kernel<BLOCK><<<B, BLOCK, 0, stream>>>(
+        logits, lut, sub_idx_out, full_idx_out, V);
     CE_CUDA_LAST();
 }
 
