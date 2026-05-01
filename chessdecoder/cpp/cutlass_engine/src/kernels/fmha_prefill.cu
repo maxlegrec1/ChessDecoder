@@ -128,13 +128,27 @@ void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
     // hardware max (~228 KB on Blackwell).  Set the function attribute once.
     static thread_local bool attr_set = false;
     if (!attr_set) {
+        // sm_100 (B200) reports per-block opt-in max of 232,448 bytes.
+        // Use 224 KB (= 229,376 B) — safely below + room for static shmem.
+        const int max_shmem = 224 * 1024;
         if (HD == 32)  cudaFuncSetAttribute((const void*)&fmha_prefill_kernel<32>,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize, 200000);
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem);
         if (HD == 64)  cudaFuncSetAttribute((const void*)&fmha_prefill_kernel<64>,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize, 200000);
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem);
         if (HD == 128) cudaFuncSetAttribute((const void*)&fmha_prefill_kernel<128>,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize, 200000);
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem);
         attr_set = true;
+    }
+    // Per-launch guard: if the requested shmem exceeds the device max, the
+    // kernel launch will fail.  Cap S accordingly via tile-based attention
+    // (TODO: separate kernel; for now, error out clearly).
+    if (shmem > 224 * 1024) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "fmha_prefill_dispatch: requested shmem %zu B > 224 KB limit "
+                      "(S=%d, HD=%d); use tile-based prefill or chunk the input.",
+                      shmem, S, HD);
+        throw std::runtime_error(buf);
     }
 
     if (HD == 32) {
