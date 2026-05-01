@@ -1,5 +1,6 @@
 #include "heads.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>

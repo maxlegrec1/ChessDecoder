@@ -62,8 +62,8 @@ rewards:
   format_coherence_as_gate: true
 
 data:
-  variation_parquet_dir: ./parquets_variations2_fixed/
-  pretrain_parquet_dir: /home/maxime/parquet_files_decoder/
+  variation_parquet_dir: ./data/variations/
+  pretrain_parquet_dir: ./data/pretrain/
   pretrain_train_split: 0.8
   num_eval_positions: 200
   eval_seed: 42
