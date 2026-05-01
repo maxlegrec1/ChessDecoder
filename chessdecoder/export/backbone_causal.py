@@ -79,18 +79,18 @@ class BackboneCausal(nn.Module):
                 override_values, override_mask):
         """
         Args:
-            input_ids:       [1, S] int64
-            input_pos:       [1, S] int64
-            attention_mask:  [1, 1, S, S+past_len] float32 (0 or -1e9)
-            past_keys:       [NL, 1, NH, past_len, HD] float16
-            past_values:     [NL, 1, NH, past_len, HD] float16
-            override_values: [1, S] float16 — scalar values for Fourier encoding
-            override_mask:   [1, S] bool — True at positions to override with Fourier
+            input_ids:       [B, S] int64
+            input_pos:       [B, S] int64
+            attention_mask:  [B, 1, S, S+past_len] float32 (0 or -1e9)
+            past_keys:       [NL, B, NH, past_len, HD] float16
+            past_values:     [NL, B, NH, past_len, HD] float16
+            override_values: [B, S] float16 — scalar values for Fourier encoding
+            override_mask:   [B, S] bool — True at positions to override with Fourier
 
         Returns:
-            hidden_states:   [1, S, E] float16
-            present_keys:    [NL, 1, NH, S+past_len, HD] float16
-            present_values:  [NL, 1, NH, S+past_len, HD] float16
+            hidden_states:   [B, S, E] float16
+            present_keys:    [NL, B, NH, S+past_len, HD] float16
+            present_values:  [NL, B, NH, S+past_len, HD] float16
         """
         B, S = input_ids.shape
 
@@ -148,6 +148,74 @@ class BackboneCausal(nn.Module):
         present_values = torch.stack(all_present_values)
 
         return h, present_keys, present_values
+
+    def forward_new(self, input_ids, input_pos, attention_mask,
+                    past_keys, past_values,
+                    override_values, override_mask):
+        """Same compute as forward(), but returns only the NEW K/V slice
+        (shape [NL, B, NH, S, HD] — proportional to S, not past_len+S).
+
+        The caller (BatchedBackbone) writes these into a pre-allocated KV
+        cache buffer at offset past_len. Eliminates the per-call alloc of
+        the [NL, B, NH, past_len+S, HD] present tensor that drove the
+        remaining allocator pressure after Phase 0 Win A.
+
+        Internal torch.cat for attention is unchanged — it's transient and
+        the allocator caches it across layers.
+        """
+        B, S = input_ids.shape
+
+        h = self.tok_embedding(input_ids)
+        fourier_embs = self._fourier_encode(override_values.reshape(-1)).reshape(B, S, -1).to(h.dtype)
+        mask_expanded = override_mask.unsqueeze(-1)
+        h = torch.where(mask_expanded, fourier_embs, h)
+
+        new_keys = []
+        new_values = []
+
+        for i in range(self.num_layers):
+            residual = h
+            h_norm = self._rms_norm(h, self.sa_norm_weights[i])
+
+            q = self.q_projs[i](h_norm).view(B, S, self.num_heads, self.head_dim)
+            k = self.k_projs[i](h_norm).view(B, S, self.num_heads, self.head_dim)
+            v = self.v_projs[i](h_norm).view(B, S, self.num_heads, self.head_dim)
+
+            q = self._apply_rope(q, input_pos)
+            k = self._apply_rope(k, input_pos)
+
+            q = q.transpose(1, 2)
+            k_new = k.transpose(1, 2)
+            v_new = v.transpose(1, 2)
+
+            new_keys.append(k_new)
+            new_values.append(v_new)
+
+            past_k = past_keys[i]
+            past_v = past_values[i]
+            full_k = torch.cat([past_k, k_new], dim=2)
+            full_v = torch.cat([past_v, v_new], dim=2)
+
+            attn_weights = torch.matmul(q, full_k.transpose(-2, -1)) * self.scale
+            attn_weights = attn_weights + attention_mask
+            attn_weights = torch.softmax(attn_weights.float(), dim=-1).to(h.dtype)
+            attn_out = torch.matmul(attn_weights, full_v)
+
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.embed_dim)
+            h = self.o_projs[i](attn_out) + residual
+
+            residual = h
+            h_norm = self._rms_norm(h, self.mlp_norm_weights[i])
+            gate = F.silu(self.gate_projs[i](h_norm))
+            up = self.up_projs[i](h_norm)
+            h = self.down_projs[i](gate * up) + residual
+
+        h = self._rms_norm(h, self.final_norm_weight)
+
+        new_keys_stack = torch.stack(new_keys)      # [NL, B, NH, S, HD]
+        new_values_stack = torch.stack(new_values)
+
+        return h, new_keys_stack, new_values_stack
 
 
 def from_chess_decoder(model):

@@ -2,6 +2,7 @@
 
 #include <torch/script.h>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -93,7 +94,11 @@ private:
     void markPrefixValid(int pos, torch::Tensor active);
 
     torch::jit::Module model_;
-    int B_, num_layers_, num_heads_, head_dim_, embed_dim_, max_seq_len_;
+    /// Cached handle to the TorchScript `forward_new` method (returns new-only
+    /// K/V instead of present K/V). Avoids `model_.get_method()` lookup on the
+    /// hot path.
+    std::unique_ptr<torch::jit::Method> forward_new_method_;
+    int num_layers_, num_heads_, head_dim_, embed_dim_, max_seq_len_, B_;
 
     torch::Tensor causal_k_, causal_v_;
     int causal_len_;

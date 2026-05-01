@@ -25,13 +25,21 @@ BatchedBackbone::BatchedBackbone(
     auto opts_fp32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto opts_bool = torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA);
 
-    model_.forward({
+    // Cache the forward_new method handle once. Phase 0.1 full uses forward_new
+    // (returns [NL, B, NH, S, HD] new-only K/V) instead of forward (returns
+    // [NL, B, NH, past_len+S, HD] present K/V) — kills the per-call allocation
+    // of a tensor that grows with past_len.
+    forward_new_method_ = std::make_unique<torch::jit::Method>(
+        model_.get_method("forward_new"));
+
+    std::vector<torch::IValue> warmup_inputs{
         torch::zeros({B_, 1}, opts_int), torch::zeros({B_, 1}, opts_int),
         torch::zeros({B_, 1, 1, 1}, opts_fp32),
         torch::zeros({num_layers_, B_, num_heads_, 0, head_dim_}, opts_fp16),
         torch::zeros({num_layers_, B_, num_heads_, 0, head_dim_}, opts_fp16),
         torch::zeros({B_, 1}, opts_fp16), torch::zeros({B_, 1}, opts_bool)
-    });
+    };
+    (*forward_new_method_)(warmup_inputs);
     c10::cuda::getCurrentCUDAStream().synchronize();
 
     // Pre-allocate mask buffers filled with -inf
@@ -77,23 +85,28 @@ torch::Tensor BatchedBackbone::forwardImpl(
     auto past_k = past_k_buf.slice(3, 0, past_len);
     auto past_v = past_v_buf.slice(3, 0, past_len);
 
-    auto result = model_.forward({ids, pos, mask, past_k, past_v, ov, om});
+    // forward_new returns NEW-only K/V [NL, B, NH, S, HD] — proportional to
+    // S, not past_len+S. Per-call allocation drops by 1000x at past_len=900,
+    // S=1.
+    std::vector<torch::IValue> inputs{ids, pos, mask, past_k, past_v, ov, om};
+    auto result = (*forward_new_method_)(inputs);
     auto outputs = result.toTuple()->elements();
     auto hidden = outputs[0].toTensor();
-    auto pk = outputs[1].toTensor();   // [NL, B, NH, past_len+S, HD] fresh
-    auto pv = outputs[2].toTensor();
-    int new_total = pk.size(3);
+    auto kn = outputs[1].toTensor();   // [NL, B, NH, S, HD] new only
+    auto vn = outputs[2].toTensor();
+    int S = kn.size(3);
+    int new_total = past_len + S;
 
     if (update_causal) {
-        // In-place copy into the persistent buffer; pk/pv go out of scope and
-        // their backing memory is reused by the allocator on next call.
-        causal_k_.slice(3, 0, new_total).copy_(pk);
-        causal_v_.slice(3, 0, new_total).copy_(pv);
+        // Write only the new tail [past_len, past_len+S) into the persistent
+        // buffer; positions [0, past_len) already hold valid past K/V.
+        causal_k_.slice(3, past_len, new_total).copy_(kn);
+        causal_v_.slice(3, past_len, new_total).copy_(vn);
         causal_len_ = new_total;
     }
     if (update_prefix) {
-        prefix_k_.slice(3, 0, new_total).copy_(pk);
-        prefix_v_.slice(3, 0, new_total).copy_(pv);
+        prefix_k_.slice(3, past_len, new_total).copy_(kn);
+        prefix_v_.slice(3, past_len, new_total).copy_(vn);
         prefix_len_ = new_total;
     }
     return hidden;

@@ -44,13 +44,14 @@ def export_torchscript(backbone, output_dir, config):
     override_values = torch.zeros(1, S, dtype=torch.float16, device="cuda")
     override_mask = torch.zeros(1, S, dtype=torch.bool, device="cuda")
 
-    print("  Tracing with torch.jit.trace...")
+    print("  Tracing with torch.jit.trace_module (forward + forward_new)...")
+    inputs = (input_ids, input_pos, attention_mask,
+              past_keys, past_values,
+              override_values, override_mask)
     with torch.no_grad():
-        traced = torch.jit.trace(
+        traced = torch.jit.trace_module(
             backbone,
-            (input_ids, input_pos, attention_mask,
-             past_keys, past_values,
-             override_values, override_mask),
+            {"forward": inputs, "forward_new": inputs},
         )
 
     path = output_dir / "backbone.pt"
@@ -107,6 +108,34 @@ def export_torchscript(backbone, output_dir, config):
     print(f"  incremental max_err={inc_err:.6f}")
     assert inc_err == 0.0, "Incremental verification failed!"
     print("  Incremental verification passed (exact match)")
+
+    # Verify forward_new returns the new-only K/V slice and matches forward()'s
+    # tail (within FP16 tolerance — independent traces of the same compute can
+    # use slightly different fused kernels).
+    print("  Verifying forward_new shape + parity...")
+    with torch.no_grad():
+        h_new, kn, vn = loaded.forward_new(inc_ids, inc_pos, inc_mask, pk, pv, inc_ov, inc_om)
+    assert kn.shape == (num_layers, 1, num_heads, 1, head_dim), \
+        f"forward_new keys shape mismatch: {kn.shape}"
+    assert vn.shape == (num_layers, 1, num_heads, 1, head_dim), \
+        f"forward_new values shape mismatch: {vn.shape}"
+    # forward() returns [past_k|k] cat'd; the new tail must equal kn.
+    with torch.no_grad():
+        _, k_full, v_full = loaded(inc_ids, inc_pos, inc_mask, pk, pv, inc_ov, inc_om)
+    past_len = pk.size(3)
+    k_tail = k_full[:, :, :, past_len:, :]
+    v_tail = v_full[:, :, :, past_len:, :]
+    h_err = (h_inc2 - h_new).abs().max().item()
+    k_err = (k_tail - kn).abs().max().item()
+    v_err = (v_tail - vn).abs().max().item()
+    print(f"  forward_new hidden_err={h_err:.6f}, k_err={k_err:.6f}, v_err={v_err:.6f}")
+    # Hidden state must match exactly (same numerical path through attn+mlp).
+    # K/V are pre-cat slices so should match exactly too — but trace_module
+    # can pick different fused kernels per method, so allow a tiny FP16 drift.
+    assert h_err < 1e-3, f"forward_new hidden parity failed: {h_err}"
+    assert k_err < 0.01, f"forward_new K parity failed: {k_err}"
+    assert v_err < 0.01, f"forward_new V parity failed: {v_err}"
+    print("  forward_new verification passed (within FP16 tolerance)")
 
     return traced
 
