@@ -75,9 +75,15 @@ public:
     void syncGraphToPrefix() {}
 
 private:
+    /// Run the model with `past_k_buf[:, :, :, :past_len, :]` as the past
+    /// (a view, no alloc), then copy the model's present_keys/values into
+    /// the appropriate fixed buffer in-place. With pre-allocated cache
+    /// buffers, the only alloc per call is the model's internal cat() —
+    /// allocator caching covers most of that as shapes stabilize.
     torch::Tensor forwardImpl(torch::Tensor ids, torch::Tensor pos,
                               torch::Tensor mask,
-                              torch::Tensor past_k, torch::Tensor past_v,
+                              torch::Tensor past_k_buf, torch::Tensor past_v_buf,
+                              int past_len,
                               torch::Tensor ov, torch::Tensor om,
                               bool update_causal, bool update_prefix);
 

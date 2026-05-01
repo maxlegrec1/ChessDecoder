@@ -38,12 +38,26 @@ BatchedBackbone::BatchedBackbone(
     causal_mask_buf_ = torch::full({B_, 1, 1, max_seq_len_}, -1e9f, opts_fp32);
     prefix_mask_buf_ = torch::full({B_, 1, 1, max_seq_len_}, -1e9f, opts_fp32);
 
+    // Pre-allocate KV cache at max size — never reassigned, just sliced + copied
+    // into. Eliminates the per-forward reallocation that was driving 150+ GB
+    // of nvidia-smi VRAM jitter under the old `causal_k_ = pk` pattern.
+    causal_k_ = torch::zeros({num_layers_, B_, num_heads_, max_seq_len_, head_dim_}, opts_fp16);
+    causal_v_ = torch::zeros({num_layers_, B_, num_heads_, max_seq_len_, head_dim_}, opts_fp16);
+    prefix_k_ = torch::zeros({num_layers_, B_, num_heads_, max_seq_len_, head_dim_}, opts_fp16);
+    prefix_v_ = torch::zeros({num_layers_, B_, num_heads_, max_seq_len_, head_dim_}, opts_fp16);
+
     resetCausal();
     resetPrefix();
 
+    // Report fixed VRAM footprint for the cache (informational; helps diagnose
+    // OOMs early).
+    int64_t kv_bytes = 4LL * num_layers_ * B_ * num_heads_ * max_seq_len_ * head_dim_ * 2; // 4 buffers, fp16
+    int64_t mask_bytes = 2LL * B_ * max_seq_len_ * 4; // 2 mask buffers, fp32
     std::cout << "[BatchedBackbone] " << num_layers << " layers, "
               << embed_dim << "d, batch=" << B_
-              << " (pre-allocated mask buffers, zero per-step alloc)"
+              << " | fixed KV="
+              << (kv_bytes / (1024 * 1024)) << " MiB"
+              << " mask=" << (mask_bytes / (1024 * 1024)) << " MiB"
               << std::endl;
 }
 
@@ -53,19 +67,35 @@ BatchedBackbone::BatchedBackbone(
 
 torch::Tensor BatchedBackbone::forwardImpl(
     torch::Tensor ids, torch::Tensor pos, torch::Tensor mask,
-    torch::Tensor past_k, torch::Tensor past_v,
+    torch::Tensor past_k_buf, torch::Tensor past_v_buf, int past_len,
     torch::Tensor ov, torch::Tensor om,
     bool update_causal, bool update_prefix)
 {
     torch::NoGradGuard no_grad;
+
+    // Slice the persistent buffer to the current valid range. Views, no alloc.
+    auto past_k = past_k_buf.slice(3, 0, past_len);
+    auto past_v = past_v_buf.slice(3, 0, past_len);
+
     auto result = model_.forward({ids, pos, mask, past_k, past_v, ov, om});
     auto outputs = result.toTuple()->elements();
     auto hidden = outputs[0].toTensor();
-    auto pk = outputs[1].toTensor();
+    auto pk = outputs[1].toTensor();   // [NL, B, NH, past_len+S, HD] fresh
     auto pv = outputs[2].toTensor();
+    int new_total = pk.size(3);
 
-    if (update_causal) { causal_k_ = pk; causal_v_ = pv; causal_len_ = pk.size(3); }
-    if (update_prefix) { prefix_k_ = pk; prefix_v_ = pv; prefix_len_ = pk.size(3); }
+    if (update_causal) {
+        // In-place copy into the persistent buffer; pk/pv go out of scope and
+        // their backing memory is reused by the allocator on next call.
+        causal_k_.slice(3, 0, new_total).copy_(pk);
+        causal_v_.slice(3, 0, new_total).copy_(pv);
+        causal_len_ = new_total;
+    }
+    if (update_prefix) {
+        prefix_k_.slice(3, 0, new_total).copy_(pk);
+        prefix_v_.slice(3, 0, new_total).copy_(pv);
+        prefix_len_ = new_total;
+    }
     return hidden;
 }
 
@@ -107,9 +137,9 @@ void BatchedBackbone::markPrefixValidRange(int start, int count, torch::Tensor a
 
 void BatchedBackbone::resetCausal()
 {
-    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA);
-    causal_k_ = torch::zeros({num_layers_, B_, num_heads_, 0, head_dim_}, opts);
-    causal_v_ = torch::zeros({num_layers_, B_, num_heads_, 0, head_dim_}, opts);
+    // Buffers are persistent — just reset the valid length and clear the mask.
+    // KV cache content past causal_len_ is never read (mask is -inf there) so
+    // we don't need to zero it.
     causal_len_ = 0;
     causal_mask_buf_.fill_(-1e9f);
 }
@@ -149,7 +179,7 @@ torch::Tensor BatchedBackbone::causalForward(
                                  torch::tensor(-1e9f, opts_fp32));
     mask.slice(3, old_len, total).copy_(new_mask.unsqueeze(1));
 
-    auto h = forwardImpl(ids, pos, mask, causal_k_, causal_v_, ov, om, true, false);
+    auto h = forwardImpl(ids, pos, mask, causal_k_, causal_v_, old_len, ov, om, true, false);
 
     // Update mask buffer: mark positions [old_len, old_len+S) based on num_real.
     // For each position j, valid if j < num_real[b].
@@ -180,7 +210,7 @@ torch::Tensor BatchedBackbone::causalIncremental(
     // slow paths in the attention kernel.
     auto mask = causal_mask_buf_.slice(3, 0, total).contiguous();
 
-    return forwardImpl(ids, pos, mask, causal_k_, causal_v_, ov, om, true, false);
+    return forwardImpl(ids, pos, mask, causal_k_, causal_v_, new_pos, ov, om, true, false);
 }
 
 // ============================================================================
@@ -189,9 +219,6 @@ torch::Tensor BatchedBackbone::causalIncremental(
 
 void BatchedBackbone::resetPrefix()
 {
-    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA);
-    prefix_k_ = torch::zeros({num_layers_, B_, num_heads_, 0, head_dim_}, opts);
-    prefix_v_ = torch::zeros({num_layers_, B_, num_heads_, 0, head_dim_}, opts);
     prefix_len_ = 0;
     prefix_mask_buf_.fill_(-1e9f);
 }
@@ -202,7 +229,7 @@ torch::Tensor BatchedBackbone::prefixForward(
     torch::Tensor active)
 {
     // Full forward with explicit mask (used for init).
-    auto h = forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, ov, om, false, true);
+    auto h = forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, prefix_len_, ov, om, false, true);
 
     // Mark all positions as valid — single kernel
     int S = ids.size(1);
@@ -223,7 +250,7 @@ torch::Tensor BatchedBackbone::prefixIncremental(
 
     auto mask = prefix_mask_buf_.slice(3, 0, total).contiguous();
 
-    auto h = forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, ov, om, false, true);
+    auto h = forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, prefix_len_, ov, om, false, true);
 
     return h;
 }
@@ -254,7 +281,7 @@ torch::Tensor BatchedBackbone::prefixBlockForward(
                                   torch::tensor(-1e9f, opts_fp32));
     mask.slice(3, old_len, total).copy_(block_val.expand({B_, 1, S, S}));
 
-    auto h = forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, ov, om, false, true);
+    auto h = forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, old_len, ov, om, false, true);
 
     // Mark block positions as valid — single kernel
     markPrefixValidRange(old_len, S, active);
@@ -283,7 +310,7 @@ torch::Tensor BatchedBackbone::causalProbe(
     // Probe tokens see each other
     mask.slice(3, causal_len_, total).fill_(0.0f);
 
-    return forwardImpl(ids, pos, mask, causal_k_, causal_v_, ov, om,
+    return forwardImpl(ids, pos, mask, causal_k_, causal_v_, causal_len_, ov, om,
                        false, false);
 }
 
@@ -302,7 +329,7 @@ torch::Tensor BatchedBackbone::prefixProbe(
     }
     mask.slice(3, prefix_len_, total).fill_(0.0f);
 
-    return forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, ov, om,
+    return forwardImpl(ids, pos, mask, prefix_k_, prefix_v_, prefix_len_, ov, om,
                        false, false);
 }
 
