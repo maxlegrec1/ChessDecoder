@@ -24,6 +24,12 @@ class GRPOConfig:
     # > 0 during rollout — otherwise the bucket distribution collapses to
     # one-hot and there is no gradient signal.
     value_action_space: bool = False
+    # ProRL-style periodic reference policy reset.
+    # 0 disables; otherwise every N outer steps copy current policy weights
+    # into ref_model (releases the KL constraint, lets exploration resume).
+    # Optimizer state (Adam moments) is zeroed at the same boundary so the
+    # post-reset trajectory isn't biased by momentum from the prior phase.
+    reset_ref_every: int = 0
 
     # --- Rollout ---
     rollout_batch_size: int = 640

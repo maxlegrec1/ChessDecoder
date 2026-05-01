@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+import collections
 import os
 import random
 import shutil
@@ -570,6 +571,22 @@ def train():
                 )
                 if eval_results:
                     metrics.to_wandb(outer_step, lr=current_lr, eval_results=eval_results)
+
+            # ── ProRL: periodic reference policy + optimizer reset ─────────
+            # Copy the current policy into ref_model so the KL term restarts
+            # from 0 (releases the KL pull, lets exploration resume), and
+            # zero the optimizer moments so post-reset updates aren't biased
+            # by stale momentum from the previous phase.
+            if (config.reset_ref_every and is_main_process()
+                    and outer_step % config.reset_ref_every == 0):
+                print_rank0(f"  ProRL reset at outer step {outer_step}: "
+                            f"copying policy → ref_model and zeroing optimizer state")
+                raw = model.module if hasattr(model, "module") else model
+                ref_model.load_state_dict(raw.state_dict())
+                ref_model.eval()
+                for p in ref_model.parameters():
+                    p.requires_grad = False
+                optimizer.state = collections.defaultdict(dict)
 
             # ── Export model for next rollout ──────────────────────────────
             new_export_dir = Path(tempfile.mkdtemp(prefix="grpo_export_"))
