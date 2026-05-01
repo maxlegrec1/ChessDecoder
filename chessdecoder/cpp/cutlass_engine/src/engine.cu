@@ -88,6 +88,64 @@ void ThinkingEngine::update_weights(const std::string& weights_dir) {
     reupload_weights(weights_dir, cfg_, w_);
 }
 
+void ThinkingEngine::forward_decode_partial(std::uintptr_t ids,
+                                            std::uintptr_t pos,
+                                            std::uintptr_t active,
+                                            std::uintptr_t past_len,
+                                            int stop_after_layer,
+                                            std::uintptr_t out_h_in,
+                                            std::uintptr_t out_residual) {
+    const int B = cfg_.batch_size;
+    CE_CUDA_CHECK(cudaMemcpyAsync(kv_.slot_active(),
+                                  reinterpret_cast<const void*>(active),
+                                  B * sizeof(int32_t), cudaMemcpyDeviceToDevice,
+                                  stream_.get()));
+    CE_CUDA_CHECK(cudaMemcpyAsync(kv_.past_len(),
+                                  reinterpret_cast<const void*>(past_len),
+                                  B * sizeof(int32_t), cudaMemcpyDeviceToDevice,
+                                  stream_.get()));
+
+    model_.forward_decode_partial(reinterpret_cast<const int32_t*>(ids),
+                                  reinterpret_cast<const int32_t*>(pos),
+                                  kv_, stop_after_layer,
+                                  reinterpret_cast<__half*>(out_h_in),
+                                  reinterpret_cast<__half*>(out_residual),
+                                  stream_.get());
+    stream_.sync();
+}
+
+void ThinkingEngine::forward_decode_test(std::uintptr_t ids, std::uintptr_t pos,
+                                         std::uintptr_t active,
+                                         std::uintptr_t past_len,
+                                         std::uintptr_t out_h) {
+    // Caller-provided active+past_len are copied into the engine's KvCache so
+    // that internal kernels read them.  Caller is responsible for matching B.
+    const int B = cfg_.batch_size;
+    CE_CUDA_CHECK(cudaMemcpyAsync(kv_.slot_active(),
+                                  reinterpret_cast<const void*>(active),
+                                  B * sizeof(int32_t),
+                                  cudaMemcpyDeviceToDevice, stream_.get()));
+    CE_CUDA_CHECK(cudaMemcpyAsync(kv_.past_len(),
+                                  reinterpret_cast<const void*>(past_len),
+                                  B * sizeof(int32_t),
+                                  cudaMemcpyDeviceToDevice, stream_.get()));
+
+    model_.forward_decode(reinterpret_cast<const int32_t*>(ids),
+                          reinterpret_cast<const int32_t*>(pos),
+                          /*wl_pos=*/nullptr, /*d_pos=*/nullptr,
+                          /*wl_val=*/nullptr, /*d_val=*/nullptr,
+                          kv_,
+                          reinterpret_cast<__half*>(out_h),
+                          stream_.get());
+
+    // Copy past_len back so caller can observe the increment.
+    CE_CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(past_len),
+                                  kv_.past_len(),
+                                  B * sizeof(int32_t),
+                                  cudaMemcpyDeviceToDevice, stream_.get()));
+    stream_.sync();
+}
+
 std::vector<RolloutResult> ThinkingEngine::predict_moves(
     const std::vector<std::string>& fens, float /*fallback_temperature*/) {
     sched_.initialize(cfg_.batch_size, (int)fens.size());

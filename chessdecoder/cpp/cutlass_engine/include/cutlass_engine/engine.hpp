@@ -43,6 +43,27 @@ public:
 
     int batch_size() const { return cfg_.batch_size; }
 
+    // ---- Test/debug surface ----------------------------------------------
+    // Run a single decode step over [B,1] input. Caller fills:
+    //   ids        device int32 [B]
+    //   pos        device int32 [B]
+    //   active     device int32 [B]   (1 = run; 0 = skip + zero output)
+    //   past_len   device int32 [B]   (will be incremented by 1 on active slots)
+    // Returns hidden state in `out_h` (device __half [B, E]).
+    // No fourier override.
+    void forward_decode_test(std::uintptr_t ids, std::uintptr_t pos,
+                             std::uintptr_t active, std::uintptr_t past_len,
+                             std::uintptr_t out_h);
+
+    // Debug: stop after `stop_after_layer` layers and return h_in + residual.
+    // stop_after_layer == -1 means "before any layer" (just embedding).
+    // stop_after_layer == cfg.num_layers means "all layers, before final norm".
+    void forward_decode_partial(std::uintptr_t ids, std::uintptr_t pos,
+                                std::uintptr_t active, std::uintptr_t past_len,
+                                int stop_after_layer,
+                                std::uintptr_t out_h_in,
+                                std::uintptr_t out_residual);
+
 private:
     ModelConfig cfg_;
     Arena arena_;

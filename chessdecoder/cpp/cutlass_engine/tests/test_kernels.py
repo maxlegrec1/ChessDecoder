@@ -181,7 +181,10 @@ def test_gemm_fp16():
 
 def test_fmha_decode_against_sdpa():
     B, NH, HD = 2, 4, 64
-    past_len_val = 16
+    # Decode contract: cache has `past_len + 1` valid entries
+    # (kv_scatter wrote the new one at index past_len; fmha reads up to past_len+1).
+    past_len_val = 15  # 15 prior entries + 1 just-written = 16 valid total
+    valid_count = past_len_val + 1
     max_seq = 64
     layer_idx = 0
     NL = 1
@@ -201,8 +204,8 @@ def test_fmha_decode_against_sdpa():
         B, NH, HD, max_seq, layer_idx, scale)
 
     # Reference: torch SDPA with the truncated cache.
-    K_used = Kc[layer_idx, :, :, :past_len_val, :].float()  # [B, NH, P, HD]
-    V_used = Vc[layer_idx, :, :, :past_len_val, :].float()
+    K_used = Kc[layer_idx, :, :, :valid_count, :].float()  # [B, NH, P, HD]
+    V_used = Vc[layer_idx, :, :, :valid_count, :].float()
     Q_f = Q.float().unsqueeze(2)  # [B, NH, 1, HD]
     scores = (Q_f @ K_used.transpose(-1, -2)) * scale  # [B, NH, 1, P]
     probs = torch.softmax(scores, dim=-1)

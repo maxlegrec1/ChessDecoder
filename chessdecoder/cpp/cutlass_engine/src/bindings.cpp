@@ -164,7 +164,16 @@ PYBIND11_MODULE(_cutlass_decoder_cpp, m) {
              py::arg("fens"), py::arg("temperature") = 1.0f)
         .def("update_weights",
              &cutlass_engine::ThinkingEngine::update_weights,
-             py::arg("weights_dir"));
+             py::arg("weights_dir"))
+        .def("forward_decode_test",
+             &cutlass_engine::ThinkingEngine::forward_decode_test,
+             py::arg("ids"), py::arg("pos"), py::arg("active"),
+             py::arg("past_len"), py::arg("out_h"))
+        .def("forward_decode_partial",
+             &cutlass_engine::ThinkingEngine::forward_decode_partial,
+             py::arg("ids"), py::arg("pos"), py::arg("active"),
+             py::arg("past_len"), py::arg("stop_after_layer"),
+             py::arg("out_h_in"), py::arg("out_residual"));
 
     // ---- Kernel test surface ------------------------------------------
     auto kernels = m.def_submodule("kernels", "Direct kernel calls for unit testing.");

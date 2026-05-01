@@ -55,6 +55,50 @@ void ChessDecoderModel::forward_decode(const int32_t* ids,
     past_len_increment(kv.past_len(), kv.slot_active(), S, B, stream);
 }
 
+void ChessDecoderModel::forward_decode_partial(const int32_t* ids,
+                                               const int32_t* pos,
+                                               KvCache& kv,
+                                               int stop_after_layer,
+                                               __half* out_h_in,
+                                               __half* out_residual,
+                                               cudaStream_t stream) {
+    // Decoding `stop_after_layer`:
+    //   stop_after_layer == -1                     : just embedding
+    //   stop_after_layer encoded as 2*L            : after attention sub-block of layer L
+    //   stop_after_layer encoded as 2*L+1          : after MLP sub-block of layer L
+    //   stop_after_layer >= 2 * num_layers          : full N layers
+    const int B = cfg_->batch_size;
+    const int M = B * 1;
+    const int E = cfg_->embed_dim;
+
+    embed_with_fourier_fp16(ids, w_->tok_embedding,
+                            nullptr, nullptr, nullptr, nullptr,
+                            w_->fourier_freq, w_->fourier_proj_w, w_->fourier_proj_b,
+                            ws_.h_in, M, E, cfg_->vocab_size, cfg_->num_fourier_freq, stream);
+    CE_CUDA_CHECK(cudaMemsetAsync(ws_.residual, 0, M * E * sizeof(__half), stream));
+    CE_CUDA_CHECK(cudaMemcpyAsync(ws_.pos, pos, M * sizeof(int32_t),
+                                  cudaMemcpyDeviceToDevice, stream));
+
+    if (stop_after_layer >= 0) {
+        for (int sub = 0; sub <= stop_after_layer; ++sub) {
+            int li = sub / 2;
+            if (li >= cfg_->num_layers) break;
+            bool do_attn = (sub % 2 == 0);
+            if (do_attn) {
+                attention_block_forward(ctx_, w_->layers[li], ws_, kv, li,
+                                        ForwardMode::Decode, B, 1, nullptr, stream);
+            } else {
+                mlp_block_forward(ctx_, w_->layers[li], ws_, B * 1, stream);
+            }
+        }
+    }
+
+    CE_CUDA_CHECK(cudaMemcpyAsync(out_h_in, ws_.h_in, M * E * sizeof(__half),
+                                  cudaMemcpyDeviceToDevice, stream));
+    CE_CUDA_CHECK(cudaMemcpyAsync(out_residual, ws_.residual, M * E * sizeof(__half),
+                                  cudaMemcpyDeviceToDevice, stream));
+}
+
 void ChessDecoderModel::forward_prefill_block(const int32_t* ids,
                                               const int32_t* pos,
                                               const int32_t* block_id,

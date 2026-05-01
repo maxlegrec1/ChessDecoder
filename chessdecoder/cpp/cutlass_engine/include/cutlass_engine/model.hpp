@@ -30,6 +30,14 @@ public:
                         __half* out_h,                     // [B, E] FP16
                         cudaStream_t stream);
 
+    // Debug: stop after a specific layer. stop_after_layer=-1 means "just embedding".
+    // num_layers means "all layers, before final norm". The returned (h_in, residual)
+    // represent the engine's per-layer ping-pong state at that point.
+    void forward_decode_partial(const int32_t* ids, const int32_t* pos,
+                                KvCache& kv, int stop_after_layer,
+                                __half* out_h_in, __half* out_residual,
+                                cudaStream_t stream);
+
     // Prefill forward over a [B, S] block (init or refill). Self-attention
     // only — does NOT update the cache. Caller post-processes by copying the
     // last-position K/V (or all positions) into cache via kv_scatter.

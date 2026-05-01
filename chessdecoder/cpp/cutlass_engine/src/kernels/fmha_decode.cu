@@ -1,7 +1,9 @@
 #include "cutlass_engine/kernels.hpp"
 #include "cutlass_engine/check.hpp"
 
+#include <cstdio>
 #include <cuda_fp16.h>
+#include <stdexcept>
 
 namespace cutlass_engine {
 
@@ -43,7 +45,10 @@ __global__ void fmha_decode_kernel(const __half* __restrict__ Q,
         return;
     }
     const int tid = threadIdx.x;
-    const int p_max = past_len[b];
+    // Decode-mode contract: kv_scatter has already written the new K/V at
+    // physical position past_len[b]. We attend over [0, past_len[b] + 1)
+    // so the new position is included (self-attention).
+    const int p_max = past_len[b] + 1;
     if (p_max <= 0) {
         // No keys to attend. Output 0; the engine will only read O at S_q=1
         // of an empty cache during pure-prefill init, which doesn't happen.
@@ -158,25 +163,32 @@ void fmha_decode_dispatch(const __half* Q, const __half* K_cache, const __half* 
                           int B, int NH, int HD,
                           int max_seq_len, int layer_idx, float scale,
                           cudaStream_t stream) {
-    if (HD == 64) {
+    dim3 grid(B, NH);
+    if (HD == 32) {
         constexpr int T_K = 64;
-        dim3 grid(B, NH);
+        dim3 block(32);
+        fmha_decode_kernel<32, T_K><<<grid, block, 0, stream>>>(
+            Q, K_cache, V_cache, past_len, active, O, B, NH,
+            max_seq_len, layer_idx, scale);
+    } else if (HD == 64) {
+        constexpr int T_K = 64;
         dim3 block(64);
         fmha_decode_kernel<64, T_K><<<grid, block, 0, stream>>>(
             Q, K_cache, V_cache, past_len, active, O, B, NH,
             max_seq_len, layer_idx, scale);
-        CE_CUDA_LAST();
     } else if (HD == 128) {
         constexpr int T_K = 32;
-        dim3 grid(B, NH);
         dim3 block(128);
         fmha_decode_kernel<128, T_K><<<grid, block, 0, stream>>>(
             Q, K_cache, V_cache, past_len, active, O, B, NH,
             max_seq_len, layer_idx, scale);
-        CE_CUDA_LAST();
     } else {
-        // Unsupported; the engine should never request this.
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "fmha_decode_dispatch: unsupported HD=%d (supported: 32, 64, 128)", HD);
+        throw std::runtime_error(buf);
     }
+    CE_CUDA_LAST();
 }
 
 }  // namespace cutlass_engine

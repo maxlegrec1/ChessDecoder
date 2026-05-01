@@ -121,16 +121,24 @@ void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
                            const int32_t* block_id, const int32_t* active,
                            __half* O, int B, int S, int NH, int HD,
                            float scale, cudaStream_t stream) {
-    if (HD == 64) {
-        dim3 grid(B, NH);
+    dim3 grid(B, NH);
+    std::size_t shmem = sizeof(float) * (2 * S * HD) + sizeof(int32_t) * S;
+    if (HD == 32) {
+        dim3 block(32);
+        fmha_prefill_kernel<32><<<grid, block, shmem, stream>>>(
+            Q, K, V, block_id, active, O, B, S, NH, scale);
+    } else if (HD == 64) {
         dim3 block(64);
-        std::size_t shmem = sizeof(float) * (2 * S * HD) + sizeof(int32_t) * S;
         fmha_prefill_kernel<64><<<grid, block, shmem, stream>>>(
             Q, K, V, block_id, active, O, B, S, NH, scale);
-        CE_CUDA_LAST();
+    } else if (HD == 128) {
+        dim3 block(128);
+        fmha_prefill_kernel<128><<<grid, block, shmem, stream>>>(
+            Q, K, V, block_id, active, O, B, S, NH, scale);
     } else {
         // unsupported
     }
+    CE_CUDA_LAST();
 }
 
 }  // namespace cutlass_engine
