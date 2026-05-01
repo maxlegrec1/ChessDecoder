@@ -346,4 +346,92 @@ torch::Tensor BatchedBackbone::prefixProbe(
                        false, false);
 }
 
+// ============================================================================
+// Phase 4: per-slot refill (continuous batching)
+// ============================================================================
+
+torch::Tensor BatchedBackbone::resetSlotsForRefill(
+    torch::Tensor slot_active,
+    torch::Tensor init_ids, torch::Tensor init_pos,
+    torch::Tensor prefix_mask,
+    torch::Tensor init_ov, torch::Tensor init_om)
+{
+    torch::NoGradGuard no_grad;
+
+    int init_len = init_ids.size(1);
+    auto opts_fp16 = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA);
+    auto opts_fp32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    // 1. Wipe slot rows of mask buffers entirely to -inf. masked_fill_
+    //    broadcasts slot_active [B] across the [1, 1, max_seq_len] dims.
+    auto reset_view = slot_active.view({B_, 1, 1, 1});
+    causal_mask_buf_.masked_fill_(reset_view, -1e9f);
+    prefix_mask_buf_.masked_fill_(reset_view, -1e9f);
+
+    // 2. Build empty past for forward_new (past_len=0).
+    auto past_k_empty = torch::zeros({num_layers_, B_, num_heads_, 0, head_dim_}, opts_fp16);
+    auto past_v_empty = torch::zeros({num_layers_, B_, num_heads_, 0, head_dim_}, opts_fp16);
+
+    // 3. Causal prefill: causal-only attention mask within [init_len, init_len].
+    auto causal_pattern = torch::tril(torch::ones({init_len, init_len}, opts_fp32));
+    auto causal_mask = torch::where(
+        causal_pattern.to(torch::kBool),
+        torch::tensor(0.0f, opts_fp32),
+        torch::tensor(-1e9f, opts_fp32))
+        .view({1, 1, init_len, init_len})
+        .expand({B_, 1, init_len, init_len})
+        .contiguous();
+
+    std::vector<torch::IValue> causal_inputs{
+        init_ids, init_pos, causal_mask, past_k_empty, past_v_empty, init_ov, init_om};
+    auto c_result = (*forward_new_method_)(causal_inputs);
+    auto c_outputs = c_result.toTuple()->elements();
+    auto causal_kn = c_outputs[1].toTensor();   // [NL, B, NH, init_len, HD]
+    auto causal_vn = c_outputs[2].toTensor();
+
+    // 4. Prefix prefill: block-aware mask supplied by caller.
+    std::vector<torch::IValue> prefix_inputs{
+        init_ids, init_pos, prefix_mask, past_k_empty, past_v_empty, init_ov, init_om};
+    auto p_result = (*forward_new_method_)(prefix_inputs);
+    auto p_outputs = p_result.toTuple()->elements();
+    auto prefix_h = p_outputs[0].toTensor();    // [B, init_len, E]
+    auto prefix_kn = p_outputs[1].toTensor();
+    auto prefix_vn = p_outputs[2].toTensor();
+
+    // 5. Scatter K/V into selected slot rows at physical [0, init_len). Loop
+    //    over K is short (typically 1-2 refills per cycle). One D2H sync.
+    auto slot_idx = torch::nonzero(slot_active).squeeze(1);  // [K] int64 on CUDA
+    auto slot_idx_cpu = slot_idx.cpu();
+    auto si_a = slot_idx_cpu.accessor<int64_t, 1>();
+    int K = (int)slot_idx.size(0);
+
+    for (int k = 0; k < K; k++)
+    {
+        int64_t b = si_a[k];
+        // causal_k_[:, b, :, 0:init_len, :].copy_(causal_kn[:, b, :, :, :])
+        causal_k_.select(1, b).slice(2, 0, init_len).copy_(causal_kn.select(1, b));
+        causal_v_.select(1, b).slice(2, 0, init_len).copy_(causal_vn.select(1, b));
+        prefix_k_.select(1, b).slice(2, 0, init_len).copy_(prefix_kn.select(1, b));
+        prefix_v_.select(1, b).slice(2, 0, init_len).copy_(prefix_vn.select(1, b));
+    }
+
+    // 6. Mark mask valid at [0, init_len) for the refilled slots.
+    auto causal_slice = causal_mask_buf_.slice(3, 0, init_len)
+                            .squeeze(2).squeeze(1);   // [B, init_len]
+    causal_slice.masked_fill_(slot_active.unsqueeze(1), 0.0f);
+    auto prefix_slice = prefix_mask_buf_.slice(3, 0, init_len)
+                            .squeeze(2).squeeze(1);
+    prefix_slice.masked_fill_(slot_active.unsqueeze(1), 0.0f);
+
+    // NOTE: causal_len_ / prefix_len_ are intentionally NOT modified.
+    // resetSlotsForRefill is called mid-rollout when other slots are at higher
+    // global positions. Slot b's logical seq_pos resets to init_len (caller's
+    // responsibility); RoPE uses input_pos arg, decoupled from physical cache
+    // index. Slot b's mask -inf at [init_len, current_global_len) keeps stale
+    // physical positions from being attended.
+
+    // Return last-position hidden state. Caller picks rows for refilled slots.
+    return prefix_h.index({torch::indexing::Slice(), init_len - 1}).contiguous();
+}
+
 } // namespace decoder

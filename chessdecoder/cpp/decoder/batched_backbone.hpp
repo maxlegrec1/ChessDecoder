@@ -69,6 +69,31 @@ public:
     void markCausalValidRange(int start, int count, torch::Tensor active);
     void markPrefixValidRange(int start, int count, torch::Tensor active);
 
+    /// Phase 4: refill finished slots in place without disturbing other slots.
+    ///
+    /// For each `slot_active[b]==true` slot:
+    ///   1. Wipe its causal_mask_buf_ and prefix_mask_buf_ rows entirely to -inf.
+    ///   2. Run a fresh prefill (forward_new on past_len=0) and write the new
+    ///      K/V into causal_k_/v_/prefix_k_/v_ at slot b, physical positions
+    ///      [0, init_len). Other slots' rows are untouched.
+    ///   3. Mark mask valid at [0, init_len) for slot b.
+    ///
+    /// `causal_len_` and `prefix_len_` are NOT modified — slot b's logical
+    /// positions decouple from physical (RoPE uses input_pos arg). After
+    /// refill, slot b's mask says valid at [0, init_len) only. Subsequent
+    /// causalIncremental writes at causal_len_ (global) get masked-valid by
+    /// the existing markCausalValid path when slot is active.
+    ///
+    /// Returns: saved_h `[B, E]` — last-position hidden state from the
+    /// refill prefill. Caller updates saved_h only at refilled slot indices.
+    torch::Tensor resetSlotsForRefill(
+        torch::Tensor slot_active,    // [B] bool
+        torch::Tensor init_ids,       // [B, init_len] int64
+        torch::Tensor init_pos,       // [B, init_len] int64
+        torch::Tensor prefix_mask,    // [B, 1, init_len, init_len] FP32 — block-aware
+        torch::Tensor init_ov,        // [B, init_len] FP16
+        torch::Tensor init_om);       // [B, init_len] bool
+
     // No-ops for API compatibility
     void syncCausalToGraph() {}
     void syncGraphToCausal() {}

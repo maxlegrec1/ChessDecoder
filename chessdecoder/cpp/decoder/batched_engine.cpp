@@ -2,6 +2,7 @@
 
 #include <c10/cuda/CUDAStream.h>
 #include <chrono>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -226,17 +227,27 @@ ThinkingBatchedInferenceEngine::predictMoves(
     auto t0 = std::chrono::high_resolution_clock::now();
     torch::NoGradGuard no_grad;
 
-    int B_actual = static_cast<int>(fens.size());
-    if (B_actual > max_batch_size_)
-        throw std::runtime_error("Batch size exceeds max_batch_size");
+    int N = static_cast<int>(fens.size());
+    if (N == 0) return {};
 
-    // Always work with max_batch_size internally — pad unused slots
+    // Continuous batching: B engine slots, N FENs (N may exceed B). Slot
+    // refills from the pending queue when its rollout terminates. RoPE
+    // position is decoupled from physical KV cache position, so a refilled
+    // slot's logical seq_pos resets to init_len while its physical KV slots
+    // sit wherever the global causal_len_ points.
     int B = max_batch_size_;
+    int initial_fill = std::min(N, B);
+    std::deque<int> pending;
+    for (int i = B; i < N; i++) pending.push_back(i);
 
-    // Pad fens list to B (reuse first FEN for padding, results discarded)
-    std::vector<std::string> padded_fens = fens;
-    while ((int)padded_fens.size() < B)
-        padded_fens.push_back(fens[0]);
+    // Per-slot FEN identity. Padded slots beyond initial_fill use fen[0] for
+    // their unused prefill computation; we never read their results.
+    std::vector<int> slot_to_fen(B, 0);
+    for (int b = 0; b < initial_fill; b++) slot_to_fen[b] = b;
+
+    // padded_fens is dynamic now: rebuilt whenever a slot is refilled.
+    std::vector<std::string> padded_fens(B);
+    for (int b = 0; b < B; b++) padded_fens[b] = fens[slot_to_fen[b]];
 
     // Resolve temperatures
     float think_temp = (think_temperature >= 0.0f) ? think_temperature : temperature;
@@ -350,20 +361,31 @@ ThinkingBatchedInferenceEngine::predictMoves(
     torch::Tensor h_board_after_loop;
 
     // ================================================================
-    // Phase 2: Variation loop
+    // Phase 2: Variation loop (with continuous-batched slot refill)
     // ================================================================
 
-    auto active = torch::ones({B}, opts_bool);
-    auto in_variation = torch::ones({B}, opts_bool);
+    // Per-FEN result storage (filled in submission order via slot_to_fen).
+    std::vector<Result> all_results(N);
+
+    // Slots beyond initial_fill are inactive from the start (no FEN to run
+    // there). Their saved_h, KV, etc. carry the prefill from padded fen[0]
+    // but we never read the result.
+    auto active = torch::zeros({B}, opts_bool);
+    if (initial_fill > 0) {
+        active.slice(0, 0, initial_fill).fill_(true);
+    }
+    auto in_variation = active.clone();
+    auto prev_active = active.clone();
 
     for (int iter = 0; iter < max_seq_len_; iter++)
     {
-        if (!active.any().item<bool>())
+        // Exit when no active slots AND no pending FENs to refill with.
+        if (!active.any().item<bool>() && pending.empty())
             break;
 
         auto need_move = active & in_variation;  // [B]
 
-        if (!need_move.any().item<bool>())
+        if (!need_move.any().item<bool>() && pending.empty())
             break;
 
         // Sync need_move to host ONCE per iteration. All per-element checks
@@ -778,60 +800,242 @@ ThinkingBatchedInferenceEngine::predictMoves(
             if (act_a[b] && (int)token_ids[b].size() >= max_seq_len_ - 5)
                 active[b] = false;
         }
+
+        // Global buffer-overflow safeguard. In CB, the global causal_len_ /
+        // prefix_len_ grow with iter count regardless of any single slot's
+        // logical seq_pos. Once they approach max_seq_len_, the next iter
+        // would write beyond the pre-allocated cache and the slice clamp
+        // produces a shape mismatch with the model's S-sized output. Force
+        // all active slots to terminate; they'll get final-predicted in the
+        // just_finished branch below.
+        if (backbone_->causalLen() + 80 > max_seq_len_ ||
+            backbone_->prefixLen() + 80 > max_seq_len_)
+        {
+            active.zero_();
+            in_variation.zero_();
+        }
+
+        // ── CB: per-slot final predict for newly-finished slots, then refill ──
+        auto prev_act_cpu = prev_active.cpu();
+        auto pa_a = prev_act_cpu.accessor<bool, 1>();
+        auto cur_act_cpu = active.cpu();
+        auto ca_a = cur_act_cpu.accessor<bool, 1>();
+
+        std::vector<int> just_finished;
+        for (int b = 0; b < B; b++)
+            if (pa_a[b] && !ca_a[b]) just_finished.push_back(b);
+
+        if (!just_finished.empty())
+        {
+            // Batched final predict on the full B saved_h. Wasted compute on
+            // non-finished slots is one matmul + softmax — cheap. For finished
+            // slots, saved_h holds the end_think hidden state (set in step 2e).
+            auto final_pair = evalPolicyHead(saved_h, policy_temp, padded_fens);
+            auto final_full = move_lut.index({final_pair.first});
+            auto ff_cpu = final_full.cpu();
+            auto ff_a = ff_cpu.accessor<int64_t, 1>();
+            auto flp_cpu = final_pair.second.cpu();
+            auto flp_a = flp_cpu.accessor<float, 1>();
+
+            for (int b : just_finished)
+            {
+                int tok = ff_a[b];
+                std::string move = vocab_->pseudoToStandardUci(vocab_->idxToToken(tok));
+                if (move.empty() && !first_root_move[b].empty())
+                    move = vocab_->pseudoToStandardUci(first_root_move[b]);
+
+                int pred_pos = seq_pos[b] - 1;
+                move_log_probs[b].push_back({pred_pos, flp_a[b]});
+                token_ids[b].push_back(tok);
+
+                // Copy (not move) — step 2c's catch-up loop in subsequent
+                // iters reads token_ids[b].back() for ALL slots regardless of
+                // need_move (mask handles correctness). Moving would empty
+                // the vector and segfault that read. Slot's accumulators are
+                // cleared on refill (below) if a new FEN is queued; otherwise
+                // they sit unread but valid until end of call.
+                int fen_id = slot_to_fen[b];
+                all_results[fen_id].move = std::move(move);
+                all_results[fen_id].token_ids = token_ids[b];
+                all_results[fen_id].wl_entries = wl_entries[b];
+                all_results[fen_id].d_entries = d_entries[b];
+                all_results[fen_id].move_log_probs = move_log_probs[b];
+                all_results[fen_id].wl_bucket_indices = wl_bucket_indices[b];
+                all_results[fen_id].d_bucket_indices = d_bucket_indices[b];
+                all_results[fen_id].wl_log_probs = wl_log_probs[b];
+                all_results[fen_id].d_log_probs = d_log_probs[b];
+
+                total_tokens += all_results[fen_id].token_ids.size();
+            }
+        }
+
+        // Buffer-overflow safety: a refilled slot will continue generating
+        // for ~1500 tokens (avg rollout length); if the global causal_len_ /
+        // prefix_len_ would push past max_seq_len_ during that, stop refilling
+        // and enter drain mode. Remaining FENs in pending are skipped — the
+        // Python wrapper detects empty results in all_results and re-calls.
+        const int rollout_budget = 1500;
+        bool buffer_full = (backbone_->causalLen() + rollout_budget > max_seq_len_) ||
+                           (backbone_->prefixLen() + rollout_budget > max_seq_len_);
+
+        // Refill any inactive slot that has a queued FEN waiting.
+        std::vector<int> refill_idxs;
+        if (!buffer_full)
+        {
+            for (int b = 0; b < B; b++)
+            {
+                if (!ca_a[b] && !pending.empty())
+                {
+                    int new_fen_id = pending.front();
+                    pending.pop_front();
+                    slot_to_fen[b] = new_fen_id;
+                    padded_fens[b] = fens[new_fen_id];
+                    refill_idxs.push_back(b);
+                }
+            }
+        }
+        else if (!pending.empty())
+        {
+            // Drain mode entered. Stop accepting new FENs; let active slots finish.
+            // Caller will re-submit pending FENs in a fresh predictMoves call
+            // (which resets causal_len_/prefix_len_ via Phase 1 resetCausal+resetPrefix).
+            pending.clear();
+        }
+
+        if (!refill_idxs.empty())
+        {
+            // Reset host-side per-slot accumulators for refilled slots.
+            for (int b : refill_idxs)
+            {
+                token_ids[b].clear();
+                block_ids[b].clear();
+                wl_entries[b].clear();
+                d_entries[b].clear();
+                move_log_probs[b].clear();
+                wl_bucket_indices[b].clear();
+                d_bucket_indices[b].clear();
+                wl_log_probs[b].clear();
+                d_log_probs[b].clear();
+                next_block[b] = 0;
+                orphan_ctr[b] = 10000;
+                first_root_move[b].clear();
+                seq_pos[b] = init_len;
+
+                // Encode new FEN's 68 root tokens + start_think into accumulators.
+                auto ids = vocab_->fenToTokenIds(padded_fens[b]);
+                int bid = next_block[b]++;
+                for (int j = 0; j < root_len; j++)
+                {
+                    token_ids[b].push_back(ids[j]);
+                    block_ids[b].push_back(bid);
+                }
+                token_ids[b].push_back(start_think_idx);
+                block_ids[b].push_back(orphan_ctr[b]++);
+            }
+
+            // Build refill batch tensors on host first, single H2D each.
+            // Per-element writes to CUDA tensors trigger sync per write —
+            // a refill cycle of K slots × init_len would produce K*69*4
+            // (tensors) sync ops, dominating refill cost.
+            auto opts_int64_cpu = torch::TensorOptions().dtype(torch::kInt64);
+            auto opts_fp16_cpu = torch::TensorOptions().dtype(torch::kFloat16);
+            auto opts_bool_cpu = torch::TensorOptions().dtype(torch::kBool);
+
+            auto refill_active_cpu = torch::zeros({B}, opts_bool_cpu);
+            auto rf_ids_cpu = torch::zeros({B, init_len}, opts_int64_cpu);
+            auto rf_block_ids_cpu = torch::zeros({B, init_len}, opts_int64_cpu);
+            auto ra_a = refill_active_cpu.accessor<bool, 1>();
+            auto rids_a = rf_ids_cpu.accessor<int64_t, 2>();
+            auto rblk_a = rf_block_ids_cpu.accessor<int64_t, 2>();
+
+            for (int b : refill_idxs)
+            {
+                ra_a[b] = true;
+                for (int j = 0; j < init_len; j++)
+                {
+                    rids_a[b][j] = token_ids[b][j];
+                    rblk_a[b][j] = block_ids[b][j];
+                }
+            }
+            auto refill_active = refill_active_cpu.cuda();
+            auto rf_ids = rf_ids_cpu.cuda();
+            auto rf_block_ids = rf_block_ids_cpu.cuda();
+            auto rf_pos = torch::arange(init_len, opts_int).unsqueeze(0)
+                              .expand({B, init_len}).contiguous();
+            auto rf_ov = torch::zeros({B, init_len}, opts_fp16);
+            auto rf_om = torch::zeros({B, init_len}, opts_bool);
+
+            // Block-aware prefix mask (same construction as Phase 1).
+            auto rf_same_block = rf_block_ids.unsqueeze(2) == rf_block_ids.unsqueeze(1);
+            auto rf_causal = torch::tril(torch::ones({init_len, init_len}, opts_bool));
+            auto rf_prefix_mask = torch::where(
+                rf_same_block | rf_causal.unsqueeze(0),
+                torch::tensor(0.0f, torch::kCUDA),
+                torch::tensor(-1e9f, torch::kCUDA))
+                .unsqueeze(1);  // [B, 1, init_len, init_len]
+
+            auto new_saved = backbone_->resetSlotsForRefill(
+                refill_active, rf_ids, rf_pos, rf_prefix_mask, rf_ov, rf_om);
+
+            // Update saved_h only for refilled slots.
+            saved_h = torch::where(refill_active.unsqueeze(1), new_saved, saved_h);
+
+            // Reactivate refilled slots in active/in_variation tensors.
+            active = active | refill_active;
+            in_variation = in_variation | refill_active;
+        }
+
+        // Snapshot active for next iter's just-finished detection.
+        prev_active = active.clone();
     }
 
     // ================================================================
-    // Phase 3: FINAL — predict final moves
+    // Loop-exit fallback: predict finals for any slots still active.
+    // (Triggers only if the for-loop iter budget runs out before all
+    //  rollouts finish — unreachable in practice given seq budget caps.)
     // ================================================================
-
-    auto final_pair = evalPolicyHead(saved_h, policy_temp, padded_fens);
-    auto final_sub_idx = final_pair.first;
-    auto final_lp = final_pair.second;
-    auto final_full = move_lut.index({final_sub_idx});
-    auto final_cpu = final_full.cpu();
-    auto final_a = final_cpu.accessor<int64_t, 1>();
-    auto final_lp_cpu = final_lp.cpu();
-    auto final_lp_a = final_lp_cpu.accessor<float, 1>();
-
-    // Build results
-    std::vector<Result> results(B);
-    for (int b = 0; b < B; b++)
+    if (active.any().item<bool>())
     {
-        int tok = final_a[b];
-        std::string move = vocab_->pseudoToStandardUci(vocab_->idxToToken(tok));
+        auto final_pair = evalPolicyHead(saved_h, policy_temp, padded_fens);
+        auto final_full = move_lut.index({final_pair.first});
+        auto ff_cpu = final_full.cpu();
+        auto ff_a = ff_cpu.accessor<int64_t, 1>();
+        auto flp_cpu = final_pair.second.cpu();
+        auto flp_a = flp_cpu.accessor<float, 1>();
+        auto act_cpu = active.cpu();
+        auto act_a = act_cpu.accessor<bool, 1>();
 
-        if (move.empty() && !first_root_move[b].empty())
-            move = vocab_->pseudoToStandardUci(first_root_move[b]);
+        for (int b = 0; b < B; b++)
+        {
+            if (!act_a[b]) continue;
+            int tok = ff_a[b];
+            std::string move = vocab_->pseudoToStandardUci(vocab_->idxToToken(tok));
+            if (move.empty() && !first_root_move[b].empty())
+                move = vocab_->pseudoToStandardUci(first_root_move[b]);
+            int pred_pos = seq_pos[b] - 1;
+            move_log_probs[b].push_back({pred_pos, flp_a[b]});
+            token_ids[b].push_back(tok);
 
-        // The final move is predicted from the end_think token, which was
-        // appended last and is now at position seq_pos[b] - 1. This matches
-        // final_move_mask[i] set at the end_think position in sequence.py.
-        int pred_pos = seq_pos[b] - 1;
-        move_log_probs[b].push_back({pred_pos, final_lp_a[b]});
-
-        // Append final move token so token_ids is the complete sequence
-        token_ids[b].push_back(tok);
-
-        results[b].move = move;
-        results[b].token_ids = std::move(token_ids[b]);
-        results[b].wl_entries = std::move(wl_entries[b]);
-        results[b].d_entries = std::move(d_entries[b]);
-        results[b].move_log_probs = std::move(move_log_probs[b]);
-        results[b].wl_bucket_indices = std::move(wl_bucket_indices[b]);
-        results[b].d_bucket_indices = std::move(d_bucket_indices[b]);
-        results[b].wl_log_probs = std::move(wl_log_probs[b]);
-        results[b].d_log_probs = std::move(d_log_probs[b]);
+            int fen_id = slot_to_fen[b];
+            all_results[fen_id].move = std::move(move);
+            all_results[fen_id].token_ids = std::move(token_ids[b]);
+            all_results[fen_id].wl_entries = std::move(wl_entries[b]);
+            all_results[fen_id].d_entries = std::move(d_entries[b]);
+            all_results[fen_id].move_log_probs = std::move(move_log_probs[b]);
+            all_results[fen_id].wl_bucket_indices = std::move(wl_bucket_indices[b]);
+            all_results[fen_id].d_bucket_indices = std::move(d_bucket_indices[b]);
+            all_results[fen_id].wl_log_probs = std::move(wl_log_probs[b]);
+            all_results[fen_id].d_log_probs = std::move(d_log_probs[b]);
+            total_tokens += all_results[fen_id].token_ids.size();
+        }
     }
-
-    results.resize(B_actual);
+    // After the post-loop fallback, no further reads of per-slot accumulators
+    // happen, so std::move there is safe.
 
     auto t1 = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double>(t1 - t0).count();
-    total_time += elapsed;
-    for (int b = 0; b < B_actual; b++)
-        total_tokens += results[b].token_ids.size();
+    total_time += std::chrono::duration<double>(t1 - t0).count();
 
-    return results;
+    return all_results;
 }
 
 } // namespace decoder
