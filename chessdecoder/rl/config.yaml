@@ -29,7 +29,9 @@ grpo:
 
 rollout:
   rollout_batch_size: 320
-  inference_batch_size: 25
+  # B=64 hits the throughput plateau on B200 (Phase 1 bench: tok/s flat
+  # from 64 → 256). Old value (25) left ~2× perf on the table.
+  inference_batch_size: 64
   think_temperature: 0.8
   policy_temperature: 0.8
   board_temperature: 0.0

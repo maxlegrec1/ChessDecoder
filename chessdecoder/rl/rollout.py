@@ -1,8 +1,9 @@
 """Rollout generation using the batched C++ inference engine.
 
-The batched engine runs in the main process — no subprocess workers needed.
-Before rollouts, training models are offloaded to CPU to free GPU memory.
-After rollouts, the engine is destroyed and GPU memory is reclaimed for training.
+The batched engine runs in-process. With Phase 0's pre-allocated KV cache
+and the B200's 191 GB VRAM, we keep both the training model and the
+inference engine resident simultaneously — no subprocess fork, no
+model.cpu()/model.to() shuttling, no per-step CUDA-graph rebuild.
 """
 
 from dataclasses import dataclass
@@ -34,54 +35,22 @@ class RolloutResult:
     num_tokens: int
 
 
-def _run_rollouts_subprocess(export_dir: str, fens_json_path: str, results_path: str):
-    """Subprocess entry point: create engine, run rollouts, save results to disk."""
-    import json
+def _build_engine(export_dir: str, config: GRPOConfig, batch_size: int):
+    """Construct a fresh ThinkingBatchedInferenceEngine and apply temperatures."""
     import _decoder_inference_cpp as cpp
-
-    with open(fens_json_path) as f:
-        data = json.load(f)
-    all_fens = data["fens"]
-    ibs = data["inference_batch_size"]
-    think_temp = data["think_temperature"]
-    policy_temp = data["policy_temperature"]
-    board_temp = data["board_temperature"]
-    wl_temp = data.get("wl_temperature", 0.0)
-    d_temp = data.get("d_temperature", 0.0)
-
     engine = cpp.ThinkingBatchedInferenceEngine(
         str(Path(export_dir) / "backbone.pt"),
         str(Path(export_dir) / "weights"),
         str(Path(export_dir) / "vocab.json"),
         str(Path(export_dir) / "config.json"),
-        ibs,
+        batch_size,
     )
-    engine.think_temperature = think_temp
-    engine.policy_temperature = policy_temp
-    engine.board_temperature = board_temp
-    engine.wl_temperature = wl_temp
-    engine.d_temperature = d_temp
-
-    all_results = []
-    for start in range(0, len(all_fens), ibs):
-        chunk = all_fens[start:start + ibs]
-        raw = engine.predict_moves(chunk, think_temp)
-        for r in raw:
-            all_results.append({
-                "move": r.move,
-                "token_ids": list(r.token_ids),
-                "wl_entries": list(r.wl_entries),
-                "d_entries": list(r.d_entries),
-                "move_log_probs": list(r.move_log_probs),
-                "wl_bucket_indices": list(r.wl_bucket_indices),
-                "d_bucket_indices": list(r.d_bucket_indices),
-                "wl_log_probs": list(r.wl_log_probs),
-                "d_log_probs": list(r.d_log_probs),
-            })
-        print(f"  [rollout] {start + len(chunk)}/{len(all_fens)} done", flush=True)
-
-    with open(results_path, "w") as f:
-        json.dump(all_results, f)
+    engine.think_temperature = config.think_temperature
+    engine.policy_temperature = config.policy_temperature
+    engine.board_temperature = config.board_temperature
+    engine.wl_temperature = config.wl_temperature
+    engine.d_temperature = config.d_temperature
+    return engine
 
 
 def generate_rollouts(
@@ -89,11 +58,7 @@ def generate_rollouts(
     fens: list[str],
     config: GRPOConfig,
 ) -> list[list[RolloutResult]]:
-    """Generate G rollouts per FEN using the batched C++ engine in a subprocess.
-
-    Runs the engine in a subprocess for complete GPU memory isolation —
-    libtorch's CUDA allocator retains internal references that survive
-    Python-side cleanup, so only process termination fully frees GPU memory.
+    """Generate G rollouts per FEN using the batched C++ engine in-process.
 
     Args:
         export_dir: path to exported TorchScript model.
@@ -103,59 +68,38 @@ def generate_rollouts(
     Returns:
         Nested list [B][G] of RolloutResults.
     """
-    import json
-    import os
-    import subprocess
-    import sys
-    import tempfile
-
     G = config.group_size
+    ibs = config.inference_batch_size
 
     # Flatten FEN×G
     all_fens = [fen for fen in fens for _ in range(G)]
 
-    # Write input data
-    tmp_dir = Path(tempfile.mkdtemp(prefix="rollout_"))
-    fens_path = tmp_dir / "fens.json"
-    results_path = tmp_dir / "results.json"
-
-    with open(fens_path, "w") as f:
-        json.dump({
-            "fens": all_fens,
-            "inference_batch_size": config.inference_batch_size,
-            "think_temperature": config.think_temperature,
-            "policy_temperature": config.policy_temperature,
-            "board_temperature": config.board_temperature,
-            "wl_temperature": config.wl_temperature,
-            "d_temperature": config.d_temperature,
-        }, f)
-
-    # Run in subprocess with expandable_segments to avoid CUDA fragmentation.
-    # Inherits CUDA_VISIBLE_DEVICES from parent so subprocess uses the same GPU.
-    env = os.environ.copy()
-    # PYTORCH_ALLOC_CONF is the new name (PyTorch 2.5+); keep the old one for
-    # backwards compat with older torch builds. Setting both avoids the
-    # "PYTORCH_CUDA_ALLOC_CONF is deprecated" warning on newer versions.
-    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-    proc = subprocess.run(
-        [sys.executable, "-m", "chessdecoder.rl.rollout",
-         str(export_dir), str(fens_path), str(results_path)],
-        capture_output=False,
-        timeout=1800,
-        env=env,
-    )
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"Rollout subprocess failed with code {proc.returncode}")
-
-    # Read results
-    with open(results_path) as f:
-        raw_results = json.load(f)
-
-    # Clean up
-    import shutil
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    engine = _build_engine(export_dir, config, ibs)
+    raw_results = []
+    try:
+        for start in range(0, len(all_fens), ibs):
+            chunk = all_fens[start:start + ibs]
+            raw = engine.predict_moves(chunk, config.think_temperature)
+            for r in raw:
+                raw_results.append({
+                    "move": r.move,
+                    "token_ids": list(r.token_ids),
+                    "wl_entries": list(r.wl_entries),
+                    "d_entries": list(r.d_entries),
+                    "move_log_probs": list(r.move_log_probs),
+                    "wl_bucket_indices": list(r.wl_bucket_indices),
+                    "d_bucket_indices": list(r.d_bucket_indices),
+                    "wl_log_probs": list(r.wl_log_probs),
+                    "d_log_probs": list(r.d_log_probs),
+                })
+            print(f"  [rollout] {start + len(chunk)}/{len(all_fens)} done", flush=True)
+    finally:
+        # Drop the engine — caller may want the GPU back for training even
+        # though Phase 0's pre-allocated KV makes the footprint stable. With
+        # B200 + Phase 3 training co-resident, this could be persisted across
+        # outer steps; left as a future optimization (Phase 3.1 update_weights).
+        del engine
+        torch.cuda.empty_cache()
 
     # Convert to RolloutResults and reshape [B][G]
     all_results = []
@@ -281,5 +225,8 @@ if __name__ == "__main__":
         # python chessdecoder/rl/rollout.py --export <ckpt> <cfg> <export_dir>
         _run_export_subprocess(argv[1], argv[2], argv[3])
     else:
-        # python chessdecoder/rl/rollout.py <export_dir> <fens_json> <results_json>
-        _run_rollouts_subprocess(argv[0], argv[1], argv[2])
+        raise SystemExit(
+            "rollout.py is no longer a rollout subprocess entry point — "
+            "rollouts run in-process via generate_rollouts(). "
+            "Use --export <ckpt> <cfg> <export_dir> for TorchScript tracing."
+        )
