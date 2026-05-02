@@ -302,12 +302,27 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
     // ---------- Helpers to run one head + argmax ----------
     // Two variants per head: one reading the CAUSAL last_h (used for
     // BOARD/AFTER_*), one reading the PREFIX last_h (used for MOVE/WL/D/FINAL).
+    //
+    // Phase K: the *_with_lp variants also compute the log-probability of
+    // the chosen index under softmax(logits/temp) for GRPO `old_log_probs`.
+    using IdxLp = std::pair<std::vector<int32_t>, std::vector<float>>;
     auto run_head_argmax_move_vocab_prefix = [&](const __half* head_w, const __half* head_b) {
         gemm_fp16(d_th_last_h_prefix_, head_w, head_b, d_logits_buf_,
                   B, Mv, E, nullptr, 0, stream_.get());
         argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
         stream_.sync();
         return d2h_int32(d_idx_out_, B);
+    };
+    auto run_head_argmax_move_vocab_prefix_with_lp = [&](const __half* head_w,
+                                                         const __half* head_b,
+                                                         float temp) -> IdxLp {
+        gemm_fp16(d_th_last_h_prefix_, head_w, head_b, d_logits_buf_,
+                  B, Mv, E, nullptr, 0, stream_.get());
+        argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
+        log_prob_at_idx_fp16(d_logits_buf_, d_idx_out_, temp, d_lp_out_,
+                             B, Mv, stream_.get());
+        stream_.sync();
+        return {d2h_int32(d_idx_out_, B), d2h_fp32(d_lp_out_, B)};
     };
     auto run_head_argmax_board_vocab_causal = [&]() {
         gemm_fp16(d_th_last_h_, w_.board_head_w, w_.board_head_b, d_logits_buf_,
@@ -326,6 +341,20 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
         stream_.sync();
         return d2h_int32(d_idx_out_, B);
+    };
+    auto run_value_head_argmax_prefix_with_lp = [&](const __half* w1_w, const __half* w1_b,
+                                                    const __half* w2_w, const __half* w2_b,
+                                                    float temp) -> IdxLp {
+        gemm_fp16(d_th_last_h_prefix_, w1_w, w1_b, d_logits_buf_,
+                  B, H, E, nullptr, 0, stream_.get());
+        mish_inplace_fp16(d_logits_buf_, B * H, stream_.get());
+        gemm_fp16(d_logits_buf_, w2_w, w2_b, d_logits_buf_ + B * H,
+                  B, Kb, H, nullptr, 0, stream_.get());
+        argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
+        log_prob_at_idx_fp16(d_logits_buf_ + B * H, d_idx_out_, temp, d_lp_out_,
+                             B, Kb, stream_.get());
+        stream_.sync();
+        return {d2h_int32(d_idx_out_, B), d2h_fp32(d_lp_out_, B)};
     };
 
     // ---------- Prefix re-prefill helper (E.5 quality path) ----------
@@ -467,8 +496,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
             std::vector<int32_t> gp(B, -1);  // last position
             run_prefix_prefill_and_gather(gp);
         }
-        auto move_sub_h = run_head_argmax_move_vocab_prefix(
-            w_.thinking_policy_head_w, w_.thinking_policy_head_b);
+        auto [move_sub_h, move_lp_h] = run_head_argmax_move_vocab_prefix_with_lp(
+            w_.thinking_policy_head_w, w_.thinking_policy_head_b, think_t_);
 
         // For active*in_variation slots: append the sampled move, then
         // forward_decode it to advance the cache and get hidden at move pos.
@@ -480,8 +509,15 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
             if (active[b] && in_variation[b]) {
                 int sub = move_sub_h[b];
                 int full = move_sub_to_full[sub];
+                int move_pos = (int)token_ids[b].size();
                 token_ids[b].push_back(full);
                 block_ids[b].push_back(orphan_ctr[b]++);
+                int fid = slot_to_fen[b];
+                if (fid >= 0) {
+                    auto& r = all_results[fid];
+                    r.move_positions.push_back(move_pos);
+                    r.move_log_probs.push_back(move_lp_h[b]);
+                }
                 step_ids_v[b] = full;
                 act_in_var[b] = 1;
             }
@@ -499,8 +535,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
             }
             run_prefix_prefill_and_gather(gp);
         }
-        auto wl_idx_h = run_value_head_argmax_prefix(w_.wl_w1_w, w_.wl_w1_b,
-                                                     w_.wl_w2_w, w_.wl_w2_b);
+        auto [wl_idx_h, wl_lp_h] = run_value_head_argmax_prefix_with_lp(
+            w_.wl_w1_w, w_.wl_w1_b, w_.wl_w2_w, w_.wl_w2_b, wl_t_);
         // Append wl_value placeholder + record entry, then forward_decode w/ fourier(wl).
         std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
         zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
@@ -517,6 +553,7 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     r.wl_positions.push_back(wl_pos_idx);
                     r.wl_indices.push_back(wl_idx_h[b]);
                     r.wl_values.push_back(wl_centers_h[wl_idx_h[b]]);
+                    r.wl_log_probs.push_back(wl_lp_h[b]);
                 }
                 step_ids_v[b] = wl_value_idx;
                 step_wl_pos[b] = 1;
@@ -537,8 +574,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
             }
             run_prefix_prefill_and_gather(gp);
         }
-        auto d_idx_h = run_value_head_argmax_prefix(w_.d_w1_w, w_.d_w1_b,
-                                                    w_.d_w2_w, w_.d_w2_b);
+        auto [d_idx_h, d_lp_h] = run_value_head_argmax_prefix_with_lp(
+            w_.d_w1_w, w_.d_w1_b, w_.d_w2_w, w_.d_w2_b, d_t_);
         std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
         zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
         zero_half(step_wl_val); zero_half(step_d_val);
@@ -554,6 +591,7 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     r.d_positions.push_back(d_pos_idx);
                     r.d_indices.push_back(d_idx_h[b]);
                     r.d_values.push_back(d_centers_h[d_idx_h[b]]);
+                    r.d_log_probs.push_back(d_lp_h[b]);
                 }
                 step_ids_v[b] = d_value_idx;
                 step_d_pos[b] = 1;
@@ -723,14 +761,15 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                 std::vector<int32_t> gp(B, -1);
                 run_prefix_prefill_and_gather(gp);
             }
-            auto fm_sub_h = run_head_argmax_move_vocab_prefix(
-                w_.policy_head_w, w_.policy_head_b);
+            auto [fm_sub_h, fm_lp_h] = run_head_argmax_move_vocab_prefix_with_lp(
+                w_.policy_head_w, w_.policy_head_b, policy_t_);
             std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
             std::fill(act_in_var.begin(), act_in_var.end(), 0);
             for (int b = 0; b < B; ++b) {
                 if (!(ended_thinking[b] && active[b])) continue;
                 int sub = fm_sub_h[b];
                 int full = move_sub_to_full[sub];
+                int move_pos = (int)token_ids[b].size();
                 token_ids[b].push_back(full);
                 block_ids[b].push_back(orphan_ctr[b]++);
                 int fid = slot_to_fen[b];
@@ -738,6 +777,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     auto& r = all_results[fid];
                     std::string mp = vocab_->idxToToken(full);
                     r.move = decoder::DecoderVocab::pseudoToStandardUci(mp);
+                    r.move_positions.push_back(move_pos);
+                    r.move_log_probs.push_back(fm_lp_h[b]);
                 }
                 step_ids_v[b] = full;
                 act_in_var[b] = 1;
@@ -754,8 +795,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                 }
                 run_prefix_prefill_and_gather(gp);
             }
-            auto fwl_h = run_value_head_argmax_prefix(w_.wl_w1_w, w_.wl_w1_b,
-                                                      w_.wl_w2_w, w_.wl_w2_b);
+            auto [fwl_h, fwl_lp_h] = run_value_head_argmax_prefix_with_lp(
+                w_.wl_w1_w, w_.wl_w1_b, w_.wl_w2_w, w_.wl_w2_b, wl_t_);
             std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
             zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
             zero_half(step_wl_val); zero_half(step_d_val);
@@ -771,6 +812,7 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     r.wl_positions.push_back(wl_pos_idx);
                     r.wl_indices.push_back(fwl_h[b]);
                     r.wl_values.push_back(wl_centers_h[fwl_h[b]]);
+                    r.wl_log_probs.push_back(fwl_lp_h[b]);
                     r.final_wl_index = fwl_h[b];
                     r.final_wl_value = wl_centers_h[fwl_h[b]];
                 }
@@ -791,8 +833,8 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                 }
                 run_prefix_prefill_and_gather(gp);
             }
-            auto fd_h = run_value_head_argmax_prefix(w_.d_w1_w, w_.d_w1_b,
-                                                     w_.d_w2_w, w_.d_w2_b);
+            auto [fd_h, fd_lp_h] = run_value_head_argmax_prefix_with_lp(
+                w_.d_w1_w, w_.d_w1_b, w_.d_w2_w, w_.d_w2_b, d_t_);
             std::fill(step_ids_v.begin(), step_ids_v.end(), 0);
             zero_uint8(step_wl_pos); zero_uint8(step_d_pos);
             zero_half(step_wl_val); zero_half(step_d_val);
@@ -808,6 +850,7 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                     r.d_positions.push_back(d_pos_idx);
                     r.d_indices.push_back(fd_h[b]);
                     r.d_values.push_back(d_centers_h[fd_h[b]]);
+                    r.d_log_probs.push_back(fd_lp_h[b]);
                     r.final_d_index = fd_h[b];
                     r.final_d_value = d_centers_h[fd_h[b]];
                     r.ended_thinking = true;

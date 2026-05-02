@@ -16,8 +16,15 @@ struct RolloutResult {
     std::string move;
     std::vector<int32_t> token_ids;
     std::vector<int32_t> block_ids;       // matches Python ThinkingResult
-    std::vector<float> log_probs;
-    // Value bookkeeping (same as existing engine):
+    // Sampled-move bookkeeping (Phase K). Parallel arrays:
+    //   move_positions[i] is the index in token_ids where the move was placed
+    //   move_log_probs[i] is the log-prob of that sampled token under the
+    //   policy (thinking_policy_head for variation moves, policy_head for
+    //   the final move). Computed inline by log_prob_at_idx_fp16.
+    std::vector<int32_t> move_positions;
+    std::vector<float>   move_log_probs;
+    // Value bookkeeping (same as existing engine; *_log_probs are now
+    // populated parallel to *_positions).
     std::vector<int32_t> wl_positions;
     std::vector<int32_t> wl_indices;
     std::vector<float>   wl_values;

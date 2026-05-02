@@ -125,6 +125,7 @@ ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
     d_th_last_h_prefix_ = arena_.allocT<__half>(B * cfg_.embed_dim);
     d_legal_mask_= arena_.allocT<bool>(B * cfg_.move_vocab_size);
     d_idx_out_   = arena_.allocT<int32_t>(B);
+    d_lp_out_    = arena_.allocT<float>(B);
 
     d_board_sub_to_full_ = arena_.allocT<int32_t>(cfg_.board_vocab_size);
     d_move_sub_to_full_  = arena_.allocT<int32_t>(cfg_.move_vocab_size);

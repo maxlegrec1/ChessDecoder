@@ -36,7 +36,20 @@ class RolloutResult:
 
 
 def _build_engine(export_dir: str, config: GRPOConfig, batch_size: int):
-    """Construct a fresh ThinkingBatchedInferenceEngine and apply temperatures."""
+    """Construct a fresh inference engine and apply temperatures.
+
+    Set RL_ENGINE=cutlass to use the CUTLASS-based engine (35-60% faster
+    on B200). Default is the libtorch ThinkingBatchedInferenceEngine.
+    """
+    import os
+    backend = os.environ.get("RL_ENGINE", "libtorch").lower()
+
+    if backend == "cutlass":
+        import sys
+        sys.path.insert(0, "/workspace/ChessDecoder/chessdecoder/cpp/cutlass_engine/python")
+        from rl_adapter import build_engine_for_rl
+        return build_engine_for_rl(export_dir, batch_size, config)
+
     import _decoder_inference_cpp as cpp
     engine = cpp.ThinkingBatchedInferenceEngine(
         str(Path(export_dir) / "backbone.pt"),

@@ -106,6 +106,7 @@ private:
     __half*  d_logits_buf_{nullptr};    // [B, move_vocab] (head outputs)
     bool*    d_legal_mask_{nullptr};    // [B, move_vocab]
     int32_t* d_idx_out_{nullptr};       // [B] int32
+    float*   d_lp_out_{nullptr};        // [B] float — log_prob_at_idx output (Phase K)
 
     int max_init_S_{71};
 
