@@ -106,32 +106,41 @@ class MovePredictor(Protocol):
 # --------------------------------------------------------------------------
 
 
+def _build_cutlass_engine(export_dir: str, batch_size: int):
+    """Construct a CUTLASS engine via the RL adapter (libtorch shape)."""
+    import sys  # noqa: PLC0415
+    sys.path.insert(0, "/workspace/ChessDecoder/chessdecoder/cpp/cutlass_engine/python")
+    from rl_adapter import CutlassRLEngine  # noqa: PLC0415
+    eng = CutlassRLEngine(
+        backbone_pt="",  # ignored
+        weights_dir=f"{export_dir}/weights",
+        vocab_json=f"{export_dir}/vocab.json",
+        config_json=f"{export_dir}/config.json",
+        batch_size=batch_size,
+    )
+    for attr in ("board_temperature", "think_temperature",
+                 "policy_temperature", "wl_temperature", "d_temperature"):
+        setattr(eng, attr, 0.0)
+    # Ensure CUTLASS FMHA is on by default for eval — the kernel-level 30x
+    # speedup is required for the engine to compete with libtorch baseline.
+    os.environ.setdefault("USE_CUTLASS_FMHA", "1")
+    return eng
+
+
 class ThinkingBatchedEngineAdapter:
-    """Wraps `_decoder_inference_cpp.ThinkingBatchedInferenceEngine`.
+    """Batched thinking-mode adapter, backed by the CUTLASS engine.
 
     All five temperature attributes are set to 0.0 on construction
-    (greedy / argmax inference).  Converts C++ `BatchedResult` objects
-    to the unified `MoveResult`.
+    (greedy / argmax inference). Returns `MoveResult` per FEN.
 
     `optimal_batch_size` equals `batch_size` passed to the constructor —
     the CUDA-graph buffers are pre-allocated for exactly that many sequences.
-    Sending fewer FENs still works (the C++ engine pads internally) but
-    wastes GPU work.
+    Sending fewer FENs still works (the engine pads internally).
     """
 
     def __init__(self, export_dir: str, batch_size: int = 32) -> None:
-        import _decoder_inference_cpp as cpp  # noqa: PLC0415 — lazy import (GPU dep)
         self.optimal_batch_size = batch_size
-        self._engine = cpp.ThinkingBatchedInferenceEngine(
-            f"{export_dir}/backbone.pt",
-            f"{export_dir}/weights",
-            f"{export_dir}/vocab.json",
-            f"{export_dir}/config.json",
-            batch_size,
-        )
-        for attr in ("board_temperature", "think_temperature",
-                     "policy_temperature", "wl_temperature", "d_temperature"):
-            setattr(self._engine, attr, 0.0)
+        self._engine = _build_cutlass_engine(export_dir, batch_size)
 
     def predict_moves(
         self,
@@ -152,34 +161,21 @@ class ThinkingBatchedEngineAdapter:
 
 
 class ThinkingSingleEngineAdapter:
-    """Wraps `_decoder_inference_cpp.ThinkingSingleInferenceEngine`.
+    """Single-FEN adapter for sequential game-play eval, backed by CUTLASS.
 
-    Implements `predict_moves` as a sequential loop over FENs — one C++
-    `predict_move` call per FEN.  This is the engine's natural operating
-    mode; `optimal_batch_size = 1` tells callers not to bundle FENs.
-
-    Only `move` is populated in returned `MoveResult`s; token_ids etc.
-    are available via the engine's getter methods if needed.
+    Implements `predict_moves` as a single B=1 cutlass call per FEN.
+    `optimal_batch_size = 1` tells callers not to bundle FENs.
 
     Args:
-        root_only: When True, use `predict_move_root` instead of `predict_move`
-            (skips the thinking trace, uses root policy head directly).
-            Useful for ablating the effect of chain-of-thought.
+        root_only: When True, skip the thinking trace and use the root
+            policy head directly (cutlass engine.predict_moves, no-thinking
+            path). Useful for ablating chain-of-thought.
     """
 
     optimal_batch_size: int = 1
 
     def __init__(self, export_dir: str, root_only: bool = False) -> None:
-        import _decoder_inference_cpp as cpp  # noqa: PLC0415
-        self._engine = cpp.ThinkingSingleInferenceEngine(
-            f"{export_dir}/backbone.pt",
-            f"{export_dir}/weights",
-            f"{export_dir}/vocab.json",
-            f"{export_dir}/config.json",
-        )
-        for attr in ("board_temperature", "think_temperature",
-                     "policy_temperature", "wl_temperature", "d_temperature"):
-            setattr(self._engine, attr, 0.0)
+        self._engine = _build_cutlass_engine(export_dir, batch_size=1)
         self._root_only = root_only
 
     def predict_moves(
@@ -187,12 +183,18 @@ class ThinkingSingleEngineAdapter:
         fens: list[str],
         temperature: float = 0.0,
     ) -> list[MoveResult]:
-        predict = (self._engine.predict_move_root if self._root_only
-                   else self._engine.predict_move)
-        return [
-            MoveResult(move=normalize_castling(predict(f, temperature) or ""))
-            for f in fens
-        ]
+        out: list[MoveResult] = []
+        for f in fens:
+            if self._root_only:
+                # No-thinking path — use the underlying engine directly.
+                raw = self._engine._engine.predict_moves([f], temperature)
+            else:
+                raw = self._engine.predict_moves([f], temperature)
+            r = raw[0]
+            out.append(MoveResult(
+                move=normalize_castling(r.move) if r.move else "",
+            ))
+        return out
 
 
 class NonThinkingModelAdapter:

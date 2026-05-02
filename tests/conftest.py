@@ -14,9 +14,10 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="No CUDA GPU available"))
         if "cpp" in item.keywords:
             try:
-                import _decoder_inference_cpp  # noqa: F401
+                import _cutlass_decoder_cpp  # noqa: F401
             except ImportError:
-                item.add_marker(pytest.mark.skip(reason="C++ engine not built"))
+                item.add_marker(pytest.mark.skip(
+                    reason="CUTLASS engine (_cutlass_decoder_cpp) not built"))
 
 
 # ---------------------------------------------------------------------------
@@ -59,28 +60,3 @@ def tiny_model():
         num_fourier_freq=16,
     ).to("cuda").eval()
     return model
-
-
-# ---------------------------------------------------------------------------
-# C++ engines
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="session")
-def single_engine():
-    cpp = pytest.importorskip("_decoder_inference_cpp")
-    engine = cpp.ThinkingSingleInferenceEngine(
-        "exports/base/backbone.pt", "exports/base/weights",
-        "exports/base/vocab.json", "exports/base/config.json",
-    )
-    return engine
-
-
-@pytest.fixture(scope="session")
-def batched_engine():
-    cpp = pytest.importorskip("_decoder_inference_cpp")
-    engine = cpp.ThinkingBatchedInferenceEngine(
-        "exports/base/backbone.pt", "exports/base/weights",
-        "exports/base/vocab.json", "exports/base/config.json",
-        32,
-    )
-    return engine

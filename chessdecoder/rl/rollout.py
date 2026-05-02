@@ -36,40 +36,15 @@ class RolloutResult:
 
 
 def _build_engine(export_dir: str, config: GRPOConfig, batch_size: int):
-    """Construct a fresh inference engine and apply temperatures.
-
-    Default backend is the CUTLASS engine (~2.1x faster than libtorch at the
-    real RL workload, full-length rollouts on B200, measured 2026-05-02).
-    Set RL_ENGINE=libtorch to fall back to the legacy
-    ThinkingBatchedInferenceEngine — kept while the periodic-eval call sites
-    in chessdecoder/finetune/cpp_eval.py and chessdecoder/eval/engine.py
-    haven't been migrated yet (they still use _decoder_inference_cpp).
-    """
-    import os
-    # Auto-enable CUTLASS FMHA when using the CUTLASS engine (kernel-level
-    # 30x speedup on the prefix prefill — required for the 2.1x end-to-end).
-    backend = os.environ.get("RL_ENGINE", "cutlass").lower()
-    if backend == "cutlass":
-        os.environ.setdefault("USE_CUTLASS_FMHA", "1")
-        import sys
-        sys.path.insert(0, "/workspace/ChessDecoder/chessdecoder/cpp/cutlass_engine/python")
-        from rl_adapter import build_engine_for_rl
-        return build_engine_for_rl(export_dir, batch_size, config)
-
-    import _decoder_inference_cpp as cpp
-    engine = cpp.ThinkingBatchedInferenceEngine(
-        str(Path(export_dir) / "backbone.pt"),
-        str(Path(export_dir) / "weights"),
-        str(Path(export_dir) / "vocab.json"),
-        str(Path(export_dir) / "config.json"),
-        batch_size,
-    )
-    engine.think_temperature = config.think_temperature
-    engine.policy_temperature = config.policy_temperature
-    engine.board_temperature = config.board_temperature
-    engine.wl_temperature = config.wl_temperature
-    engine.d_temperature = config.d_temperature
-    return engine
+    """Construct a fresh CUTLASS inference engine and apply temperatures."""
+    import os, sys
+    # Auto-enable CUTLASS FMHA — kernel-level 30x speedup on the prefix
+    # prefill, required for the 2.1x end-to-end speedup vs the retired
+    # libtorch engine.
+    os.environ.setdefault("USE_CUTLASS_FMHA", "1")
+    sys.path.insert(0, "/workspace/ChessDecoder/chessdecoder/cpp/cutlass_engine/python")
+    from rl_adapter import build_engine_for_rl
+    return build_engine_for_rl(export_dir, batch_size, config)
 
 
 def generate_rollouts(
@@ -150,23 +125,21 @@ def generate_rollouts(
 # ---------------------------------------------------------------------------
 
 def export_model(model: torch.nn.Module, config: dict, export_dir: str | Path):
-    """Export current model weights for C++ engine consumption.
+    """Export current model weights for the CUTLASS engine.
 
-    Saves a temporary checkpoint, then runs TorchScript tracing in a subprocess
-    to guarantee complete GPU memory cleanup (libtorch retains internal references
-    that survive Python-side del/gc).
+    The cutlass engine reads raw FP16 weight blobs (no TorchScript backbone),
+    plus vocab.json + config.json. This is a thin wrapper around
+    `export_for_cutlass` that handles DDP-wrapped models and eval/train mode.
 
     Args:
         model: ChessDecoder (possibly wrapped in DDP).
         config: full config dict (must have "model" key).
-        export_dir: directory to write backbone.pt, weights/, vocab.json, config.json.
+        export_dir: directory to write weights/, vocab.json, config.json.
     """
-    import json
-    import subprocess
     import sys
-    import tempfile
 
-    from chessdecoder.export.common import export_head_weights, export_vocab, export_config
+    sys.path.insert(0, "/workspace/ChessDecoder/chessdecoder/cpp/cutlass_engine/python")
+    from export_for_cutlass import export_for_cutlass
 
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -174,78 +147,8 @@ def export_model(model: torch.nn.Module, config: dict, export_dir: str | Path):
     raw_model = model.module if hasattr(model, "module") else model
     was_training = raw_model.training
     raw_model.eval()
-
-    # Export vocab, config, and head weights (no GPU allocation needed)
-    export_vocab(export_dir)
-    export_config(config, raw_model, export_dir)
-    export_head_weights(raw_model, export_dir / "weights")
-
-    # Save model state + config to temp files for subprocess
-    tmp_ckpt = Path(tempfile.mktemp(suffix=".pt"))
-    tmp_cfg = Path(tempfile.mktemp(suffix=".json"))
-    torch.save(raw_model.state_dict(), tmp_ckpt)
-    with open(tmp_cfg, "w") as f:
-        json.dump({"config": config, "vocab_size": raw_model.tok_embedding.num_embeddings}, f)
-
-    if was_training:
-        raw_model.train()
-
-    # Run TorchScript tracing in subprocess (isolates libtorch GPU memory)
-    proc = subprocess.run(
-        [sys.executable, "-m", "chessdecoder.rl.rollout", "--export",
-         str(tmp_ckpt), str(tmp_cfg), str(export_dir)],
-        capture_output=False,
-        timeout=120,
-    )
-    tmp_ckpt.unlink(missing_ok=True)
-    tmp_cfg.unlink(missing_ok=True)
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"TorchScript export subprocess failed with code {proc.returncode}")
-
-
-def _run_export_subprocess(ckpt_path: str, cfg_path: str, export_dir: str):
-    """Subprocess entry point: load checkpoint, trace to TorchScript, save."""
-    import json
-
-    from chessdecoder.models.model import ChessDecoder
-    from chessdecoder.export.backbone_causal import from_chess_decoder
-    from chessdecoder.export.export_torchscript import export_torchscript
-
-    with open(cfg_path) as f:
-        payload = json.load(f)
-    config = payload["config"]
-    vocab_size = payload["vocab_size"]
-    mc = config["model"]
-
-    model = ChessDecoder(
-        vocab_size=vocab_size,
-        embed_dim=mc["embed_dim"],
-        num_heads=mc["num_heads"],
-        num_layers=mc["num_layers"],
-        max_seq_len=mc["max_seq_len"],
-        d_ff=mc.get("d_ff"),
-        n_buckets=mc.get("n_buckets", 100),
-        value_hidden_size=mc.get("value_hidden_size", 256),
-        num_fourier_freq=mc.get("num_fourier_freq", 128),
-        wl_sigma=mc.get("wl_sigma", 0.4),
-    )
-    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
-    backbone = from_chess_decoder(model)
-    del model
-    export_torchscript(backbone, Path(export_dir), config)
-
-
-if __name__ == "__main__":
-    import sys
-
-    argv = sys.argv[1:]
-    if argv and argv[0] == "--export":
-        # python chessdecoder/rl/rollout.py --export <ckpt> <cfg> <export_dir>
-        _run_export_subprocess(argv[1], argv[2], argv[3])
-    else:
-        raise SystemExit(
-            "rollout.py is no longer a rollout subprocess entry point — "
-            "rollouts run in-process via generate_rollouts(). "
-            "Use --export <ckpt> <cfg> <export_dir> for TorchScript tracing."
-        )
+    try:
+        export_for_cutlass(raw_model, config, export_dir)
+    finally:
+        if was_training:
+            raw_model.train()
