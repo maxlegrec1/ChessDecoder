@@ -474,6 +474,7 @@ def train():
             # 9. Single-pass GRPO update
             model.train()
             inner_step_count = 0
+            total_mb = (N + config.mini_batch_size - 1) // config.mini_batch_size
             perm = torch.randperm(N, device=device)
 
             for mb_start in range(0, N, config.mini_batch_size):
@@ -513,7 +514,8 @@ def train():
                 metrics.log_training_step(info)
 
                 if info["kl"] > config.max_kl:
-                    print_rank0(f"  Early stop: KL={info['kl']:.4f} > {config.max_kl}")
+                    print_rank0(f"  Early stop at mini-batch {inner_step_count}/{total_mb}: "
+                                f"KL={info['kl']:.4f} > {config.max_kl}")
                     break
 
             # Flush remaining gradients
