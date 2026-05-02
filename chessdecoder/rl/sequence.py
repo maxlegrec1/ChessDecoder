@@ -62,11 +62,19 @@ def parse_rollout(
 
     # Old log-probs from the C++ inference engine, aligned to the same
     # positions as thinking_move_mask / final_move_mask.
+    #
+    # The engine records `move_log_probs[(pos, lp)]` where `pos` is the
+    # *position the sampled move was placed at* (i.e., move's index in the
+    # token sequence). The masks below are set at the *predictor position*
+    # `pos - 1` (the hidden state that produced the move). Subtract 1 here
+    # so old_log_probs aligns with thinking_move_mask/final_move_mask —
+    # matches the existing convention for WL/D bucket log_probs below.
     old_log_probs = torch.zeros(max_seq_len, dtype=torch.float32)
     if move_log_probs:
         for pos, lp in move_log_probs:
-            if 0 <= pos < max_seq_len:
-                old_log_probs[pos] = lp
+            pred_pos = pos - 1
+            if 0 <= pred_pos < max_seq_len:
+                old_log_probs[pred_pos] = lp
 
     # Build WL/D lookup from entries
     wl_lookup = {pos: val for pos, val in wl_entries if pos < max_seq_len}

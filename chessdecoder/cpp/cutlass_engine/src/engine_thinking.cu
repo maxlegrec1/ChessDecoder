@@ -324,7 +324,11 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         } else {
             argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
         }
-        log_prob_at_idx_fp16(d_logits_buf_, d_idx_out_, temp, d_lp_out_,
+        // RL contract: old_log_prob is recorded under UNSCALED log_softmax
+        // (T=1), matching compute_current_log_probs in chessdecoder/rl/
+        // log_probs.py — temperature only controls sampling, not the policy
+        // distribution being optimized.
+        log_prob_at_idx_fp16(d_logits_buf_, d_idx_out_, 1.0f, d_lp_out_,
                              B, Mv, stream_.get());
         stream_.sync();
         return {d2h_int32(d_idx_out_, B), d2h_fp32(d_lp_out_, B)};
@@ -361,7 +365,9 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         } else {
             argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
         }
-        log_prob_at_idx_fp16(d_logits_buf_ + B * H, d_idx_out_, temp, d_lp_out_,
+        // See note in run_head_argmax_move_vocab_prefix_with_lp: the RL
+        // contract requires unscaled (T=1) log-prob recording.
+        log_prob_at_idx_fp16(d_logits_buf_ + B * H, d_idx_out_, 1.0f, d_lp_out_,
                              B, Kb, stream_.get());
         stream_.sync();
         return {d2h_int32(d_idx_out_, B), d2h_fp32(d_lp_out_, B)};
