@@ -38,13 +38,19 @@ class RolloutResult:
 def _build_engine(export_dir: str, config: GRPOConfig, batch_size: int):
     """Construct a fresh inference engine and apply temperatures.
 
-    Set RL_ENGINE=cutlass to use the CUTLASS-based engine (35-60% faster
-    on B200). Default is the libtorch ThinkingBatchedInferenceEngine.
+    Default backend is the CUTLASS engine (~2.1x faster than libtorch at the
+    real RL workload, full-length rollouts on B200, measured 2026-05-02).
+    Set RL_ENGINE=libtorch to fall back to the legacy
+    ThinkingBatchedInferenceEngine — kept while the periodic-eval call sites
+    in chessdecoder/finetune/cpp_eval.py and chessdecoder/eval/engine.py
+    haven't been migrated yet (they still use _decoder_inference_cpp).
     """
     import os
-    backend = os.environ.get("RL_ENGINE", "libtorch").lower()
-
+    # Auto-enable CUTLASS FMHA when using the CUTLASS engine (kernel-level
+    # 30x speedup on the prefix prefill — required for the 2.1x end-to-end).
+    backend = os.environ.get("RL_ENGINE", "cutlass").lower()
     if backend == "cutlass":
+        os.environ.setdefault("USE_CUTLASS_FMHA", "1")
         import sys
         sys.path.insert(0, "/workspace/ChessDecoder/chessdecoder/cpp/cutlass_engine/python")
         from rl_adapter import build_engine_for_rl
