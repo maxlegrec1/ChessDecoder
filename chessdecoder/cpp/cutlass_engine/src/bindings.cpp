@@ -121,6 +121,30 @@ void fmha_prefill_dispatch(std::uintptr_t Q, std::uintptr_t K, std::uintptr_t V,
     cudaDeviceSynchronize();
 }
 
+void fmha_prefill_cutlass_causal(std::uintptr_t Q, std::uintptr_t K, std::uintptr_t V,
+                                 std::uintptr_t O, int B, int S, int NH, int HD,
+                                 float scale, std::uintptr_t workspace,
+                                 std::uintptr_t lse_buf) {
+    cutlass_engine::fmha_prefill_cutlass_causal(
+        reinterpret_cast<const __half*>(Q),
+        reinterpret_cast<const __half*>(K),
+        reinterpret_cast<const __half*>(V),
+        reinterpret_cast<__half*>(O),
+        B, S, NH, HD, scale,
+        reinterpret_cast<void*>(workspace),
+        reinterpret_cast<void*>(lse_buf),
+        /*stream=*/0);
+    cudaDeviceSynchronize();
+}
+
+std::size_t fmha_prefill_cutlass_workspace_bytes(int B, int S, int NH, int HD) {
+    return cutlass_engine::fmha_prefill_cutlass_workspace_bytes(B, S, NH, HD);
+}
+
+std::size_t fmha_prefill_cutlass_lse_elements(int B, int S, int NH) {
+    return cutlass_engine::fmha_prefill_cutlass_lse_elements(B, S, NH);
+}
+
 }  // namespace test_api
 
 PYBIND11_MODULE(_cutlass_decoder_cpp, m) {
@@ -218,4 +242,14 @@ PYBIND11_MODULE(_cutlass_decoder_cpp, m) {
                 py::arg("block_id"), py::arg("active"), py::arg("O"),
                 py::arg("B"), py::arg("S"), py::arg("NH"), py::arg("HD"),
                 py::arg("scale"));
+    kernels.def("fmha_prefill_cutlass_causal", &test_api::fmha_prefill_cutlass_causal,
+                py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"),
+                py::arg("B"), py::arg("S"), py::arg("NH"), py::arg("HD"),
+                py::arg("scale"), py::arg("workspace"), py::arg("lse_buf"));
+    kernels.def("fmha_prefill_cutlass_workspace_bytes",
+                &test_api::fmha_prefill_cutlass_workspace_bytes,
+                py::arg("B"), py::arg("S"), py::arg("NH"), py::arg("HD"));
+    kernels.def("fmha_prefill_cutlass_lse_elements",
+                &test_api::fmha_prefill_cutlass_lse_elements,
+                py::arg("B"), py::arg("S"), py::arg("NH"));
 }

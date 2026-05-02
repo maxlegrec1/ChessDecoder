@@ -191,6 +191,18 @@ void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
                            int B, int S, int NH, int HD,
                            float scale, cudaStream_t stream);
 
+// CUTLASS Blackwell FMHA (sm_100a, TMA + tensor cores). Causal mask only in
+// J.2; block-aware mask is a follow-up. Caller must allocate workspace and
+// LSE buffer of the sizes returned below.
+void fmha_prefill_cutlass_causal(const __half* Q, const __half* K, const __half* V,
+                                 __half* O,
+                                 int B, int S, int NH, int HD, float scale,
+                                 void* workspace, void* lse_buf,
+                                 cudaStream_t stream);
+
+std::size_t fmha_prefill_cutlass_workspace_bytes(int B, int S, int NH, int HD);
+std::size_t fmha_prefill_cutlass_lse_elements(int B, int S, int NH);
+
 // ---------- Misc ----------
 
 // out[b] = centers[idx[b]]. centers FP32, idx int32, out FP32.

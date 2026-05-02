@@ -23,6 +23,10 @@ NVCC = str(CUDA_ROOT / "bin" / "nvcc")
 CUTLASS_ROOT = CPP_ROOT / "third_party" / "cutlass"
 CUTLASS_INCLUDE = CUTLASS_ROOT / "include"
 CUTLASS_TOOLS_INCLUDE = CUTLASS_ROOT / "tools" / "util" / "include"
+# Example 77 (Blackwell FMHA) headers — the device/, kernel/, collective/
+# subdirs aren't on the standard CUTLASS include path, so we add the example
+# root and use relative includes (#include "device/fmha.hpp" etc.).
+CUTLASS_FMHA_EXAMPLE_INCLUDE = CUTLASS_ROOT / "examples" / "77_blackwell_fmha"
 
 ARCH = os.environ.get("CUTLASS_ENGINE_ARCH", "sm_100a")
 
@@ -45,6 +49,7 @@ CU_SOURCES = [
     _src("kernels/kv_write.cu"),
     _src("kernels/fmha_decode.cu"),
     _src("kernels/fmha_prefill.cu"),
+    _src("kernels/fmha_prefill_cutlass.cu"),
     _src("kernels/misc.cu"),
     _src("layers/attention_block.cu"),
     _src("layers/mlp_block.cu"),
@@ -129,6 +134,7 @@ ext = Extension(
         str(ROOT / "include"),
         str(CUTLASS_INCLUDE),
         str(CUTLASS_TOOLS_INCLUDE),
+        str(CUTLASS_FMHA_EXAMPLE_INCLUDE),
         str(CPP_ROOT / "decoder"),               # for vocab.hpp
         str(CPP_ROOT / "chess-library/include"), # for chess.hpp (header-only)
         str(CUDA_ROOT / "include"),
