@@ -29,9 +29,11 @@ grpo:
 
 rollout:
   rollout_batch_size: 320
-  # B=64 hits the throughput plateau on B200 (Phase 1 bench: tok/s flat
-  # from 64 → 256). Old value (25) left ~2× perf on the table.
-  inference_batch_size: 64
+  # CUTLASS engine bench on B200: B=64 → 10.12 FEN/s, B=128 → 12.27, B=160
+  # → 14.22, B≥176 hangs (cuBLAS/allocator regime change above the cliff).
+  # B=160 is the empirical max; arena uses ~55 GB / 67 GB reserved at B=160,
+  # plenty of headroom for training to coexist after engine teardown.
+  inference_batch_size: 160
   think_temperature: 0.8
   policy_temperature: 0.8
   board_temperature: 0.0
