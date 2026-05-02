@@ -70,9 +70,9 @@ CPP_SOURCES = [
     _src("weights.cpp"),
     _src("config.cpp"),
     _src("bindings.cpp"),
-    # Reuse the existing vocab loader (no libtorch dep — depends only on
-    # the header-only chess-library).
-    "../decoder/vocab.cpp",
+    # Vocab loader (Phase L: copied from the retired libtorch decoder
+    # tree; depends only on the header-only chess-library).
+    _src("vocab.cpp"),
 ]
 
 
@@ -196,7 +196,7 @@ ext = Extension(
         str(CUTLASS_INCLUDE),
         str(CUTLASS_TOOLS_INCLUDE),
         str(CUTLASS_FMHA_EXAMPLE_INCLUDE),
-        str(CPP_ROOT / "decoder"),               # for vocab.hpp
+        str(ROOT / "include"),                   # for vocab.hpp
         str(CPP_ROOT / "chess-library/include"), # for chess.hpp (header-only)
         str(CUDA_ROOT / "include"),
         pybind11.get_include(),
