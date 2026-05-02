@@ -55,9 +55,10 @@ def _make_scheduler(optimizer, warmup_steps):
 class PositionStream:
     """Streams training positions from pretrain parquet files.
 
-    Each call to sample_batch() loads B positions from the current file.
-    When a file is exhausted, advances to the next one.  When all files
-    have been used, reshuffles and cycles back to the first file.
+    Drain-then-advance: each parquet file is fully consumed across as many
+    sample_batch() calls as it can serve before advancing to the next file.
+    When all files have been used, reshuffles and cycles back to the first
+    file.
     """
 
     def __init__(self, files: list[str], seed: int):
@@ -72,7 +73,8 @@ class PositionStream:
         print_rank0(f"PositionStream: {len(self._files)} parquet files (train split)")
 
     def _load_next_file(self):
-        """Load and shuffle positions from the next parquet file."""
+        """Load and shuffle positions from the next parquet file, appending
+        to the buffer."""
         import pandas as pd
         from chessdecoder.dataloader.sampling import (
             filter_standard_games, sample_one_per_game,
@@ -93,21 +95,24 @@ class PositionStream:
         sampled = sample_one_per_game(df, self._rng.randint(0, 2**31))
         sampled = sampled.sample(frac=1, random_state=self._rng.randint(0, 2**31)).reset_index(drop=True)
 
-        self._buffer = [
+        self._buffer.extend(
             {"fen": row["fen"], "best_move": normalize_castling(row["best_move"])}
             for _, row in sampled.iterrows()
-        ]
-        print_rank0(f"  PositionStream: loaded {len(self._buffer)} positions from {Path(fname).name}")
+        )
+        print_rank0(f"  PositionStream: loaded positions from {Path(fname).name}, "
+                    f"buffer now has {len(self._buffer)} positions")
 
     def sample_batch(self, batch_size: int) -> list[dict]:
-        """Load a fresh parquet file and return batch_size positions from it.
+        """Return batch_size positions, loading more files only when needed.
 
-        Every call loads a new file for maximum data diversity.
-        Remaining positions in the file are discarded.
+        Drains the current file's positions across consecutive calls before
+        loading the next file. If the buffer can't satisfy a full batch (e.g.,
+        single small file remainder), pulls in additional files until it can.
         """
-        self._load_next_file()
+        while len(self._buffer) < batch_size:
+            self._load_next_file()
         result = self._buffer[:batch_size]
-        self._buffer = []  # discard remainder — next call loads a new file
+        self._buffer = self._buffer[batch_size:]
         self._positions_served += len(result)
         return result
 
