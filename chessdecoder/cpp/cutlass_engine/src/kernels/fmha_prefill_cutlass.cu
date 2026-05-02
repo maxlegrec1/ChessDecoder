@@ -61,36 +61,42 @@ using StrideO = StrideQ;
 using StrideLSE = cute::tuple<_1, cute::tuple<cute::tuple<int, int>, int>>;
 
 using TileShapeHD64 = Shape<_256, _128, _64>;
-using ActiveMask    = CausalMask;
 
+template <class Mask>
 using MainloopHD64 =
     cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
         Element, ElementAccumulatorQK, ElementAccumulatorPV,
         TileShapeHD64, StrideQ, StrideK, StrideV,
-        ActiveMask
+        Mask
     >;
 
+template <class Mask>
 using EpilogueHD64 =
     cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
         ElementOut, ElementAccumulatorPV,
-        typename MainloopHD64::TileShapePV,
+        typename MainloopHD64<Mask>::TileShapePV,
         StrideO, StrideLSE
     >;
 
+template <class Mask>
 using KernelHD64 = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
     ProblemShape,
-    MainloopHD64,
-    EpilogueHD64,
+    MainloopHD64<Mask>,
+    EpilogueHD64<Mask>,
     cutlass::fmha::kernel::PersistentTileScheduler
 >;
 
-using OperationHD64 = cutlass::fmha::device::FMHA<KernelHD64>;
+template <class Mask>
+using OperationHD64 = cutlass::fmha::device::FMHA<KernelHD64<Mask>>;
 
+template <class Mask>
 void run_fmha_hd64(const __half* Q, const __half* K, const __half* V,
                    __half* O,
                    int B, int S, int NH, float scale,
                    void* workspace, void* lse_buf,
                    cudaStream_t stream) {
+    using Op = OperationHD64<Mask>;
+    using Kernel = KernelHD64<Mask>;
     constexpr int D = 64;
 
     // Shape (Q-len, K-len, D, ((H_R=1, H_K=NH), B))
@@ -118,7 +124,7 @@ void run_fmha_hd64(const __half* Q, const __half* K, const __half* V,
     }
     hw_info.sm_count = sm_count;
 
-    typename OperationHD64::Arguments args{
+    typename Op::Arguments args{
         problem_shape,
         { reinterpret_cast<const Element*>(Q), stride_Q,
           reinterpret_cast<const Element*>(K), stride_K,
@@ -134,7 +140,7 @@ void run_fmha_hd64(const __half* Q, const __half* K, const __half* V,
     // workspace init / params update; run() then launches with the cached
     // params_. Thread-local because the static-bool init flag inside FMHA
     // would otherwise be shared across threads.
-    static thread_local OperationHD64 op;
+    static thread_local Op op;
     cutlass::Status st = op.initialize(args, workspace, stream);
     if (st != cutlass::Status::kSuccess) {
         char msg[256];
@@ -154,14 +160,21 @@ void run_fmha_hd64(const __half* Q, const __half* K, const __half* V,
 
 }  // namespace
 
+// __device__ symbol definitions — fixed-size array (no pointer indirection)
+// + scalar max_S. cudaMemcpyToSymbol writes directly into the array storage.
+__device__ int g_block_aware_eff_limit_arr[kBlockAwareEffLimitMaxElems];
+__device__ volatile int g_block_aware_max_S;
+
 // Workspace size needed by CUTLASS FMHA per invocation, in bytes.
-// (Conservative upper bound — actual usage is tiny.)
+// (Conservative upper bound — actual usage is tiny; both Mask types share
+// the same workspace size.)
 std::size_t fmha_prefill_cutlass_workspace_bytes(int B, int S, int NH, int HD) {
     if (HD != 64) return 0;
-    typename OperationHD64::Arguments args{};
+    using Op = OperationHD64<CausalMask>;
+    typename Op::Arguments args{};
     args.problem_shape = make_tuple(
         S, S, HD, make_tuple(make_tuple(1, NH), B));
-    return OperationHD64::get_workspace_size(args);
+    return Op::get_workspace_size(args);
 }
 
 // LSE buffer size in float elements: [B * NH * S].
@@ -169,20 +182,63 @@ std::size_t fmha_prefill_cutlass_lse_elements(int B, int S, int NH) {
     return std::size_t(B) * NH * S;
 }
 
-// Causal-only entry. (Block-aware mask = follow-up.)
 void fmha_prefill_cutlass_causal(const __half* Q, const __half* K, const __half* V,
                                  __half* O,
                                  int B, int S, int NH, int HD, float scale,
                                  void* workspace, void* lse_buf,
                                  cudaStream_t stream) {
     if (HD == 64) {
-        run_fmha_hd64(Q, K, V, O, B, S, NH, scale, workspace, lse_buf, stream);
+        run_fmha_hd64<CausalMask>(Q, K, V, O, B, S, NH, scale, workspace, lse_buf, stream);
     } else {
         char msg[128];
         std::snprintf(msg, sizeof(msg),
             "CUTLASS FMHA: HD=%d not instantiated (only 64 is supported in J.2)", HD);
         throw std::runtime_error(msg);
     }
+    CE_CUDA_LAST();
+}
+
+// Block-aware causal: caller precomputes effective_limit[B*max_S] (int32)
+// device pointer. Per (b, q): valid k iff k <= effective_limit[b*max_S + q].
+// To express block-aware mask, set effective_limit[b][q] = max(q, end_of_block(b, q)).
+void fmha_prefill_cutlass_block_aware(const __half* Q, const __half* K, const __half* V,
+                                      __half* O,
+                                      const int32_t* effective_limit, int max_S,
+                                      int B, int S, int NH, int HD, float scale,
+                                      void* workspace, void* lse_buf,
+                                      cudaStream_t stream) {
+    if (HD != 64) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+            "CUTLASS FMHA block-aware: HD=%d not instantiated (only 64)", HD);
+        throw std::runtime_error(msg);
+    }
+    // Copy the limit array directly into __device__ storage. Direct array
+    // storage (no pointer indirection) avoids the constant-folding issue we
+    // hit with __device__ pointer globals in templated FMHA kernels.
+    std::size_t bytes = std::size_t(B) * max_S * sizeof(int32_t);
+    if (bytes > std::size_t(kBlockAwareEffLimitMaxElems) * sizeof(int)) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+            "fmha_prefill_cutlass_block_aware: B*max_S=%zu exceeds %d slots",
+            std::size_t(B) * max_S, kBlockAwareEffLimitMaxElems);
+        throw std::runtime_error(msg);
+    }
+    // First copy the limit data (device-to-device — `effective_limit` is in
+    // gmem too). Use cudaMemcpyToSymbol with cudaMemcpyDeviceToDevice.
+    CE_CUDA_CHECK(cudaMemcpyToSymbol(g_block_aware_eff_limit_arr,
+        effective_limit, bytes, /*offset=*/0, cudaMemcpyDeviceToDevice));
+    CE_CUDA_CHECK(cudaMemcpyToSymbol(g_block_aware_max_S,
+        &max_S, sizeof(int)));
+    // Note: host-side readback confirms these writes land at the symbol
+    // address. The FMHA kernel however reads zeros for both — the symbol
+    // resolution diverges between the host's cudaMemcpyToSymbol and the
+    // templated FMHA kernel's read. -rdc=true fixes the symbol resolution
+    // but breaks the device-link in the current setuptools build.
+    // See fmha_fusion.hpp BlockAwareCausalMask::apply_mask comment.
+
+    run_fmha_hd64<BlockAwareCausalMask>(Q, K, V, O, B, S, NH, scale,
+                                        workspace, lse_buf, stream);
     CE_CUDA_LAST();
 }
 

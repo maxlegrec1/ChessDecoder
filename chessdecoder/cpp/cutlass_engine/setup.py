@@ -131,6 +131,12 @@ ext = Extension(
     "_cutlass_decoder_cpp",
     sources=CPP_SOURCES + CU_SOURCES,
     include_dirs=[
+        # Fork dir comes BEFORE example 77 so that
+        # `#include "collective/fmha_fusion.hpp"` and
+        # `#include "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"`
+        # resolve to our patched copies (with blk_coord forwarded to apply_mask
+        # + BlockAwareCausalMask defined).
+        str(ROOT / "include" / "fmha_fork"),
         str(ROOT / "include"),
         str(CUTLASS_INCLUDE),
         str(CUTLASS_TOOLS_INCLUDE),

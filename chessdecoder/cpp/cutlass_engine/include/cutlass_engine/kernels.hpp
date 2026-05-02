@@ -191,14 +191,24 @@ void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
                            int B, int S, int NH, int HD,
                            float scale, cudaStream_t stream);
 
-// CUTLASS Blackwell FMHA (sm_100a, TMA + tensor cores). Causal mask only in
-// J.2; block-aware mask is a follow-up. Caller must allocate workspace and
-// LSE buffer of the sizes returned below.
+// CUTLASS Blackwell FMHA (sm_100a, TMA + tensor cores). Caller must allocate
+// workspace and LSE buffer of the sizes returned below.
 void fmha_prefill_cutlass_causal(const __half* Q, const __half* K, const __half* V,
                                  __half* O,
                                  int B, int S, int NH, int HD, float scale,
                                  void* workspace, void* lse_buf,
                                  cudaStream_t stream);
+
+// Block-aware causal: per (b, q), valid k iff k <= effective_limit[b*max_S+q].
+// Caller is responsible for precomputing effective_limit on the device.
+// Equivalent to "(block_id[q] == block_id[k]) || (k <= q)" when the limit is
+// set to max(q, end_of_block(q)) per token.
+void fmha_prefill_cutlass_block_aware(const __half* Q, const __half* K, const __half* V,
+                                      __half* O,
+                                      const int32_t* effective_limit, int max_S,
+                                      int B, int S, int NH, int HD, float scale,
+                                      void* workspace, void* lse_buf,
+                                      cudaStream_t stream);
 
 std::size_t fmha_prefill_cutlass_workspace_bytes(int B, int S, int NH, int HD);
 std::size_t fmha_prefill_cutlass_lse_elements(int B, int S, int NH);

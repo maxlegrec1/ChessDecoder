@@ -137,6 +137,24 @@ void fmha_prefill_cutlass_causal(std::uintptr_t Q, std::uintptr_t K, std::uintpt
     cudaDeviceSynchronize();
 }
 
+void fmha_prefill_cutlass_block_aware(std::uintptr_t Q, std::uintptr_t K, std::uintptr_t V,
+                                      std::uintptr_t O, std::uintptr_t effective_limit,
+                                      int max_S, int B, int S, int NH, int HD,
+                                      float scale, std::uintptr_t workspace,
+                                      std::uintptr_t lse_buf) {
+    cutlass_engine::fmha_prefill_cutlass_block_aware(
+        reinterpret_cast<const __half*>(Q),
+        reinterpret_cast<const __half*>(K),
+        reinterpret_cast<const __half*>(V),
+        reinterpret_cast<__half*>(O),
+        reinterpret_cast<const std::int32_t*>(effective_limit),
+        max_S, B, S, NH, HD, scale,
+        reinterpret_cast<void*>(workspace),
+        reinterpret_cast<void*>(lse_buf),
+        /*stream=*/0);
+    cudaDeviceSynchronize();
+}
+
 std::size_t fmha_prefill_cutlass_workspace_bytes(int B, int S, int NH, int HD) {
     return cutlass_engine::fmha_prefill_cutlass_workspace_bytes(B, S, NH, HD);
 }
@@ -244,6 +262,12 @@ PYBIND11_MODULE(_cutlass_decoder_cpp, m) {
                 py::arg("scale"));
     kernels.def("fmha_prefill_cutlass_causal", &test_api::fmha_prefill_cutlass_causal,
                 py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"),
+                py::arg("B"), py::arg("S"), py::arg("NH"), py::arg("HD"),
+                py::arg("scale"), py::arg("workspace"), py::arg("lse_buf"));
+    kernels.def("fmha_prefill_cutlass_block_aware",
+                &test_api::fmha_prefill_cutlass_block_aware,
+                py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"),
+                py::arg("effective_limit"), py::arg("max_S"),
                 py::arg("B"), py::arg("S"), py::arg("NH"), py::arg("HD"),
                 py::arg("scale"), py::arg("workspace"), py::arg("lse_buf"));
     kernels.def("fmha_prefill_cutlass_workspace_bytes",
