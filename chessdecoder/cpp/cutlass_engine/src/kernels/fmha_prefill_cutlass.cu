@@ -159,11 +159,18 @@ void run_fmha_hd64(const __half* Q, const __half* K, const __half* V,
 }
 
 }  // namespace
+}  // namespace cutlass_engine
 
-// __device__ symbol definitions — fixed-size array (no pointer indirection)
-// + scalar max_S. cudaMemcpyToSymbol writes directly into the array storage.
+// __device__ symbol definitions — at GLOBAL scope so the linker symbol matches
+// the unmangled `g_block_aware_*` references emitted by the FMHA kernel
+// (declared in fmha_fork/collective/fmha_fusion.hpp also at global scope).
+// Initially these were inside `namespace cutlass_engine { ... }` and got
+// mangled as `_ZN14cutlass_engine27g_block_aware_eff_limit_arrE`, so nvlink
+// reported them as undefined references against the unmangled names.
 __device__ int g_block_aware_eff_limit_arr[kBlockAwareEffLimitMaxElems];
 __device__ volatile int g_block_aware_max_S;
+
+namespace cutlass_engine {
 
 // Workspace size needed by CUTLASS FMHA per invocation, in bytes.
 // (Conservative upper bound — actual usage is tiny; both Mask types share

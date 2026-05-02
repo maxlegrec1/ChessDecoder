@@ -95,7 +95,54 @@ class build_ext(_build_ext):
                 original_compile(obj, src, ext, cc_args, extra_postargs, pp_opts)
 
         self.compiler._compile = _compile
+
+        # Replace the link step with `nvcc -shared`. With -rdc=true on the
+        # compile side, the .o files contain unresolved device symbols that
+        # only nvcc -shared knows how to device-link. g++ would emit a .so
+        # missing __cudaRegisterLinkedBinary_* and crash at import time.
+        original_link = self.compiler.link
+
+        def link(target_desc, objects, output_filename, output_dir=None,
+                 libraries=None, library_dirs=None, runtime_library_dirs=None,
+                 export_symbols=None, debug=0, extra_preargs=None,
+                 extra_postargs=None, build_temp=None, target_lang=None):
+            self._nvcc_link(objects, output_filename, libraries or [],
+                            library_dirs or [], runtime_library_dirs or [],
+                            extra_postargs or [])
+
+        self.compiler.link = link
         super().build_extensions()
+
+    def _nvcc_link(self, objects, output_filename, libraries, library_dirs,
+                   runtime_library_dirs, extra_postargs):
+        Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
+        nvcc_cmd = [
+            NVCC,
+            "-shared",
+            f"-arch={ARCH}",
+            "-o", output_filename,
+            *objects,
+            "-Xcompiler", "-fPIC",
+            "-Xcompiler", "-fvisibility=hidden",
+        ]
+        for lib_dir in library_dirs:
+            nvcc_cmd += [f"-L{lib_dir}"]
+        for lib in libraries:
+            nvcc_cmd += [f"-l{lib}"]
+        for rpath in runtime_library_dirs:
+            nvcc_cmd += ["-Xlinker", f"-rpath,{rpath}"]
+        # Forward any caller-supplied extra link args. Translate -Wl,-rpath,X
+        # into nvcc-native form (-Xlinker -rpath -Xlinker X). -Xcompiler -Wl
+        # gets re-split by gcc's tokenizer and breaks.
+        for arg in extra_postargs:
+            if arg.startswith("-Wl,"):
+                # Each comma-separated piece becomes a -Xlinker arg.
+                for piece in arg[len("-Wl,"):].split(","):
+                    nvcc_cmd += ["-Xlinker", piece]
+            else:
+                nvcc_cmd.append(arg)
+        print(" ".join(nvcc_cmd), flush=True)
+        subprocess.check_call(nvcc_cmd)
 
     def _nvcc_compile(self, obj, src, cc_args, extra_postargs, pp_opts):
         # Filter cc-only flags from extra_postargs (we keep our own list).
@@ -109,10 +156,17 @@ class build_ext(_build_ext):
             "-std=c++17",
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
+            # -rdc=true: relocatable device code. Without this, __device__
+            # globals can have separate addresses per template instantiation
+            # (J.3 BlockAwareCausalMask hit this). Pairs with nvcc -shared in
+            # the link step which performs device linking.
+            "-rdc=true",
             "-Xcompiler",
             "-fPIC",
-            "-Xcompiler",
-            "-fvisibility=hidden",
+            # Note: -fvisibility=hidden was previously here. Removed because
+            # with -rdc=true it caused nvlink to see __device__ globals as
+            # undefined references in the same .o (they were emitted with
+            # hidden visibility and the device linker couldn't pair them).
             "-DCUTLASS_NVCC_ARCHS=100a",
         ]
         if DEBUG:
