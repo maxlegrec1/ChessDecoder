@@ -148,6 +148,21 @@ void gemm_fp16_out_fp32(const __half* A, const __half* B_w, const __half* bias,
                         void* workspace, std::size_t workspace_bytes,
                         cudaStream_t stream);
 
+// CUTLASS-backed FP16 GEMM (alternative implementation, env-var selected via
+// USE_CUTLASS_GEMM=1 inside gemm_fp16). Exposed directly for callers that
+// want fused-residual without going through the env switch.
+void gemm_fp16_cutlass(const __half* A, const __half* B_w, const __half* bias,
+                       __half* D, int M, int N, int K,
+                       cudaStream_t stream);
+
+// D[M,N] = A @ B_w^T + residual[M,N]. Single-pass fused epilogue.
+// Equivalent to gemm_fp16(...) followed by elementwise D += residual, but
+// the residual read happens inside the GEMM epilogue (one pass).
+void gemm_fp16_cutlass_residual(const __half* A, const __half* B_w,
+                                const __half* residual,
+                                __half* D, int M, int N, int K,
+                                cudaStream_t stream);
+
 // ---------- FlashAttention ----------
 //
 // Decode (S_q = 1). Q [B, NH, HD]. K/V cache [num_layers, B, NH, max_seq, HD].

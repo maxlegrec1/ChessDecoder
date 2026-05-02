@@ -3,6 +3,8 @@
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 // FP16 GEMM wrapper.
@@ -57,10 +59,32 @@ std::size_t gemm_fp16_workspace_bytes(int /*M*/, int /*N*/, int /*K*/) {
     return 0;
 }
 
+namespace {
+// Check USE_CUTLASS_GEMM=1 once. Cached because env reads are not free.
+bool use_cutlass_backend() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = std::getenv("USE_CUTLASS_GEMM");
+        cached = (v && v[0] == '1') ? 1 : 0;
+        std::fprintf(stderr, "[cutlass_engine] gemm backend: %s\n",
+                     cached ? "CUTLASS" : "cuBLAS");
+    }
+    return cached == 1;
+}
+}  // namespace
+
 void gemm_fp16(const __half* A, const __half* B_w, const __half* bias,
                __half* C, int M, int N, int K,
                void* /*workspace*/, std::size_t /*workspace_bytes*/,
                cudaStream_t stream) {
+    // CUTLASS backend requires alignment 8 on N and K (8-half = 16B vector
+    // loads). Head GEMMs (N=1924 policy, N=41 board, etc.) don't fit; fall
+    // back to cuBLAS for those. Transformer block GEMMs all qualify
+    // (N ∈ {3072, 1024}, K ∈ {1024, 1536}).
+    if (use_cutlass_backend() && (N % 8 == 0) && (K % 8 == 0)) {
+        gemm_fp16_cutlass(A, B_w, bias, C, M, N, K, stream);
+        return;
+    }
     // We compute C[M,N] = A[M,K] @ B_w[N,K]^T, row-major.
     // cuBLAS is column-major, so we issue the equivalent
     //   C^T[N,M] = (B_w[N,K])  @  (A[M,K])^T

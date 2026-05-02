@@ -57,6 +57,7 @@ CU_SOURCES = [
     _src("engine_thinking.cu"),
     _src("allocator.cu"),
     _src("gemm.cu"),
+    _src("gemm_cutlass.cu"),
 ]
 
 CPP_SOURCES = [
