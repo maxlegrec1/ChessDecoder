@@ -145,26 +145,22 @@ __global__ void fmha_prefill_tiled_kernel(
 
 }  // namespace
 
-namespace {
-// USE_CUTLASS_FMHA=1 routes prefix prefill through the CUTLASS Blackwell
-// FMHA (TMA + tensor cores). Cached on first call; logged once.
-bool use_cutlass_fmha() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char* v = std::getenv("USE_CUTLASS_FMHA");
-        cached = (v && v[0] == '1') ? 1 : 0;
-        std::fprintf(stderr, "[cutlass_engine] fmha_prefill backend: %s\n",
-                     cached ? "CUTLASS" : "hand-rolled");
-    }
-    return cached == 1;
-}
-}  // namespace
-
+// fmha_prefill backend policy:
+//   HD == 64  → CUTLASS Blackwell FMHA (TMA + tensor cores). The production
+//               model has head_dim = 64 (embed_dim 1024 / num_heads 16), so
+//               this is what RL/eval/finetune always hit.
+//   HD != 64  → hand-rolled tiled kernel. Only exercised by small-model unit
+//               tests (e.g. test_thinking_parity_small_model uses HD=32).
+//               The CUTLASS wrapper is HD=64-only at the moment.
+//
+// There used to be a USE_CUTLASS_FMHA env var to gate this. It was removed
+// because the hand-rolled path is materially slower at HD=64 and benches
+// kept reaching for it by accident.
 void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
                            const int32_t* block_id, const int32_t* active,
                            __half* O, int B, int S, int NH, int HD,
                            float scale, cudaStream_t stream) {
-    if (use_cutlass_fmha() && HD == 64) {
+    if (HD == 64) {
         // Allocate scratch on stream (workspace + lse + eff_limit).
         std::size_t ws_bytes = fmha_prefill_cutlass_workspace_bytes(B, S, NH, HD);
         std::size_t lse_elems = fmha_prefill_cutlass_lse_elements(B, S, NH);
@@ -202,6 +198,7 @@ void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
         return;
     }
 
+    // HD != 64: hand-rolled tiled fallback.
     constexpr int T_Q = 64;
     constexpr int T_K = 64;
     int n_q_tiles = (S + T_Q - 1) / T_Q;
@@ -210,9 +207,6 @@ void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
 
     if (HD == 32) {
         fmha_prefill_tiled_kernel<32, T_Q, T_K><<<grid, block, 0, stream>>>(
-            Q, K, V, block_id, active, O, B, S, NH, scale);
-    } else if (HD == 64) {
-        fmha_prefill_tiled_kernel<64, T_Q, T_K><<<grid, block, 0, stream>>>(
             Q, K, V, block_id, active, O, B, S, NH, scale);
     } else if (HD == 128) {
         fmha_prefill_tiled_kernel<128, T_Q, T_K><<<grid, block, 0, stream>>>(

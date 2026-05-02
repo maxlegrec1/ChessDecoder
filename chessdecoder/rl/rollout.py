@@ -37,11 +37,7 @@ class RolloutResult:
 
 def _build_engine(export_dir: str, config: GRPOConfig, batch_size: int):
     """Construct a fresh CUTLASS inference engine and apply temperatures."""
-    import os, sys
-    # Auto-enable CUTLASS FMHA — kernel-level 30x speedup on the prefix
-    # prefill, required for the 2.1x end-to-end speedup vs the retired
-    # libtorch engine.
-    os.environ.setdefault("USE_CUTLASS_FMHA", "1")
+    import sys
     sys.path.insert(0, "/workspace/ChessDecoder/chessdecoder/cpp/cutlass_engine/python")
     from rl_adapter import build_engine_for_rl
     return build_engine_for_rl(export_dir, batch_size, config)

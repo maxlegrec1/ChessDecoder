@@ -39,7 +39,6 @@ Usage
 
 from __future__ import annotations
 
-import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -121,9 +120,6 @@ def _build_cutlass_engine(export_dir: str, batch_size: int):
     for attr in ("board_temperature", "think_temperature",
                  "policy_temperature", "wl_temperature", "d_temperature"):
         setattr(eng, attr, 0.0)
-    # Ensure CUTLASS FMHA is on by default for eval — the kernel-level 30x
-    # speedup is required for the engine to compete with libtorch baseline.
-    os.environ.setdefault("USE_CUTLASS_FMHA", "1")
     return eng
 
 

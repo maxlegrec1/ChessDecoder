@@ -31,8 +31,6 @@ def _run_inference_cutlass(tmp_dir: Path, var_positions: list, pt_positions: lis
     Bundles the position lists into batches of `batch_size` for throughput.
     Returns the same metrics dict shape the libtorch path used.
     """
-    import os  # noqa: PLC0415
-    os.environ.setdefault("USE_CUTLASS_FMHA", "1")
     from rl_adapter import CutlassRLEngine  # noqa: PLC0415
 
     engine = CutlassRLEngine(
