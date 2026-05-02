@@ -50,6 +50,7 @@ CU_SOURCES = [
     _src("kernels/fmha_decode.cu"),
     _src("kernels/fmha_prefill.cu"),
     _src("kernels/fmha_prefill_cutlass.cu"),
+    _src("kernels/fmha_helpers.cu"),
     _src("kernels/misc.cu"),
     _src("layers/attention_block.cu"),
     _src("layers/mlp_block.cu"),

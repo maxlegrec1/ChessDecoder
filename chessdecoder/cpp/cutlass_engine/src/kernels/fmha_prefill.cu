@@ -2,6 +2,9 @@
 #include "cutlass_engine/check.hpp"
 
 #include <cuda_fp16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
 
 namespace cutlass_engine {
 
@@ -142,10 +145,63 @@ __global__ void fmha_prefill_tiled_kernel(
 
 }  // namespace
 
+namespace {
+// USE_CUTLASS_FMHA=1 routes prefix prefill through the CUTLASS Blackwell
+// FMHA (TMA + tensor cores). Cached on first call; logged once.
+bool use_cutlass_fmha() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = std::getenv("USE_CUTLASS_FMHA");
+        cached = (v && v[0] == '1') ? 1 : 0;
+        std::fprintf(stderr, "[cutlass_engine] fmha_prefill backend: %s\n",
+                     cached ? "CUTLASS" : "hand-rolled");
+    }
+    return cached == 1;
+}
+}  // namespace
+
 void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
                            const int32_t* block_id, const int32_t* active,
                            __half* O, int B, int S, int NH, int HD,
                            float scale, cudaStream_t stream) {
+    if (use_cutlass_fmha() && HD == 64) {
+        // Allocate scratch on stream (workspace + lse + eff_limit).
+        std::size_t ws_bytes = fmha_prefill_cutlass_workspace_bytes(B, S, NH, HD);
+        std::size_t lse_elems = fmha_prefill_cutlass_lse_elements(B, S, NH);
+        void* ws_ptr = nullptr;
+        if (ws_bytes > 0) {
+            CE_CUDA_CHECK(cudaMallocAsync(&ws_ptr, ws_bytes, stream));
+        }
+        float* lse_buf = nullptr;
+        CE_CUDA_CHECK(cudaMallocAsync((void**)&lse_buf,
+                                       lse_elems * sizeof(float), stream));
+        int32_t* eff_buf = nullptr;
+        CE_CUDA_CHECK(cudaMallocAsync((void**)&eff_buf,
+                                       std::size_t(B) * S * sizeof(int32_t),
+                                       stream));
+
+        // Compute effective_limit[b][q] = max(q, end_of_block(b, q)).
+        fmha_compute_effective_limit(block_id, eff_buf, B, S, stream);
+        // Publish to __device__ globals so the FMHA kernel's
+        // BlockAwareCausalMask sees them.
+        fmha_publish_block_aware_globals(eff_buf, B, S, stream);
+        // Run CUTLASS FMHA with the block-aware mask.
+        fmha_prefill_cutlass_block_aware(Q, K, V, O,
+                                         eff_buf, /*max_S=*/S,
+                                         B, S, NH, HD, scale,
+                                         ws_ptr, lse_buf, stream);
+
+        CE_CUDA_CHECK(cudaFreeAsync(eff_buf, stream));
+        CE_CUDA_CHECK(cudaFreeAsync(lse_buf, stream));
+        if (ws_ptr) CE_CUDA_CHECK(cudaFreeAsync(ws_ptr, stream));
+        // active[] is currently ignored on the CUTLASS path. All slots
+        // process; inactive slots' outputs are restored by the caller via
+        // restore_inactive_last_h elsewhere in the engine.
+        (void)active;
+        CE_CUDA_LAST();
+        return;
+    }
+
     constexpr int T_Q = 64;
     constexpr int T_K = 64;
     int n_q_tiles = (S + T_Q - 1) / T_Q;

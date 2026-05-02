@@ -191,6 +191,20 @@ void fmha_prefill_dispatch(const __half* Q, const __half* K, const __half* V,
                            int B, int S, int NH, int HD,
                            float scale, cudaStream_t stream);
 
+// Compute effective_limit[b][q] = max(q, end_of_block(b, q)) from block_id.
+// Used by the CUTLASS FMHA block-aware path to express the model's prefix-
+// mode mask `(block_id[q] == block_id[k]) || (k <= q)` as a single per-row
+// limit `k <= effective_limit[b][q]`.
+void fmha_compute_effective_limit(const int32_t* block_id,
+                                  int32_t* eff_limit_out,
+                                  int B, int S, cudaStream_t stream);
+
+// Publish a precomputed effective_limit buffer into the __device__ globals
+// read by BlockAwareCausalMask in the CUTLASS FMHA kernel. Sequences on the
+// stream so the upcoming FMHA launch observes the values.
+void fmha_publish_block_aware_globals(const int32_t* eff_limit_buf,
+                                      int B, int S, cudaStream_t stream);
+
 // CUTLASS Blackwell FMHA (sm_100a, TMA + tensor cores). Caller must allocate
 // workspace and LSE buffer of the sizes returned below.
 void fmha_prefill_cutlass_causal(const __half* Q, const __half* K, const __half* V,
