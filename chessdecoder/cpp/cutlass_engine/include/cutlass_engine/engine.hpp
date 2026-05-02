@@ -142,6 +142,12 @@ private:
     cudaGraph_t decode_graph_{nullptr};
     cudaGraphExec_t decode_graph_exec_{nullptr};
 
+    // Per-slot Philox state for Gumbel-max sampling. Distinct seeds per slot
+    // ensure the 10 rollouts of the same FEN (placed in adjacent slots in the
+    // RL group_size=10 layout) sample independently.
+    uint64_t* d_ph_seed_{nullptr};
+    uint64_t* d_ph_offset_{nullptr};
+
     float board_t_{0.0f};
     float think_t_{0.0f};
     float policy_t_{0.0f};

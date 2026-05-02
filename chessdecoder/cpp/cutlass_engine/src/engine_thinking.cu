@@ -318,7 +318,12 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
                                                          float temp) -> IdxLp {
         gemm_fp16(d_th_last_h_prefix_, head_w, head_b, d_logits_buf_,
                   B, Mv, E, nullptr, 0, stream_.get());
-        argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
+        if (temp > 0.0f) {
+            gumbel_argmax_fp16(d_logits_buf_, d_ph_seed_, d_ph_offset_,
+                               d_idx_out_, temp, B, Mv, stream_.get());
+        } else {
+            argmax_fp16(d_logits_buf_, d_idx_out_, B, Mv, stream_.get());
+        }
         log_prob_at_idx_fp16(d_logits_buf_, d_idx_out_, temp, d_lp_out_,
                              B, Mv, stream_.get());
         stream_.sync();
@@ -350,7 +355,12 @@ std::vector<RolloutResult> ThinkingEngine::predict_moves_thinking(
         mish_inplace_fp16(d_logits_buf_, B * H, stream_.get());
         gemm_fp16(d_logits_buf_, w2_w, w2_b, d_logits_buf_ + B * H,
                   B, Kb, H, nullptr, 0, stream_.get());
-        argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
+        if (temp > 0.0f) {
+            gumbel_argmax_fp16(d_logits_buf_ + B * H, d_ph_seed_, d_ph_offset_,
+                               d_idx_out_, temp, B, Kb, stream_.get());
+        } else {
+            argmax_fp16(d_logits_buf_ + B * H, d_idx_out_, B, Kb, stream_.get());
+        }
         log_prob_at_idx_fp16(d_logits_buf_ + B * H, d_idx_out_, temp, d_lp_out_,
                              B, Kb, stream_.get());
         stream_.sync();

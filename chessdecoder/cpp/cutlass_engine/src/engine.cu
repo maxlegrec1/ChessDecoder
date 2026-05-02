@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -131,6 +132,23 @@ ThinkingEngine::ThinkingEngine(const std::string& /*backbone_pt*/,
     d_move_sub_to_full_  = arena_.allocT<int32_t>(cfg_.move_vocab_size);
     d_th_sub_idx_log_    = arena_.allocT<int32_t>(B * 68);
     d_th_full_idx_       = arena_.allocT<int32_t>(B);
+
+    // Per-slot Philox RNG state for Gumbel-max sampling. Distinct seeds per
+    // slot — RL packs the 10 rollouts of a single FEN into adjacent slots,
+    // so independence across slots is what produces diverse rollouts.
+    d_ph_seed_   = arena_.allocT<uint64_t>(B);
+    d_ph_offset_ = arena_.allocT<uint64_t>(B);
+    {
+        std::random_device rd;
+        std::mt19937_64 gen(((uint64_t)rd() << 32) | rd());
+        std::vector<uint64_t> seed_h(B);
+        for (int b = 0; b < B; ++b) seed_h[b] = gen();
+        std::vector<uint64_t> offset_h(B, 0);
+        cudaMemcpy(d_ph_seed_,   seed_h.data(),
+                   B * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_ph_offset_, offset_h.data(),
+                   B * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    }
 
     if (!vocab_json.empty()) {
         vocab_.reset(new decoder::DecoderVocab(vocab_json));
