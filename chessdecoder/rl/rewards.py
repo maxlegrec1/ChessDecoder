@@ -129,10 +129,39 @@ def coherence_reward(
 # Signature: (final_move, token_ids, ground_truth) -> float
 RewardFn = Callable[[str, list[int], dict], float]
 
+def policy_prob_reward(
+    final_move: str,
+    token_ids: list[int],
+    ground_truth: dict,
+) -> float:
+    """Continuous reward = teacher-policy probability of `final_move`.
+
+    Expects `ground_truth["policy"]` to be a 1858-float array (Leela-style
+    policy index, white-perspective with rank-mirroring for black-to-move
+    positions; see chessdecoder.rl.leela_move_index for the convention).
+
+    Returns 0.0 when the move can't be looked up (illegal, malformed,
+    or under-promotion outside the vocab).
+
+    Reward range: [0.0, 1.0]. Sharp teacher → near-1.0 only for the
+    teacher's preferred move; broad teacher → smoother reward landscape.
+    Naturally produces continuous group rewards even with single-correct
+    move tasks because near-best moves earn partial credit.
+    """
+    from chessdecoder.rl.leela_move_index import policy_prob  # noqa: PLC0415
+
+    policy = ground_truth.get("policy")
+    fen = ground_truth.get("fen")
+    if policy is None or fen is None or not final_move:
+        return 0.0
+    return policy_prob(final_move, fen, policy)
+
+
 _REWARD_REGISTRY: dict[str, RewardFn] = {
     "move_quality": move_quality_reward,
     "format": format_reward,
     "coherence": coherence_reward,
+    "policy_prob": policy_prob_reward,
 }
 
 
