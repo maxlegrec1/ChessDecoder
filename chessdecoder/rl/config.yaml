@@ -16,9 +16,9 @@ grpo:
   group_size: 10
   clip_epsilon_low: 0.2
   clip_epsilon_high: 0.28
-  kl_coeff: 0.02
+  kl_coeff: 0.05
   ppo_epochs: 1
-  max_kl: 0.5
+  max_kl: 1
   # Treat WL/D bucket samples as additional policy actions. Requires
   # rollout.wl_temperature and rollout.d_temperature to be > 0 below.
   value_action_space: true
@@ -76,3 +76,11 @@ data:
   pretrain_train_split: 0.8
   num_eval_positions: 200
   eval_seed: 42
+  # Continuous-reward training source: HF ChessFENS-style parquets
+  # (fen + 1858-float policy column). When set, replaces the binary
+  # best-move pretrain stream with PolicyPositionStream. move_quality_reward
+  # automatically becomes the teacher policy probability of the chosen move.
+  # Empty string disables this and falls back to the legacy pretrain stream.
+  policy_parquet_dir: ./data/policy_eval/
+  policy_stream_mirror_prob: 0.5
+  policy_stream_positions_per_file: 0   # 0 = use all rows; e.g. 50000 to cap

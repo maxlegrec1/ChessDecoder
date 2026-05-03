@@ -30,11 +30,36 @@ def move_quality_reward(
 ) -> float:
     """Reward for final move quality.
 
-    +1.0 if final_move == best_move
-     0.0 otherwise
+    Two modes, chosen by what's in `ground_truth`:
+
+    1. Continuous (preferred): if `ground_truth["policy"]` is present (e.g. a
+       1858-float Leela policy from HF ChessFENS), reward = teacher policy
+       probability of `final_move` ∈ [0, 1]. Castling normalisation
+       (e1g1↔e1h1) and rank-mirroring for black-to-move are handled inside
+       chessdecoder.rl.leela_move_index.policy_prob.
+
+    2. Binary fallback: matches the legacy semantics (1.0 if move equals
+       `ground_truth["best_move"]`, 0.0 otherwise). Used when no policy
+       array is available, e.g. variation-parquet rollouts.
+
+    The continuous form is a drop-in replacement: same name, same
+    composability with format/coherence (gating still works because near-1
+    rewards correspond to "this is the teacher's pick").
     """
     move = normalize_castling(final_move)
-    best = normalize_castling(ground_truth["best_move"])
+    if not move:
+        return 0.0
+
+    policy = ground_truth.get("policy")
+    fen = ground_truth.get("fen")
+    if policy is not None and fen is not None:
+        from chessdecoder.rl.leela_move_index import policy_prob  # noqa: PLC0415
+        return policy_prob(move, fen, policy)
+
+    best_raw = ground_truth.get("best_move")
+    if best_raw is None:
+        return 0.0
+    best = normalize_castling(best_raw)
     return 1.0 if move == best else 0.0
 
 
@@ -129,39 +154,10 @@ def coherence_reward(
 # Signature: (final_move, token_ids, ground_truth) -> float
 RewardFn = Callable[[str, list[int], dict], float]
 
-def policy_prob_reward(
-    final_move: str,
-    token_ids: list[int],
-    ground_truth: dict,
-) -> float:
-    """Continuous reward = teacher-policy probability of `final_move`.
-
-    Expects `ground_truth["policy"]` to be a 1858-float array (Leela-style
-    policy index, white-perspective with rank-mirroring for black-to-move
-    positions; see chessdecoder.rl.leela_move_index for the convention).
-
-    Returns 0.0 when the move can't be looked up (illegal, malformed,
-    or under-promotion outside the vocab).
-
-    Reward range: [0.0, 1.0]. Sharp teacher → near-1.0 only for the
-    teacher's preferred move; broad teacher → smoother reward landscape.
-    Naturally produces continuous group rewards even with single-correct
-    move tasks because near-best moves earn partial credit.
-    """
-    from chessdecoder.rl.leela_move_index import policy_prob  # noqa: PLC0415
-
-    policy = ground_truth.get("policy")
-    fen = ground_truth.get("fen")
-    if policy is None or fen is None or not final_move:
-        return 0.0
-    return policy_prob(final_move, fen, policy)
-
-
 _REWARD_REGISTRY: dict[str, RewardFn] = {
     "move_quality": move_quality_reward,
     "format": format_reward,
     "coherence": coherence_reward,
-    "policy_prob": policy_prob_reward,
 }
 
 

@@ -70,6 +70,18 @@ class GRPOConfig:
     # num_train_positions removed — PositionStream reads fresh data from files
     num_eval_positions: int = 200
     eval_seed: int = 42
+    # Optional: HF-style parquets (fen + 1858-float policy) used for
+    # continuous-reward training. When set, PolicyPositionStream replaces
+    # PositionStream and move_quality_reward becomes the teacher policy
+    # probability of the chosen move. Leave empty to use the legacy binary
+    # best-move match against pretrain_parquet_dir.
+    policy_parquet_dir: str = ""
+    # Probability of mirroring each loaded position (gives the model both
+    # colour perspectives — the HF dataset only stores white-to-move FENs).
+    policy_stream_mirror_prob: float = 0.5
+    # Optional cap on positions sampled per file before advancing (keeps
+    # peak memory bounded; None / 0 = use all rows).
+    policy_stream_positions_per_file: int = 0
 
     # --- Checkpointing ---
     finetuned_checkpoint: str = ""

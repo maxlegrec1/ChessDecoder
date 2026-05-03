@@ -137,6 +137,68 @@ class PositionStream:
                     f"{self._positions_served} positions served")
 
 
+class PolicyPositionStream(PositionStream):
+    """Streams positions with a teacher policy from HF ChessFENS-format parquets.
+
+    Each row carries `fen` and a 1858-float `policy` (Leela-style index, white-
+    perspective). With probability `mirror_prob`, positions are mirrored
+    (chess.Board.mirror) so the model trains on both colours. The policy
+    array is unchanged by mirroring — `policy_prob` handles the rank-flip at
+    lookup time via `_side_to_move_is_black(fen)`.
+
+    `best_move` is derived from the policy's argmax (in standard UCI, in the
+    perspective of the FEN's side-to-move) so that existing metrics like
+    acc@1 / acc@k continue to make sense without modification.
+    """
+
+    def __init__(self, files: list[str], seed: int,
+                 mirror_prob: float = 0.5,
+                 positions_per_file: int | None = None):
+        super().__init__(files, seed)
+        self._mirror_prob = mirror_prob
+        self._positions_per_file = positions_per_file
+        print_rank0(f"PolicyPositionStream: mirror_prob={mirror_prob}, "
+                    f"positions_per_file={positions_per_file}")
+
+    def _load_next_file(self):
+        import pandas as pd  # noqa: PLC0415
+        from chessdecoder.rl.leela_move_index import (  # noqa: PLC0415
+            best_move_from_policy, mirror_fen,
+        )
+
+        if self._file_idx >= len(self._files):
+            self._rng.shuffle(self._files)
+            self._file_idx = 0
+            print_rank0("  PolicyPositionStream: cycled through all files, reshuffling")
+
+        fname = self._files[self._file_idx]
+        self._file_idx += 1
+
+        df = pd.read_parquet(fname, columns=["fen", "policy"])
+        if self._positions_per_file is not None and len(df) > self._positions_per_file:
+            df = df.sample(n=self._positions_per_file,
+                           random_state=self._rng.randint(0, 2**31)).reset_index(drop=True)
+        else:
+            df = df.sample(frac=1, random_state=self._rng.randint(0, 2**31)).reset_index(drop=True)
+
+        rows: list[dict] = []
+        for fen, policy in zip(df["fen"].values, df["policy"].values):
+            # Optional mirror so the model sees both colours during RL.
+            if self._rng.random() < self._mirror_prob:
+                try:
+                    fen = mirror_fen(fen)
+                except Exception:
+                    pass  # if FEN is malformed, skip mirroring
+            best = best_move_from_policy(fen, policy)
+            if best is None:
+                continue  # skip terminal positions with no legal moves
+            rows.append({"fen": fen, "policy": policy, "best_move": best})
+
+        self._buffer.extend(rows)
+        print_rank0(f"  PolicyPositionStream: loaded {len(rows)} positions from "
+                    f"{Path(fname).name}, buffer now has {len(self._buffer)}")
+
+
 def _rl_extra_state(config, position_stream, eval_var_positions, eval_pt_positions):
     """Build the RL-specific extra_state for save_training_checkpoint."""
     return {
@@ -274,7 +336,25 @@ def train():
     print_rank0(f"Pretrain split: {len(train_pretrain_files)} train / "
                 f"{len(eval_pretrain_files)} eval files")
 
-    position_stream = PositionStream(train_pretrain_files, config.eval_seed)
+    # Position-stream choice: if `policy_parquet_dir` is set, stream from
+    # HF-style parquets (fen + 1858 policy) and turn move_quality_reward
+    # into the continuous teacher-policy probability of the chosen move.
+    # Otherwise use the legacy pretrain stream with binary best-move
+    # matching.
+    policy_dir = getattr(config, "policy_parquet_dir", None)
+    if policy_dir:
+        policy_files = sorted(_glob.glob(os.path.join(policy_dir, "*.parquet")))
+        if not policy_files:
+            raise RuntimeError(f"policy_parquet_dir set but no parquets in {policy_dir}")
+        print_rank0(f"Using policy-reward stream: {len(policy_files)} files from {policy_dir}")
+        per_file = getattr(config, "policy_stream_positions_per_file", 0)
+        position_stream = PolicyPositionStream(
+            policy_files, config.eval_seed,
+            mirror_prob=getattr(config, "policy_stream_mirror_prob", 0.5),
+            positions_per_file=per_file if per_file > 0 else None,
+        )
+    else:
+        position_stream = PositionStream(train_pretrain_files, config.eval_seed)
     if _resume_stream_state is not None:
         position_stream.load_state_dict(_resume_stream_state)
 

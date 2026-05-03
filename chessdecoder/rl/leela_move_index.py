@@ -87,3 +87,33 @@ def policy_prob(move: str, fen: str, policy_array) -> float:
         return 0.0
     p = float(policy_array[idx])
     return max(0.0, p)
+
+
+def best_move_from_policy(fen: str, policy_array) -> str | None:
+    """Return the standard-UCI move with the highest teacher probability,
+    in the perspective of the side to move in `fen`.
+
+    Inverts `policy_idx_for_move`: argmax over the 1858 entries → vocab UCI →
+    standard UCI (e1h1 → e1g1) → mirror back to black-perspective if
+    the FEN is black-to-move.
+    """
+    import numpy as np  # noqa: PLC0415
+    arr = np.asarray(policy_array)
+    legal = np.where(arr >= 0)[0]
+    if len(legal) == 0:
+        return None
+    idx = int(legal[arr[legal].argmax()])
+    moves, _ = _load_vocab()
+    canon = moves[idx]                    # e.g. "e1h1" or "e7e5"
+    if _side_to_move_is_black(fen):
+        canon = _mirror_rank_uci(canon)   # back to black-perspective UCI
+    # Inverse of to_model_uci: convert king-takes-rook → king-target.
+    from chessdecoder.utils.uci import normalize_castling  # noqa: PLC0415
+    return normalize_castling(canon)
+
+
+def mirror_fen(fen: str) -> str:
+    """Mirror a FEN: flip ranks, swap colours, swap castling rights, flip
+    side-to-move and en-passant rank. Wraps `chess.Board.mirror`."""
+    import chess  # noqa: PLC0415
+    return chess.Board(fen).mirror().fen()
