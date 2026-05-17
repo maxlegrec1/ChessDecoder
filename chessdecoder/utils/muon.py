@@ -1,0 +1,95 @@
+"""Muon optimizer (Newton-Schulz orthogonalized momentum on 2-D hidden
+matrices; AdamW for embeddings / heads / norms / 1-D params). Promoted from
+scripts/v2_hp_sweep.py so train_v2 and the sweep share one implementation.
+"""
+import torch
+import torch.optim as optim
+
+
+def _newtonschulz5(G, steps=5, eps=1e-7):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.bfloat16()
+    X = X / (X.norm() + eps)
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X.to(G.dtype)
+
+
+class MuonWithAdam(torch.optim.Optimizer):
+    def __init__(self, muon_params, adam_params, lr=1e-3, weight_decay=0.0,
+                 momentum=0.95, betas=(0.9, 0.95), eps=1e-8):
+        groups = [
+            dict(params=list(muon_params), kind="muon", lr=lr,
+                 weight_decay=weight_decay, momentum=momentum),
+            dict(params=list(adam_params), kind="adam", lr=lr,
+                 weight_decay=weight_decay, betas=betas, eps=eps),
+        ]
+        super().__init__(groups, dict(lr=lr))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for g in self.param_groups:
+            lr, wd = g["lr"], g["weight_decay"]
+            if g["kind"] == "muon":
+                mom = g["momentum"]
+                for p in g["params"]:
+                    if p.grad is None:
+                        continue
+                    st = self.state[p]
+                    if "buf" not in st:
+                        st["buf"] = torch.zeros_like(p)
+                    buf = st["buf"]
+                    buf.mul_(mom).add_(p.grad)
+                    upd = p.grad.add(buf, alpha=mom)            # Nesterov
+                    o = _newtonschulz5(upd)
+                    scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                    if wd:
+                        p.mul_(1 - lr * wd)
+                    p.add_(o, alpha=-lr * scale)
+            else:  # AdamW
+                b1, b2 = g["betas"]; eps = g["eps"]
+                for p in g["params"]:
+                    if p.grad is None:
+                        continue
+                    st = self.state[p]
+                    if "step" not in st:
+                        st["step"] = 0
+                        st["m"] = torch.zeros_like(p)
+                        st["v"] = torch.zeros_like(p)
+                    st["step"] += 1
+                    m, v = st["m"], st["v"]
+                    m.mul_(b1).add_(p.grad, alpha=1 - b1)
+                    v.mul_(b2).addcmul_(p.grad, p.grad, value=1 - b2)
+                    bc1 = 1 - b1 ** st["step"]
+                    bc2 = 1 - b2 ** st["step"]
+                    if wd:
+                        p.mul_(1 - lr * wd)
+                    p.addcdiv_(m / bc1, (v / bc2).sqrt_().add_(eps), value=-lr)
+        return loss
+
+
+def build_optimizer(model, name, lr, wd):
+    """name: 'adamw' | 'muon'. Muon routes 2-D hidden matrices through
+    Newton-Schulz; embeddings / policy_head / latent_queries / norms / biases
+    go to the AdamW arm."""
+    if name == "adamw":
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    if name == "muon":
+        muon_p, adam_p = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_matrix = p.ndim == 2 and not any(
+                k in n for k in ("tok_embedding", "policy_head",
+                                 "latent_queries"))
+            (muon_p if is_matrix else adam_p).append(p)
+        return MuonWithAdam(muon_p, adam_p, lr=lr, weight_decay=wd)
+    raise ValueError(f"unknown optimizer {name!r}")

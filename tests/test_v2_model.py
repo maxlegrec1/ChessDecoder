@@ -10,7 +10,7 @@ import chess
 import torch
 
 from chessdecoder.models.vocab import vocab_size, token_to_idx
-from chessdecoder.models.model import FourierEncoder as V1Fourier
+from chessdecoder.models.v2.layers import FourierEncoder
 from chessdecoder.dataloader.data import fen_to_position_tokens
 from chessdecoder.models.v2.model_v2 import (
     ChessDecoderV2, board_tokens_to_transition_targets,
@@ -48,14 +48,14 @@ def test_predict_move_legal():
     assert chess.Move.from_uci(mv) in set(chess.Board(START).legal_moves)
 
 
-def test_fourier_injection_parity_vs_v1():
-    """V2 reuses V1's FourierEncoder verbatim; with identical weights the
-    WL/D injection must be bit-for-bit identical to V1's."""
+def test_fourier_injection_matches_encoder():
+    """embed_value must be exactly FourierEncoder(value) with shared weights
+    (the WL/D injection wiring is the model's fourier_encoder, nothing else)."""
     m = _tiny()
-    v1 = V1Fourier(embed_dim=32, num_frequencies=8)
-    v1.load_state_dict(m.fourier_encoder.state_dict())
+    ref = FourierEncoder(embed_dim=32, num_frequencies=8)
+    ref.load_state_dict(m.fourier_encoder.state_dict())
     x = torch.tensor([-0.73, 0.0, 0.41, 0.99])
-    assert torch.equal(m.embed_value(x), v1(x))
+    assert torch.equal(m.embed_value(x), ref(x))
 
 
 def test_transition_target_extraction():

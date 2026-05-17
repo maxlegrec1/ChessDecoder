@@ -49,6 +49,12 @@ def game_to_v2_arrays(game_df, max_plies):
     [max_plies, ...] tensors + ply_mask. Plies beyond max_plies are dropped."""
     rows = [r for r in game_df.itertuples(index=False)
             if getattr(r, 'played_move', None)]
+    # V1-style random start point (no fixed window): begin the sequence at a
+    # uniformly random ply so the model sees mid/endgame histories, then crop
+    # the tail to max_plies so the sequence never exceeds the context window.
+    if len(rows) > 1:
+        start = random.randint(0, len(rows) - 1)
+        rows = rows[start:]
     rows = rows[:max_plies]
     P = len(rows)
 
@@ -56,8 +62,10 @@ def game_to_v2_arrays(game_df, max_plies):
     move_full = torch.zeros(max_plies, dtype=torch.long)
     policy_tgt = torch.full((max_plies,), IGNORE_INDEX, dtype=torch.long)
     policy_valid = torch.zeros(max_plies, dtype=torch.bool)
-    wl = torch.zeros(max_plies, dtype=torch.float32)
-    d = torch.zeros(max_plies, dtype=torch.float32)
+    # Per-position WDL soft target (markdowns/12): reconstructed from the
+    # position's ORIGINAL eval orig_q/orig_d (a position quantity, unlike
+    # played_q/d which is an action value).  W=(1-D+Q)/2, L=(1-D-Q)/2.
+    wdl_tgt = torch.zeros(max_plies, 3, dtype=torch.float32)
     wdl_valid = torch.zeros(max_plies, dtype=torch.bool)
     ply_mask = torch.zeros(max_plies, dtype=torch.bool)
 
@@ -69,10 +77,13 @@ def game_to_v2_arrays(game_df, max_plies):
         if bm is not None and bm in token_to_idx:
             policy_tgt[i] = full_idx_to_move_idx[token_to_idx[bm]]
             policy_valid[i] = True
-        pq, pd_ = getattr(row, 'played_q', None), getattr(row, 'played_d', None)
-        if pq is not None and pd.notna(pq) and pd_ is not None and pd.notna(pd_):
-            wl[i] = float(pq)
-            d[i] = float(pd_)
+        q, dd = getattr(row, 'orig_q', None), getattr(row, 'orig_d', None)
+        if q is not None and pd.notna(q) and dd is not None and pd.notna(dd):
+            q, dd = float(q), float(dd)
+            w = (1.0 - dd + q) / 2.0
+            l = (1.0 - dd - q) / 2.0
+            v = torch.tensor([w, dd, l], dtype=torch.float32).clamp_(0.0, 1.0)
+            wdl_tgt[i] = v / v.sum().clamp_(min=1e-8)        # renorm -> distribution
             wdl_valid[i] = True
         ply_mask[i] = True
 
@@ -91,32 +102,35 @@ def game_to_v2_arrays(game_df, max_plies):
     return {
         "board_ids": board_ids, "move_full": move_full,
         "policy_tgt": policy_tgt, "policy_valid": policy_valid,
-        "wl": wl, "d": d, "wdl_valid": wdl_valid,
+        "wdl_tgt": wdl_tgt, "wdl_valid": wdl_valid,
         "trans_sq": tsq, "trans_stm": tstm, "trans_cas": tcas,
         "trans_valid": trans_valid, "ply_mask": ply_mask,
     }
 
 
-def assemble_decoder_inputs(latents, move_emb, wl_val, d_val, fourier_encoder):
-    """latents [B,P,k,E], move_emb [B,P,E], wl_val/d_val [B,P] floats,
-    fourier_encoder: model.fourier_encoder.
+def assemble_decoder_inputs(latents, move_emb, value_emb):
+    """Build the reshaped decoder stream (markdowns/12).
 
-    Returns inputs_embeds [B, P*L, E] in the regular
-    ``[z | move | wl | d]`` per-ply layout, plus the closed-form position
-    index helpers (policy/move/wl/d) as [P] long tensors."""
+    Per-ply layout ``[ z (k latents) | value | move ]``, L = k + 2:
+      latents   [B,P,k,E]
+      value_emb [B,P,E]   model.embed_wdl(target/predicted WDL) — Fourier(Q)+Fourier(D)
+      move_emb  [B,P,E]   tok_embedding(played_move)
+
+    Returns inputs_embeds [B, P*L, E] + closed-form positions. The move (and
+    policy supervision) is read at the **value slot** so move choice is
+    conditioned on board + its evaluation (eval-aware)."""
     B, P, k, E = latents.shape
-    L = k + 3
+    L = k + 2
     dev = latents.device
     seq = torch.zeros(B, P, L, E, device=dev, dtype=latents.dtype)
     seq[:, :, :k, :] = latents
-    seq[:, :, k, :] = move_emb
-    seq[:, :, k + 1, :] = fourier_encoder(wl_val.reshape(-1)).reshape(B, P, E).to(seq.dtype)
-    seq[:, :, k + 2, :] = fourier_encoder(d_val.reshape(-1)).reshape(B, P, E).to(seq.dtype)
+    seq[:, :, k, :] = value_emb.to(seq.dtype)
+    seq[:, :, k + 1, :] = move_emb
     inputs_embeds = seq.reshape(B, P * L, E)
 
     idx = torch.arange(P, device=dev) * L
-    pos = {"policy_pos": idx + (k - 1), "move_pos": idx + k,
-           "wl_pos": idx + k + 1, "d_pos": idx + k + 2, "ply_len": L}
+    pos = {"policy_pos": idx + k, "value_pos": idx + k,
+           "move_pos": idx + k + 1, "ply_len": L}
     return inputs_embeds, pos
 
 

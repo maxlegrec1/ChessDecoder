@@ -29,8 +29,8 @@ from chessdecoder.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
     average_gradients, barrier, print_rank0)
 from chessdecoder.utils.training import (
-    load_config, soft_bucket_loss, save_training_checkpoint,
-    init_wandb_with_resume)
+    load_config, save_training_checkpoint, init_wandb_with_resume)
+from chessdecoder.utils.muon import build_optimizer
 
 IGNORE_INDEX = -100
 
@@ -69,10 +69,14 @@ def train():
         max_plies=config["data"]["max_plies"],
         seed=seed, rank=rank, world_size=world_size)
 
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config["training"]["learning_rate"],
-        weight_decay=config["training"]["weight_decay"])
+    optimizer = build_optimizer(
+        model,
+        config["training"].get("optimizer", "adamw"),
+        config["training"]["learning_rate"],
+        config["training"]["weight_decay"])
+    print_rank0(f"Optimizer: {config['training'].get('optimizer', 'adamw')} "
+                f"lr={config['training']['learning_rate']} "
+                f"wd={config['training']['weight_decay']}")
 
     use_amp = config["training"].get("use_amp", False)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -110,8 +114,7 @@ def train():
     model.train()
     w_pol = config["loss"]["policy_weight"]
     w_tr = config["loss"]["transition_weight"]
-    w_wl = config["loss"]["wl_weight"]
-    w_d = config["loss"]["d_weight"]
+    w_wdl = config["loss"]["wdl_weight"]
     grad_accum = config["training"].get("gradient_accumulation_steps", 1)
     grad_clip = config["training"].get("grad_clip", 10.0)
     ce = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
@@ -133,7 +136,7 @@ def train():
             move_full = batch["move_full"].to(device)       # [B,P]
             pol_tgt = batch["policy_tgt"].to(device)
             pol_val = batch["policy_valid"].to(device)
-            wl = batch["wl"].to(device); d = batch["d"].to(device)
+            wdl_tgt = batch["wdl_tgt"].to(device)           # [B,P,3]
             wdl_val = batch["wdl_valid"].to(device)
             tsq = batch["trans_sq"].to(device)              # [B,P,64]
             tstm = batch["trans_stm"].to(device)
@@ -144,30 +147,30 @@ def train():
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 latents = model.encode_boards(
                     bid.reshape(B * P, 68)).reshape(B, P, -1, model.embed_dim)
-                move_emb = model.tok_embedding(move_full)    # [B,P,E]
-                seq, pos = assemble_decoder_inputs(
-                    latents, move_emb, wl, d, model.fourier_encoder)
-                h = model.decoder(seq)                       # [B, P*L, E]
+                E = model.embed_dim
 
-                h_pol = h[:, pos["policy_pos"], :]           # [B,P,E]
-                h_mv = h[:, pos["move_pos"], :]
-                h_wl = h[:, pos["wl_pos"], :]
+                # --- WDL: encoder-side joint position evaluator (leak-free) ---
+                wdl_logits = model.wdl_head(
+                    latents.reshape(B * P, -1, E)).reshape(B, P, 3)
+                vmask = (wdl_val & ply_mask)                  # [B,P]
+                logp = torch.log_softmax(wdl_logits.float(), dim=-1)
+                wdl_ce = -(wdl_tgt * logp).sum(-1)            # [B,P] soft-CE
+                wdl_loss = (wdl_ce * vmask).sum() / (vmask.sum() + 1e-8)
 
-                # --- policy ---
-                pol_logits = model.policy_head(h_pol)        # [B,P,move_vocab]
+                # value token = Fourier(Q)+Fourier(D) from the target WDL,
+                # teacher-forced into the stream (markdowns/12).
+                value_emb = model.embed_wdl(
+                    wdl_tgt.reshape(-1, 3)).reshape(B, P, E)
+                move_emb = model.tok_embedding(move_full)     # [B,P,E]
+                seq, pos = assemble_decoder_inputs(latents, move_emb, value_emb)
+                h = model.decoder(seq)                        # [B, P*L, E]
+
+                # --- policy (read at the value slot: eval-aware move) ---
+                pol_logits = model.policy_head(h[:, pos["policy_pos"], :])
                 pmask = pol_val & ply_mask
                 policy_loss = ce(
                     pol_logits.reshape(-1, move_vocab_size),
                     torch.where(pmask, pol_tgt, torch.full_like(pol_tgt, IGNORE_INDEX)).reshape(-1))
-
-                # --- value (WL at move pos, D at wl pos) — V1 mechanism ---
-                vmask = (wdl_val & ply_mask).reshape(-1)
-                wl_logits = model.wl_head(h_mv.reshape(-1, model.embed_dim))
-                d_logits = model.d_head(h_wl.reshape(-1, model.embed_dim))
-                wl_loss = soft_bucket_loss(wl_logits, wl.reshape(-1),
-                                           model.wl_bucket_centers, vmask)
-                d_loss = soft_bucket_loss(d_logits, d.reshape(-1),
-                                          model.d_bucket_centers, vmask)
 
                 # --- transition (parallel absolute world model) ---
                 out = model.transition_head(
@@ -186,7 +189,7 @@ def train():
                     + ce(out["castling"], cas_t))
 
                 total = (w_pol * policy_loss + w_tr * trans_loss
-                         + w_wl * wl_loss + w_d * d_loss)
+                         + w_wdl * wdl_loss)
 
             (scaler.scale(total / grad_accum)).backward()
             if (step + 1) % grad_accum == 0:
@@ -199,22 +202,86 @@ def train():
 
             if step % config["training"]["log_every_n_steps"] == 0 and is_main_process():
                 with torch.no_grad():
-                    pa = ((pol_logits.argmax(-1) == pol_tgt) & pmask).sum() / (pmask.sum() + 1e-8)
-                    sq_acc = ((out["square"].argmax(-1) == tsq.reshape(B * P, 64))
-                              & trm.unsqueeze(1)).sum() / (trm.sum() * 64 + 1e-8)
+                    # --- move / policy accuracy ---
+                    move_correct = (pol_logits.argmax(-1) == pol_tgt) & pmask
+                    pa = move_correct.sum() / (pmask.sum() + 1e-8)
+
+                    # --- board (transition) reconstruction metrics ---
+                    # In V2 the next-board prediction IS the transition head;
+                    # these mirror V1's board_total/square/stm/castling acc.
+                    bm = trm                                          # [B*P] valid
+                    sq_ok = (out["square"].argmax(-1)
+                             == tsq.reshape(B * P, 64))               # [B*P,64]
+                    stm_ok = out["stm"].argmax(-1) == tstm.reshape(-1)
+                    cas_ok = out["castling"].argmax(-1) == tcas.reshape(-1)
+                    nb = bm.sum().clamp(min=1)
+                    board_square_acc = (sq_ok & bm.unsqueeze(1)).sum() / (nb * 64)
+                    board_stm_acc = (stm_ok & bm).sum() / nb
+                    board_castling_acc = (cas_ok & bm).sum() / nb
+                    board_total_acc = (
+                        (sq_ok.all(dim=1) & stm_ok & cas_ok) & bm).sum() / nb
+                    # V1 train/board_acc == per-cell board-token accuracy;
+                    # V2 analogue = mean over the 66 transition cells / board.
+                    board_acc = (((sq_ok & bm.unsqueeze(1)).sum()
+                                  + (stm_ok & bm).sum()
+                                  + (cas_ok & bm).sum()) / (nb * 66))
+
+                    # --- WDL metrics (joint position evaluator) ---
+                    vf = vmask.float()
+                    vn = vf.sum() + 1e-8
+                    wdl_p = torch.softmax(wdl_logits.float(), -1)        # [B,P,3]
+                    q_pred = wdl_p[..., 0] - wdl_p[..., 2]               # Q = W-L
+                    q_tgt = wdl_tgt[..., 0] - wdl_tgt[..., 2]
+                    q_mae = ((q_pred - q_tgt).abs() * vf).sum() / vn
+                    d_mae = ((wdl_p[..., 1] - wdl_tgt[..., 1]).abs() * vf).sum() / vn
+                    wdl_acc = ((wdl_p.argmax(-1) == wdl_tgt.argmax(-1))
+                               & vmask).sum() / vn
+
+                    # --- max |logit| per head (logit-explosion watch) ---
+                    policy_logit_max = pol_logits.detach().abs().max()
+                    board_logit_max = torch.stack([
+                        out["square"].detach().abs().max(),
+                        out["stm"].detach().abs().max(),
+                        out["castling"].detach().abs().max()]).max()
+                    value_logit_max = wdl_logits.detach().abs().max()
+
+                    # --- per-ply (nth-move) policy accuracy ---
+                    max_track = config["training"].get("max_track_nth_moves", 20)
+                    nth = {}
+                    for i in range(min(max_track, P)):
+                        cnt = pmask[:, i].sum()
+                        if cnt > 0:
+                            nth[f"train/move_acc_nth/{i}"] = (
+                                move_correct[:, i].sum() / cnt).item()
+
                 print(f"Step {step}: loss {total.item():.4f} "
                       f"(pol {policy_loss.item():.4f} trans {trans_loss.item():.4f} "
-                      f"wl {wl_loss.item():.4f} d {d_loss.item():.4f})")
+                      f"wdl {wdl_loss.item():.4f}) "
+                      f"move_acc={pa.item():.3f} wdl_acc={wdl_acc.item():.3f} "
+                      f"q_mae={q_mae.item():.3f} "
+                      f"board[sq={board_square_acc.item():.3f} "
+                      f"stm={board_stm_acc.item():.3f} cas={board_castling_acc.item():.3f} "
+                      f"total={board_total_acc.item():.4f}]")
                 wandb.log({
                     "train/total_loss": total.item(),
-                    "train/policy_loss": policy_loss.item(),
-                    "train/transition_loss": trans_loss.item(),
-                    "train/wl_loss": float(wl_loss),
-                    "train/d_loss": float(d_loss),
-                    "train/policy_acc": pa.item(),
-                    "train/transition_square_acc": sq_acc.item(),
+                    "train/move_loss": policy_loss.item(),
+                    "train/board_loss": trans_loss.item(),
+                    "train/wdl_loss": wdl_loss.item(),
+                    "train/move_acc": pa.item(),
+                    "train/board_acc": board_acc.item(),
+                    "train/board_total_acc": board_total_acc.item(),
+                    "train/board_square_acc": board_square_acc.item(),
+                    "train/board_stm_acc": board_stm_acc.item(),
+                    "train/board_castling_acc": board_castling_acc.item(),
+                    "train/wdl_acc": wdl_acc.item(),
+                    "train/q_mae": q_mae.item(),
+                    "train/d_mae": d_mae.item(),
+                    "train/policy_logit_max": policy_logit_max.item(),
+                    "train/board_logit_max": board_logit_max.item(),
+                    "train/value_logit_max": value_logit_max.item(),
                     "train/epoch": epoch, "train/step": step,
                     "train/grad_step": step / grad_accum,
+                    **nth,
                 })
 
             del h, seq, latents, pol_logits, out, total

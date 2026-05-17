@@ -129,7 +129,7 @@ def save_pgn_game(pgn_game, pgn_filename):
 
 def model_vs_stockfish(model = None,model1_name = "run",num_games = 1,temperature = 0.1,elo = 1400, pgn_dir = "pgns"):
     assert num_games > 0
-    assert isinstance(elo, int) and elo >= 1400
+    assert isinstance(elo, int) and elo >= 1320  # Stockfish UCI_Elo minimum
     wins, draws = 0, 0
     games_played = 0
 

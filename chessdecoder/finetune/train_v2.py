@@ -22,7 +22,7 @@ from chessdecoder.models.v2.model_v2 import (
 from chessdecoder.dataloader.sequence_v2 import build_mixed_sequence
 from chessdecoder.finetune.loader_v2 import (
     variation_to_v2_sample, flat_to_decoder_index)
-from chessdecoder.utils.training import load_config, soft_bucket_loss
+from chessdecoder.utils.training import load_config
 
 IGNORE = -100
 
@@ -51,17 +51,13 @@ def compute_finetune_v2_loss(model, plan, sup, ss_p: float = 0.0, device="cpu"):
         fl = ce(model.policy_head(h[f2d[fp]]).unsqueeze(0),
                 torch.tensor([fm], device=device))
 
-    # value: wl_head at the move pos (wl_flat-2), d_head at the wl pos
-    wl_terms, d_terms = [], []
-    for p, (val, valid, kind) in sup["value"].items():
-        if not valid:
-            continue
-        if kind == "wl" and (p - 2) in f2d:
-            wl_terms.append((f2d[p - 2], val))
-        if kind == "d" and p in f2d:
-            d_terms.append((f2d[p], val))
-    wll = _bucket(model, model.wl_head, model.wl_bucket_centers, wl_terms, h, device)
-    dl = _bucket(model, model.d_head, model.d_bucket_centers, d_terms, h, device)
+    # value: DEFERRED to the Phase-D thinking-trace reshape (markdowns/12
+    # §4/§5). The bucketed decoder-side wl/d heads were removed in favour of
+    # the encoder-side joint WDLHead; wiring per-variation-node WDL targets
+    # onto the spliced stream is the later finetune-phase change. Zero for now
+    # so finetune training runs (thinking + final + transition only).
+    wll = torch.tensor(0.0, device=device)
+    dl = torch.tensor(0.0, device=device)
 
     # transition: every (board, move, next_board) triple, scheduled-sampled
     trl = torch.tensor(0.0, device=device)
@@ -93,15 +89,6 @@ def compute_finetune_v2_loss(model, plan, sup, ss_p: float = 0.0, device="cpu"):
                + ce(out["castling"], torch.cat(tcas, 0)))
 
     return {"thinking": tl, "final": fl, "wl": wll, "d": dl, "transition": trl}
-
-
-def _bucket(model, head, centers, terms, h, device):
-    if not terms:
-        return torch.tensor(0.0, device=device)
-    idx = torch.tensor([i for i, _ in terms], device=device)
-    val = torch.tensor([v for _, v in terms], device=device, dtype=torch.float32)
-    valid = torch.ones(len(terms), dtype=torch.bool, device=device)
-    return soft_bucket_loss(head(h[idx]), val, centers, valid)
 
 
 def train():

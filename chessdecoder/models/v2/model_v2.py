@@ -32,9 +32,9 @@ from torchtune.modules import (MultiHeadAttention, FeedForward, RMSNorm,
                                TransformerSelfAttentionLayer)
 
 from chessdecoder.dataloader.data import fen_to_position_tokens
-from chessdecoder.models.encoder import TransformerEncoderLayer
+from chessdecoder.models.v2.layers import (
+    TransformerEncoderLayer, FourierEncoder)
 from chessdecoder.models.v2.encoder_mode import PerceiverPool
-from chessdecoder.models.model import FourierEncoder, ValueHead, make_wl_buckets, make_d_buckets
 from chessdecoder.models.vocab import (
     token_to_idx, idx_to_token, policy_index,
     move_vocab_size, move_idx_to_full_idx, move_token_to_idx,
@@ -197,6 +197,30 @@ class TransitionHead(nn.Module):
         return {"square": sq, "stm": stm, "castling": cas}
 
 
+class WDLHead(nn.Module):
+    """Encoder-side pure position evaluator (markdowns/12).
+
+    One learned query cross-attends the board's 16 latents (same Perceiver
+    pattern as TransitionHead) -> 3 logits (win, draw, loss). Reads `z_i`
+    directly, never the decoder -> structurally leak-free, flash-friendly,
+    and applied identically to every board. Q = W-L and D = D are derived
+    from this single joint distribution, so they inherently "see each other".
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, embed_dim) * 0.02)
+        self.pool = PerceiverPool(embed_dim, num_heads)
+        self.head = nn.Linear(embed_dim, 3)            # win, draw, loss
+
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        # latents: [B,k,E] -> wdl logits [B,3]
+        b = latents.shape[0]
+        q = self.query.unsqueeze(0).expand(b, -1, -1)              # [B,1,E]
+        q = self.pool(q, latents, key_valid_mask=None)             # [B,1,E]
+        return self.head(q[:, 0, :])                               # [B,3]
+
+
 class ChessDecoderV2(nn.Module):
     """Full V2 model. One nn.Module, one optimizer, joint loss (markdowns/11).
 
@@ -210,8 +234,9 @@ class ChessDecoderV2(nn.Module):
                  num_encoder_layers=10, num_decoder_layers=12,
                  num_latents=NUM_LATENTS_DEFAULT, board_max_seq_len=68,
                  decoder_max_seq_len=2048, d_ff=1536,
-                 n_buckets=100, value_hidden_size=256,
-                 num_fourier_freq=128, wl_sigma=0.4):
+                 num_fourier_freq=128,
+                 # accepted-but-unused legacy kwargs (old bucketed value head):
+                 n_buckets=100, value_hidden_size=256, wl_sigma=0.4):
         super().__init__()
         self.vocab_size = vocab_size
         self.num_latents = num_latents
@@ -225,16 +250,12 @@ class ChessDecoderV2(nn.Module):
         self.decoder = CausalLatentDecoder(
             embed_dim, num_heads, num_decoder_layers, decoder_max_seq_len, d_ff)
         self.transition_head = TransitionHead(embed_dim, num_heads)
+        # Encoder-side joint WDL position evaluator (markdowns/12).
+        self.wdl_head = WDLHead(embed_dim, num_heads)
 
-        # Heads reused from V1 (sub-vocab sizes / value buckets unchanged).
         self.policy_head = nn.Linear(embed_dim, move_vocab_size)
         self.thinking_policy_head = nn.Linear(embed_dim, move_vocab_size)
-        self.wl_head = ValueHead(embed_dim, n_buckets, value_hidden_size)
-        self.d_head = ValueHead(embed_dim, n_buckets, value_hidden_size)
         self.fourier_encoder = FourierEncoder(embed_dim, num_fourier_freq)
-
-        self.register_buffer('wl_bucket_centers', make_wl_buckets(n_buckets, wl_sigma))
-        self.register_buffer('d_bucket_centers', make_d_buckets(n_buckets))
 
         self.pad_id = token_to_idx["pad"]
 
@@ -246,9 +267,20 @@ class ChessDecoderV2(nn.Module):
         return self.board_encoder(board_ids)
 
     def embed_value(self, value: torch.Tensor) -> torch.Tensor:
-        """Fourier injection for WL/D placeholders (V1 mechanism, decoder-side
-        only since WL/D never touch the encoder)."""
+        """Fourier features for a scalar [N] -> [N,E]."""
         return self.fourier_encoder(value)
+
+    def embed_wdl(self, wdl: torch.Tensor) -> torch.Tensor:
+        """Value-token injection (markdowns/12): WDL [N,3] -> [N,E] as
+        Fourier(Q) + Fourier(D), with Q = W-L and D = D. One token carrying
+        the full joint value, re-injected so later moves are eval-aware."""
+        w, d, l = wdl[:, 0], wdl[:, 1], wdl[:, 2]
+        return self.fourier_encoder(w - l) + self.fourier_encoder(d)
+
+    @torch.no_grad()
+    def predict_wdl(self, board_ids: torch.Tensor) -> torch.Tensor:
+        """[N,68] board ids -> softmax WDL [N,3] (pure position eval)."""
+        return torch.softmax(self.wdl_head(self.encode_boards(board_ids)), -1)
 
     # ---- engine-free rollout (Phase D) -----------------------------------
 
