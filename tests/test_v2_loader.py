@@ -34,11 +34,17 @@ def test_arrays_shapes_and_validity():
     # transition valid for plies 0,1 (ply 2 is the last -> no next board)
     assert a["trans_valid"].tolist() == [True, True, False] + [False] * 5
     assert a["policy_tgt"][0].item() == full_idx_to_move_idx[token_to_idx["e2e4"]]
-    # WDL target reconstructed from orig_q=0.2, orig_d=0.5:
-    # W=(1-0.5+0.2)/2=0.35, D=0.5, L=(1-0.5-0.2)/2=0.15 (sums to 1)
-    assert torch.allclose(a["wdl_tgt"][1],
+    # exact mean WDL from orig_q=0.2, orig_d=0.5:
+    # W=(1-0.5+0.2)/2=0.35, D=0.5, L=(1-0.5-0.2)/2=0.15
+    assert torch.allclose(a["wdl_mean"][1],
                           torch.tensor([0.35, 0.5, 0.15]), atol=1e-5)
+    # soft 2-D-simplex categorical: rows sum to 1 and are unbiased
+    # (expectation under the bucket grid recovers the mean WDL)
+    from chessdecoder.models.v2.value_buckets import CELL_WDL, N_CELLS
+    assert a["wdl_tgt"].shape == (8, N_CELLS)
     assert abs(a["wdl_tgt"][:3].sum(-1).sub(1.0).abs().max().item()) < 1e-5
+    recon = a["wdl_tgt"][:3] @ CELL_WDL
+    assert torch.allclose(recon, a["wdl_mean"][:3], atol=2e-2)
 
 
 def test_transition_target_is_next_ply_board():
@@ -89,7 +95,7 @@ def test_assemble_layout_and_fourier_injection():
     B, P, k = 1, 3, 4
     latents = m.encode_boards(a["board_ids"]).unsqueeze(0)        # [1,3,4,E]
     move_emb = m.tok_embedding(a["move_full"]).unsqueeze(0)        # [1,3,E]
-    value_emb = m.embed_wdl(a["wdl_tgt"]).unsqueeze(0)            # [1,3,E]
+    value_emb = m.embed_wdl(a["wdl_mean"]).unsqueeze(0)          # [1,3,E]
 
     seq, pos = assemble_decoder_inputs(latents, move_emb, value_emb)
     L = k + 2                                                     # [z|value|move]
@@ -103,7 +109,7 @@ def test_assemble_layout_and_fourier_injection():
     # latent slots, value slot (Fourier WDL), move slot are exact.
     assert torch.equal(seq[0, :k], latents[0, 0])
     assert torch.allclose(seq[0, pos["value_pos"][2]],
-                          m.embed_wdl(a["wdl_tgt"][2:3])[0].to(seq.dtype))
+                          m.embed_wdl(a["wdl_mean"][2:3])[0].to(seq.dtype))
     assert torch.equal(seq[0, pos["move_pos"][1]], move_emb[0, 1])
 
 

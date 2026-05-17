@@ -33,8 +33,38 @@ Closed-form read positions: `policy_pos[i] = i·18+16` (the value slot — the
 move is predicted **conditioned on board + its evaluation**, eval-aware),
 `move_pos[i] = i·18+17`.
 
-## 2. The WDL head — encoder-side pure position evaluator
+## 2. The WDL head — encoder-side 2-D-simplex categorical evaluator
 
+**Decision (supersedes a plain 3-way softmax):** a single 3-way WDL softmax
+is a *point* on the simplex — it can express the sharpness of a position but
+**cannot be multimodal** ("either winning or losing, unsure which" collapses
+to the same vector as "genuinely a 50/50 draw-less fight"). A single
+Dirichlet adds only a confidence width, still unimodal. So the head predicts
+a **categorical over a discretized 2-D simplex** (C51 generalized from a 1-D
+return to the WDL triangle): fully non-parametric, any shape incl. arbitrary
+bimodality, and the loss stays the soft cross-entropy we already use.
+
+Grid (`models/v2/value_buckets.py`, single source of truth for model+loader):
+- **Q axis** = Gaussian-CDF-quantile centers (concentrated at Q=0, coarse
+  toward ±1; odd `NQ=51` ⇒ exact center at 0, `sigma=0.5` ⇒ ~4–5× finer at
+  equality). Mirrors V1's `wl_sigma` intuition.
+- **D axis** = uniform, `ND=13`.
+- keep only cells with center inside the simplex (`|Q| ≤ 1−D`) ⇒ **405
+  cells**.
+- target: `(orig_q,orig_d)` → factorized C51-style **barycentric projection**
+  (1-D barycentric on Q ⊗ on D, invalid cells dropped+renormalized) → soft
+  categorical; per-axis expectation is unbiased so the decoded value is
+  correct. The exact mean WDL `[3]` is also kept for Fourier value-token
+  injection.
+- decode for play / metrics / injection: `mean = softmax(logits) @ CELL_WDL`
+  → Q=W−L, D=D. Categorical **entropy** logged as an uncertainty proxy.
+
+`WDLHead`: one learned query cross-attends the 16 board latents
+(`PerceiverPool`) → `Linear(E, N_CELLS=405)`. Reads `z_i` directly, never
+the decoder → leak-free, flash-friendly, uniform on every board, and now
+**multimodal-capable**.
+
+[legacy description — single-blob variant, kept for context:]
 `WDLHead(z_i) -> 3 logits (win, draw, loss)`. One learned query
 cross-attends over the 16 board latents (`PerceiverPool`, same pattern as
 `TransitionHead`) → `Linear(E,3)`. **Reads the encoder latents `z_i`

@@ -39,6 +39,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from chessdecoder.dataloader.data import fen_to_position_tokens
 from chessdecoder.models.vocab import (token_to_idx, full_idx_to_move_idx)
 from chessdecoder.models.v2.model_v2 import board_tokens_to_transition_targets
+from chessdecoder.models.v2.value_buckets import N_CELLS, project_targets
 
 IGNORE_INDEX = -100
 
@@ -62,12 +63,15 @@ def game_to_v2_arrays(game_df, max_plies):
     move_full = torch.zeros(max_plies, dtype=torch.long)
     policy_tgt = torch.full((max_plies,), IGNORE_INDEX, dtype=torch.long)
     policy_valid = torch.zeros(max_plies, dtype=torch.bool)
-    # Per-position WDL soft target (markdowns/12): reconstructed from the
-    # position's ORIGINAL eval orig_q/orig_d (a position quantity, unlike
-    # played_q/d which is an action value).  W=(1-D+Q)/2, L=(1-D-Q)/2.
-    wdl_tgt = torch.zeros(max_plies, 3, dtype=torch.float32)
+    # Per-position WDL target (markdowns/12), from the position's ORIGINAL
+    # eval orig_q/orig_d (a position quantity, unlike played_q/d). We keep
+    # both the exact mean WDL [3] (for Fourier value-token injection) and the
+    # 2-D-simplex soft categorical [N_CELLS] (the loss target).
+    wdl_mean = torch.zeros(max_plies, 3, dtype=torch.float32)
+    wdl_tgt = torch.zeros(max_plies, N_CELLS, dtype=torch.float32)
     wdl_valid = torch.zeros(max_plies, dtype=torch.bool)
     ply_mask = torch.zeros(max_plies, dtype=torch.bool)
+    q_buf, d_buf, q_idx = [], [], []
 
     for i, row in enumerate(rows):
         toks = fen_to_position_tokens(row.fen)
@@ -83,9 +87,16 @@ def game_to_v2_arrays(game_df, max_plies):
             w = (1.0 - dd + q) / 2.0
             l = (1.0 - dd - q) / 2.0
             v = torch.tensor([w, dd, l], dtype=torch.float32).clamp_(0.0, 1.0)
-            wdl_tgt[i] = v / v.sum().clamp_(min=1e-8)        # renorm -> distribution
+            wdl_mean[i] = v / v.sum().clamp_(min=1e-8)
+            q_buf.append(max(-1.0, min(1.0, w - l)))
+            d_buf.append(dd)
+            q_idx.append(i)
             wdl_valid[i] = True
         ply_mask[i] = True
+
+    if q_idx:                                 # vectorized C51-style projection
+        cat = project_targets(torch.tensor(q_buf), torch.tensor(d_buf))
+        wdl_tgt[torch.tensor(q_idx)] = cat
 
     # Transition target for ply i is the board at ply i+1.
     tsq = torch.full((max_plies, 64), IGNORE_INDEX, dtype=torch.long)
@@ -102,7 +113,7 @@ def game_to_v2_arrays(game_df, max_plies):
     return {
         "board_ids": board_ids, "move_full": move_full,
         "policy_tgt": policy_tgt, "policy_valid": policy_valid,
-        "wdl_tgt": wdl_tgt, "wdl_valid": wdl_valid,
+        "wdl_tgt": wdl_tgt, "wdl_mean": wdl_mean, "wdl_valid": wdl_valid,
         "trans_sq": tsq, "trans_stm": tstm, "trans_cas": tcas,
         "trans_valid": trans_valid, "ply_mask": ply_mask,
     }

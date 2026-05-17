@@ -136,7 +136,8 @@ def train():
             move_full = batch["move_full"].to(device)       # [B,P]
             pol_tgt = batch["policy_tgt"].to(device)
             pol_val = batch["policy_valid"].to(device)
-            wdl_tgt = batch["wdl_tgt"].to(device)           # [B,P,3]
+            wdl_tgt = batch["wdl_tgt"].to(device)           # [B,P,N_CELLS] soft cat
+            wdl_mean = batch["wdl_mean"].to(device)         # [B,P,3] exact WDL
             wdl_val = batch["wdl_valid"].to(device)
             tsq = batch["trans_sq"].to(device)              # [B,P,64]
             tstm = batch["trans_stm"].to(device)
@@ -149,18 +150,20 @@ def train():
                     bid.reshape(B * P, 68)).reshape(B, P, -1, model.embed_dim)
                 E = model.embed_dim
 
-                # --- WDL: encoder-side joint position evaluator (leak-free) ---
+                # --- WDL: encoder-side 2-D-simplex categorical evaluator
+                # (leak-free, multimodal-capable) ---
+                ncell = wdl_tgt.shape[-1]
                 wdl_logits = model.wdl_head(
-                    latents.reshape(B * P, -1, E)).reshape(B, P, 3)
+                    latents.reshape(B * P, -1, E)).reshape(B, P, ncell)
                 vmask = (wdl_val & ply_mask)                  # [B,P]
                 logp = torch.log_softmax(wdl_logits.float(), dim=-1)
                 wdl_ce = -(wdl_tgt * logp).sum(-1)            # [B,P] soft-CE
                 wdl_loss = (wdl_ce * vmask).sum() / (vmask.sum() + 1e-8)
 
-                # value token = Fourier(Q)+Fourier(D) from the target WDL,
-                # teacher-forced into the stream (markdowns/12).
+                # value token = Fourier(Q)+Fourier(D) from the exact target
+                # WDL mean, teacher-forced into the stream (markdowns/12).
                 value_emb = model.embed_wdl(
-                    wdl_tgt.reshape(-1, 3)).reshape(B, P, E)
+                    wdl_mean.reshape(-1, 3)).reshape(B, P, E)
                 move_emb = model.tok_embedding(move_full)     # [B,P,E]
                 seq, pos = assemble_decoder_inputs(latents, move_emb, value_emb)
                 h = model.decoder(seq)                        # [B, P*L, E]
@@ -226,16 +229,21 @@ def train():
                                   + (stm_ok & bm).sum()
                                   + (cas_ok & bm).sum()) / (nb * 66))
 
-                    # --- WDL metrics (joint position evaluator) ---
+                    # --- WDL metrics: decode the simplex categorical to its
+                    # mean and compare to the exact target WDL ---
                     vf = vmask.float()
                     vn = vf.sum() + 1e-8
-                    wdl_p = torch.softmax(wdl_logits.float(), -1)        # [B,P,3]
+                    wdl_p = model.wdl_head.mean_wdl(wdl_logits)          # [B,P,3]
                     q_pred = wdl_p[..., 0] - wdl_p[..., 2]               # Q = W-L
-                    q_tgt = wdl_tgt[..., 0] - wdl_tgt[..., 2]
+                    q_tgt = wdl_mean[..., 0] - wdl_mean[..., 2]
                     q_mae = ((q_pred - q_tgt).abs() * vf).sum() / vn
-                    d_mae = ((wdl_p[..., 1] - wdl_tgt[..., 1]).abs() * vf).sum() / vn
-                    wdl_acc = ((wdl_p.argmax(-1) == wdl_tgt.argmax(-1))
+                    d_mae = ((wdl_p[..., 1] - wdl_mean[..., 1]).abs() * vf).sum() / vn
+                    wdl_acc = ((wdl_p.argmax(-1) == wdl_mean.argmax(-1))
                                & vmask).sum() / vn
+                    # categorical entropy = an uncertainty proxy
+                    pcat = torch.softmax(wdl_logits.float(), -1)
+                    wdl_entropy = ((-(pcat * (pcat + 1e-9).log()).sum(-1))
+                                   * vf).sum() / vn
 
                     # --- max |logit| per head (logit-explosion watch) ---
                     policy_logit_max = pol_logits.detach().abs().max()
@@ -276,6 +284,7 @@ def train():
                     "train/wdl_acc": wdl_acc.item(),
                     "train/q_mae": q_mae.item(),
                     "train/d_mae": d_mae.item(),
+                    "train/wdl_entropy": wdl_entropy.item(),
                     "train/policy_logit_max": policy_logit_max.item(),
                     "train/board_logit_max": board_logit_max.item(),
                     "train/value_logit_max": value_logit_max.item(),

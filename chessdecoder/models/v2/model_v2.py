@@ -35,6 +35,7 @@ from chessdecoder.dataloader.data import fen_to_position_tokens
 from chessdecoder.models.v2.layers import (
     TransformerEncoderLayer, FourierEncoder)
 from chessdecoder.models.v2.encoder_mode import PerceiverPool
+from chessdecoder.models.v2.value_buckets import CELL_WDL, N_CELLS
 from chessdecoder.models.vocab import (
     token_to_idx, idx_to_token, policy_index,
     move_vocab_size, move_idx_to_full_idx, move_token_to_idx,
@@ -201,24 +202,33 @@ class WDLHead(nn.Module):
     """Encoder-side pure position evaluator (markdowns/12).
 
     One learned query cross-attends the board's 16 latents (same Perceiver
-    pattern as TransitionHead) -> 3 logits (win, draw, loss). Reads `z_i`
+    pattern as TransitionHead) -> a categorical over the 2-D simplex value
+    grid (``value_buckets.N_CELLS``: Q-concentrated, D-uniform). Reads `z_i`
     directly, never the decoder -> structurally leak-free, flash-friendly,
-    and applied identically to every board. Q = W-L and D = D are derived
-    from this single joint distribution, so they inherently "see each other".
+    uniform on every board. Multimodal-capable: can put mass on two distinct
+    WDL hypotheses (e.g. "winning or losing, unsure which"). Q and D are read
+    off the categorical's mean, so they jointly "see each other".
     """
 
     def __init__(self, embed_dim: int, num_heads: int):
         super().__init__()
         self.query = nn.Parameter(torch.randn(1, embed_dim) * 0.02)
         self.pool = PerceiverPool(embed_dim, num_heads)
-        self.head = nn.Linear(embed_dim, 3)            # win, draw, loss
+        self.head = nn.Linear(embed_dim, N_CELLS)      # 2-D simplex buckets
+        self.register_buffer("cell_wdl", CELL_WDL.clone())   # [N_CELLS,3]
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        # latents: [B,k,E] -> wdl logits [B,3]
+        # latents: [B,k,E] -> bucket logits [B,N_CELLS]
         b = latents.shape[0]
         q = self.query.unsqueeze(0).expand(b, -1, -1)              # [B,1,E]
         q = self.pool(q, latents, key_valid_mask=None)             # [B,1,E]
-        return self.head(q[:, 0, :])                               # [B,3]
+        return self.head(q[:, 0, :])                               # [B,N_CELLS]
+
+    def mean_wdl(self, logits: torch.Tensor) -> torch.Tensor:
+        """bucket logits [...,N_CELLS] -> mean WDL [...,3] (the value to act
+        on: E[(W,D,L)] under the predicted categorical)."""
+        p = torch.softmax(logits.float(), dim=-1)
+        return p @ self.cell_wdl.to(p.dtype)
 
 
 class ChessDecoderV2(nn.Module):
@@ -279,8 +289,9 @@ class ChessDecoderV2(nn.Module):
 
     @torch.no_grad()
     def predict_wdl(self, board_ids: torch.Tensor) -> torch.Tensor:
-        """[N,68] board ids -> softmax WDL [N,3] (pure position eval)."""
-        return torch.softmax(self.wdl_head(self.encode_boards(board_ids)), -1)
+        """[N,68] board ids -> mean WDL [N,3] (pure position eval; the value
+        to act on, E[(W,D,L)] under the predicted simplex categorical)."""
+        return self.wdl_head.mean_wdl(self.wdl_head(self.encode_boards(board_ids)))
 
     # ---- engine-free rollout (Phase D) -----------------------------------
 

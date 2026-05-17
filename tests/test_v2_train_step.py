@@ -38,13 +38,14 @@ def test_v2_training_step_and_encoder_gradient():
 
     latents = m.encode_boards(batch["board_ids"].reshape(B * P, 68)).reshape(B, P, -1, 32)
 
-    # --- encoder-side joint WDL (leak-free), soft cross-entropy ---
-    wdl_logits = m.wdl_head(latents.reshape(B * P, -1, 32)).reshape(B, P, 3)
+    # --- encoder-side 2-D-simplex categorical WDL (leak-free), soft-CE ---
+    ncell = batch["wdl_tgt"].shape[-1]
+    wdl_logits = m.wdl_head(latents.reshape(B * P, -1, 32)).reshape(B, P, ncell)
     vmask = batch["wdl_valid"] & batch["ply_mask"]
     logp = torch.log_softmax(wdl_logits.float(), -1)
     wdl_loss = (-(batch["wdl_tgt"] * logp).sum(-1) * vmask).sum() / (vmask.sum() + 1e-8)
 
-    value_emb = m.embed_wdl(batch["wdl_tgt"].reshape(-1, 3)).reshape(B, P, 32)
+    value_emb = m.embed_wdl(batch["wdl_mean"].reshape(-1, 3)).reshape(B, P, 32)
     move_emb = m.tok_embedding(batch["move_full"])
     seq, pos = assemble_decoder_inputs(latents, move_emb, value_emb)
     h = m.decoder(seq)
