@@ -306,7 +306,8 @@ running HP sweep informs Phase C defaults (optimizer/LR/wd/clip).
 | E — engine-free generator (RL rollout core) | ✅ done | `model_v2.generate_v2` (decode→sample→transition→encode→append, per-token log-probs; V2-native rollout record) | `tests/test_v2_generate.py` (2) |
 | E — GRPO reward/advantage + log-prob recompute wiring | ⏳ next | re-point `rl/grpo.py`/`log_probs.py` to V2 policy-head positions; needs RL reward harness (not runnable here) | — |
 | F — eval (multi-ply history) | ✅ done | `model_v2.predict_move_n` (engine-free roll-forward; n=0 ≡ predict_move) | `tests/test_v2_generate.py` (1) |
-| G — export + C++ | ⏳ last | TorchScript 3 modules; textbook causal KV cache; FEN→latents cache | — |
+| G.1 — export encoder + transition (fixed-shape) | ✅ done | `export/export_v2.py` traces both + eager-vs-scripted parity gate + contract `config.json` | `tests/test_v2_export.py` (1) |
+| G.2 — export causal decoder + C++ engine | ⏳ last | KV-cache rebuild (cf. `export/backbone_causal.py`) — textbook causal cache (no V1 block-boundary invalidation), then C++ engine + FEN→latents cache | — |
 
 **Notes / divergences from the plan, decided during implementation:**
 - **No en-passant target.** `fen_to_position_tokens` does not tokenize ep
