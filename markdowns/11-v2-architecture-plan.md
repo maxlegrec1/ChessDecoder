@@ -300,7 +300,8 @@ running HP sweep informs Phase C defaults (optimizer/LR/wd/clip).
 | B — dataloader / sequence builder | ✅ done | `chessdecoder/dataloader/loader_v2.py` (`game_to_v2_arrays`, `assemble_decoder_inputs`, `ChessV2IterableDataset`) | `tests/test_v2_loader.py` (4) |
 | C — pretraining | ✅ done | `chessdecoder/train/train_v2.py` + `config_v2.yaml` | `tests/test_v2_train_step.py` (1, incl. encoder-grad-flow) |
 | F — eval (single-position) | ✅ done | reuses `PytorchModelAdapter`; `ChessDecoderV2.predict_move` matches the contract | `tests/test_v2_eval_adapter.py` (1) |
-| D — finetune thinking + engine-free rollout | ⏳ next | sequence builder for `start_think…end_think`; scheduled-sampling rollout via transition head | — |
+| D — finetune thinking (sequence splice) | ✅ done | `dataloader/sequence_v2.py` (`Seg`, `build_mixed_sequence`, `variation_plan_from_token_ids` — reuses `finetune/data.py`'s variation parser verbatim, only the representation changes) | `tests/test_v2_sequence.py` (2) |
+| D — engine-free scheduled-sampling rollout + finetune loop | ⏳ next | transition-head rollout (replace GT board latents w/ predicted), `finetune/train_v2.py` + config | — |
 | E — RL / GRPO plumbing | ⏳ next | `rl/rollout.py`/`sequence.py` decoder→move→transition→encode loop; log-prob re-pointing | — |
 | F — eval (multi-ply history) | ⏳ next | `predict_move_n` port (cached per-board latents) | — |
 | G — export + C++ | ⏳ last | TorchScript 3 modules; textbook causal KV cache; FEN→latents cache | — |
