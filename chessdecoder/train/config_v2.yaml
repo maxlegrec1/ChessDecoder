@@ -4,7 +4,7 @@ project_name: "chess-decoder-v2"
 run_name: "v2-run-1"
 
 data:
-  parquet_dir: "/home/maxime/parquet_files_decoder/"
+  parquet_dir: "/workspace/ChessDecoder/parquet_files_decoder/"
   batch_size: 16
   num_workers: 8
   max_plies: 64          # decoder seq len = max_plies * (num_latents + 3)
