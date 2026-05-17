@@ -1,0 +1,39 @@
+# V2 thinking-variation finetune config. V1 finetune/config.yaml untouched.
+project_name: "chess-decoder-v2-finetune"
+run_name: "v2-finetune-thinking-1"
+
+data:
+  variation_parquet_dir: "./parquets_variations2_fixed/"
+  max_variations: 3
+  max_depth: 5
+  tau_base: 0.3
+  tau_alpha: 1.0
+  use_backed_up_wdl: true
+
+model:
+  embed_dim: 1024
+  num_heads: 16
+  num_encoder_layers: 10
+  num_decoder_layers: 8
+  num_latents: 16
+  d_ff: 1536
+  decoder_max_seq_len: 8192   # thinking traces are long; k=16 keeps them ~4x shorter than V1
+
+training:
+  learning_rate: 3.0e-5
+  weight_decay: 0.1
+  num_epochs: 5
+  log_every_n_steps: 10
+  save_every_n_steps: 2000
+  device: "cuda"
+  pretrain_checkpoint: null   # set to a V2 pretrain checkpoint_*.pt
+  checkpoint_dir: "checkpoints/"
+  scheduled_sampling_max: 0.25
+  scheduled_sampling_ramp_steps: 20000
+
+loss:
+  final_move_weight: 3.0
+  thinking_move_weight: 3.0
+  wl_weight: 3.0
+  d_weight: 3.0
+  transition_weight: 1.0

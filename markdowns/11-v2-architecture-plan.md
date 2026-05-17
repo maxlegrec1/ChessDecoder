@@ -301,7 +301,8 @@ running HP sweep informs Phase C defaults (optimizer/LR/wd/clip).
 | C — pretraining | ✅ done | `chessdecoder/train/train_v2.py` + `config_v2.yaml` | `tests/test_v2_train_step.py` (1, incl. encoder-grad-flow) |
 | F — eval (single-position) | ✅ done | reuses `PytorchModelAdapter`; `ChessDecoderV2.predict_move` matches the contract | `tests/test_v2_eval_adapter.py` (1) |
 | D — finetune thinking (sequence splice) | ✅ done | `dataloader/sequence_v2.py` (`Seg`, `build_mixed_sequence`, `variation_plan_from_token_ids` — reuses `finetune/data.py`'s variation parser verbatim, only the representation changes) | `tests/test_v2_sequence.py` (2) |
-| D — engine-free scheduled-sampling rollout + finetune loop | ⏳ next | transition-head rollout (replace GT board latents w/ predicted), `finetune/train_v2.py` + config | — |
+| D — engine-free rollout + scheduled sampling + finetune loop | ✅ done | `model_v2.decode_transition`/`rollout_next`/`scheduled_sample_latents`; `finetune/loader_v2.py` + `train_v2.py` + `config_v2.yaml` | `tests/test_v2_rollout.py` (3, incl. bit-exact inverse), `tests/test_v2_finetune.py` (2, incl. encoder grad-flow + ss path) |
+| D — real-data finetune validation | ⏳ blocked | needs variation parquets (`scripts/generate_variations.py`, MCTS) — not present locally | — |
 | E — RL / GRPO plumbing | ⏳ next | `rl/rollout.py`/`sequence.py` decoder→move→transition→encode loop; log-prob re-pointing | — |
 | F — eval (multi-ply history) | ⏳ next | `predict_move_n` port (cached per-board latents) | — |
 | G — export + C++ | ⏳ last | TorchScript 3 modules; textbook causal KV cache; FEN→latents cache | — |

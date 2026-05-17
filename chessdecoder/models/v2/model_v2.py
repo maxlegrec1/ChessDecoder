@@ -57,6 +57,13 @@ SQUARE_TOKID_TO_CLASS = {token_to_idx[t]: i for i, t in enumerate(SQUARE_VOCAB)}
 STM_TOKID_TO_CLASS = {token_to_idx[t]: i for i, t in enumerate(STM_VOCAB)}
 CASTLING_TOKID_TO_CLASS = {token_to_idx[t]: i for i, t in enumerate(CASTLING_VOCAB)}
 
+# inverse: transition class id -> full-vocab token id (engine-free rollout:
+# decode the parallel head back into the model's own 68-token board layout —
+# the exact inverse of fen_to_position_tokens, no chess library involved)
+SQUARE_CLASS_TO_TOKID = [token_to_idx[t] for t in SQUARE_VOCAB]
+STM_CLASS_TO_TOKID = [token_to_idx[t] for t in STM_VOCAB]
+CASTLING_CLASS_TO_TOKID = [token_to_idx[t] for t in CASTLING_VOCAB]
+
 NUM_LATENTS_DEFAULT = 16
 
 
@@ -242,6 +249,54 @@ class ChessDecoderV2(nn.Module):
         """Fourier injection for WL/D placeholders (V1 mechanism, decoder-side
         only since WL/D never touch the encoder)."""
         return self.fourier_encoder(value)
+
+    # ---- engine-free rollout (Phase D) -----------------------------------
+
+    def decode_transition(self, out: dict) -> torch.Tensor:
+        """Transition-head logits dict -> board_ids [B,68] in the model's own
+        tokenization (start_pos, 64 squares, end_pos, castling, stm). Exact
+        inverse of board_tokens_to_transition_targets — no chess library, so
+        rollouts stay engine-free."""
+        dev = out["square"].device
+        B = out["square"].shape[0]
+        sq = out["square"].argmax(-1)                            # [B,64]
+        stm = out["stm"].argmax(-1)                              # [B]
+        cas = out["castling"].argmax(-1)                         # [B]
+        sq_lut = torch.tensor(SQUARE_CLASS_TO_TOKID, device=dev)
+        stm_lut = torch.tensor(STM_CLASS_TO_TOKID, device=dev)
+        cas_lut = torch.tensor(CASTLING_CLASS_TO_TOKID, device=dev)
+        ids = torch.empty(B, 68, dtype=torch.long, device=dev)
+        ids[:, 0] = token_to_idx["start_pos"]
+        ids[:, 1:65] = sq_lut[sq]
+        ids[:, 65] = token_to_idx["end_pos"]
+        ids[:, 66] = cas_lut[cas]
+        ids[:, 67] = stm_lut[stm]
+        return ids
+
+    @torch.no_grad()
+    def rollout_next(self, latents: torch.Tensor, move_emb: torch.Tensor):
+        """(z_t [B,k,E], move_emb [B,E]) -> (board_ids [B,68], z_{t+1}
+        [B,k,E]) entirely from the model: imagine the next board with the
+        parallel transition head, re-tokenize, re-encode. The generation loop
+        for thinking/RL appends z_{t+1} to the causal stream — no engine."""
+        out = self.transition_head(latents, move_emb)
+        board_ids = self.decode_transition(out)
+        return board_ids, self.encode_boards(board_ids)
+
+    @staticmethod
+    def scheduled_sample_latents(gt_latents: torch.Tensor,
+                                 pred_latents: torch.Tensor,
+                                 p: float) -> torch.Tensor:
+        """Per-board Bernoulli(p) swap of ground-truth board latents for the
+        transition head's own predicted latents (exposure-bias fix). p ramps
+        0 -> p_max over finetuning so the model trains on the boards it will
+        actually roll out at inference. gt/pred: [N,k,E]."""
+        if p <= 0.0:
+            return gt_latents
+        n = gt_latents.shape[0]
+        use_pred = (torch.rand(n, device=gt_latents.device) < p)
+        m = use_pred.view(n, 1, 1).to(gt_latents.dtype)
+        return (1 - m) * gt_latents + m * pred_latents
 
     # ---- inference: degenerate single-board case (eval compat) -----------
 
