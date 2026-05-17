@@ -303,8 +303,9 @@ running HP sweep informs Phase C defaults (optimizer/LR/wd/clip).
 | D — finetune thinking (sequence splice) | ✅ done | `dataloader/sequence_v2.py` (`Seg`, `build_mixed_sequence`, `variation_plan_from_token_ids` — reuses `finetune/data.py`'s variation parser verbatim, only the representation changes) | `tests/test_v2_sequence.py` (2) |
 | D — engine-free rollout + scheduled sampling + finetune loop | ✅ done | `model_v2.decode_transition`/`rollout_next`/`scheduled_sample_latents`; `finetune/loader_v2.py` + `train_v2.py` + `config_v2.yaml` | `tests/test_v2_rollout.py` (3, incl. bit-exact inverse), `tests/test_v2_finetune.py` (2, incl. encoder grad-flow + ss path) |
 | D — real-data finetune validation | ⏳ blocked | needs variation parquets (`scripts/generate_variations.py`, MCTS) — not present locally | — |
-| E — RL / GRPO plumbing | ⏳ next | `rl/rollout.py`/`sequence.py` decoder→move→transition→encode loop; log-prob re-pointing | — |
-| F — eval (multi-ply history) | ⏳ next | `predict_move_n` port (cached per-board latents) | — |
+| E — engine-free generator (RL rollout core) | ✅ done | `model_v2.generate_v2` (decode→sample→transition→encode→append, per-token log-probs; V2-native rollout record) | `tests/test_v2_generate.py` (2) |
+| E — GRPO reward/advantage + log-prob recompute wiring | ⏳ next | re-point `rl/grpo.py`/`log_probs.py` to V2 policy-head positions; needs RL reward harness (not runnable here) | — |
+| F — eval (multi-ply history) | ✅ done | `model_v2.predict_move_n` (engine-free roll-forward; n=0 ≡ predict_move) | `tests/test_v2_generate.py` (1) |
 | G — export + C++ | ⏳ last | TorchScript 3 modules; textbook causal KV cache; FEN→latents cache | — |
 
 **Notes / divergences from the plan, decided during implementation:**

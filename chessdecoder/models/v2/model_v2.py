@@ -298,6 +298,67 @@ class ChessDecoderV2(nn.Module):
         m = use_pred.view(n, 1, 1).to(gt_latents.dtype)
         return (1 - m) * gt_latents + m * pred_latents
 
+    # ---- engine-free autoregressive generation (Phase E rollout / F-multi) -
+
+    @torch.no_grad()
+    def generate_v2(self, root_board_ids: torch.Tensor, max_plies: int,
+                    temperature: float = 1.0):
+        """Engine-free game rollout from a root board (no chess library, no
+        C++ engine). Loop: decode causal stream -> sample move from
+        policy_head (capture log-prob) -> transition_head imagines the next
+        board -> re-encode -> append latents -> repeat.
+
+        root_board_ids: [1,68]. Returns a list of per-ply dicts
+        {move_sub_id, move_logprob, board_ids[1,68]} — the V2-native rollout
+        record GRPO consumes (log-prob recompute re-points to the same
+        policy-head positions) and `predict_move_n` reads the last move from.
+        Greedy/argmax when temperature==0."""
+        self.eval()
+        dev = next(self.parameters()).device
+        k = self.num_latents
+        z = self.encode_boards(root_board_ids)                  # [1,k,E]
+        stream = [z]                                            # list of [1,*,E]
+        plies = []
+        for _ in range(max_plies):
+            seq = torch.cat(stream, dim=1)                      # [1,S,E]
+            h = self.decoder(seq)
+            logits = self.policy_head(h[0, -1, :])              # at last latent
+            logp = torch.log_softmax(logits, dim=-1)
+            if temperature == 0.0:
+                sub = int(torch.argmax(logits))
+            else:
+                sub = int(torch.multinomial(
+                    torch.softmax(logits / temperature, -1), 1))
+            move_full = move_idx_to_full_idx[sub]
+            move_emb = self.tok_embedding(
+                torch.tensor([move_full], device=dev))          # [1,E]
+            board_ids, z_next = self.rollout_next(z, move_emb)  # engine-free
+            plies.append({"move_sub_id": sub,
+                          "move_logprob": float(logp[sub]),
+                          "board_ids": board_ids})
+            # append move embedding + next-board latents to the causal stream
+            stream.append(move_emb.unsqueeze(1))                # [1,1,E]
+            stream.append(z_next)                               # [1,k,E]
+            z = z_next
+        return plies
+
+    @torch.no_grad()
+    def predict_move_n(self, root_fen: str, n_history_plies: int = 0,
+                       temperature: float = 0.0) -> str:
+        """Multi-ply eval (Phase F-multi): engine-free roll forward
+        ``n_history_plies`` then return the next predicted move (UCI). With
+        n_history_plies==0 this matches ``predict_move``."""
+        tokens = fen_to_position_tokens(root_fen)
+        bid = torch.tensor([[token_to_idx[t] for t in tokens]],
+                           dtype=torch.long,
+                           device=next(self.parameters()).device)
+        plies = self.generate_v2(bid, max_plies=n_history_plies + 1,
+                                 temperature=temperature)
+        sub = plies[-1]["move_sub_id"]
+        s = idx_to_token[move_idx_to_full_idx[sub]]
+        return {'e1h1': 'e1g1', 'e1a1': 'e1c1',
+                'e8h8': 'e8g8', 'e8a8': 'e8c8'}.get(s, s)
+
     # ---- inference: degenerate single-board case (eval compat) -----------
 
     @torch.no_grad()
