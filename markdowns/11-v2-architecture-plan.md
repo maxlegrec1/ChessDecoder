@@ -325,3 +325,55 @@ running HP sweep informs Phase C defaults (optimizer/LR/wd/clip).
   pending the final sweep aggregation).
 - V1 (`models/model.py`, `train/train.py`, `config.yaml`) untouched;
   full CPU test suite still 140 passed, 0 regressions.
+
+# 13. HP sweep results — 2⁴⁻¹ resolution-IV factorial (8 runs, 10k steps)
+
+Design: A=LR{3e-4,1e-3} · B=opt{adamw,muon} · C=wd{0,0.1} ·
+D=grad_clip{1,10}, D=ABC generator. Single seed, eff. batch 2048, ChessFENS,
+held-out val, 60-game Stockfish match (UCI_Elo, temp 0) at step 10k.
+
+**Data-quality caveat (reported, not hidden):** the per-step `*.csv`
+`val_*`/`train_top*` columns are unreliable — several runs were created with
+the 6-col header but appended with 9-col rows after an orchestrator resume, so
+a header-keyed parse mis-maps them. Analysis therefore uses only the two
+schema-stable signals: the clean separate `*_sf.csv` **Stockfish ELO** and
+**`train_loss`** (column 2, identical in both schemas).
+
+**Final ranking by ELO:**
+
+| LR | opt | wd | clip | ELO | train_loss |
+|---|---|---|---|---|---|
+| 1e-3 | muon | 0 | 1 | **1152** | 1.776 |
+| 3e-4 | adamw | 0.1 | 10 | **1144** | 1.809 |
+| 3e-4 | adamw | 0 | 1 | 1113 | 1.941 |
+| 1e-3 | muon | 0.1 | 10 | 1097 | 1.812 |
+| 3e-4 | muon | 0 | 10 | 903 | 2.334 |
+| 3e-4 | muon | 0.1 | 1 | 837 | 2.432 |
+| 1e-3 | adamw | 0.1 | 1 | 684 | 2.716 |
+| 1e-3 | adamw | 0 | 10 | 0 (collapsed) | 2.939 |
+
+**Main effects** (Δ = high−low; res-IV → each main effect aliased with a
+3-factor interaction, so read as directional, not exact):
+
+| Factor | ΔELO | Δtrain_loss |
+|---|---|---|
+| LR 1e-3 vs 3e-4 | −266 | +0.18 |
+| optimizer muon vs adamw | +262 | −0.26 |
+| weight decay 0.1 vs 0 | +149 | −0.06 |
+| grad clip 10 vs 1 | −161 | +0.01 |
+
+**Interpretation.** The dominant structure is an **LR × optimizer
+interaction**, not clean main effects: AdamW needs the *low* LR (3e-4: 1144 /
+1113; at 1e-3 it collapses to 684 / 0), while Muon needs the *high* LR (1e-3:
+1152 / 1097; at 3e-4 only 903 / 837 — classic Muon behaviour, it wants a
+larger step). The two regimes are statistically tied (top two within 8 ELO ≪
+the ~±60 ELO SE of a 60-game match). Weight-decay 0.1 helps modestly and
+consistently; grad-clip 10's apparent harm is mostly confounded with the
+LR×opt aliasing (the clip=10 cell is loaded with the bad AdamW@1e-3 corner).
+
+**Phase-C defaults (decided):** keep **AdamW / 3e-4 / wd 0.1 / clip 10** —
+already set in `config_v2.yaml`, the more standard/robust corner and the
+codebase's native optimizer. **Muon / 1e-3 / wd 0 / clip 1** is the
+co-leading alternative; worth a 2-seed confirmation if a faster-converging
+optimizer is later wanted (Muon also reached the best train_loss). No
+single-corner blowups in the chosen regime.
