@@ -407,17 +407,22 @@ class ChessDecoderV2(nn.Module):
     @torch.no_grad()
     def predict_move(self, fen: str, temperature: float = 1.0,
                      force_legal: bool = True) -> str:
-        """Single-position FEN -> best move. Same semantics/signature as
-        ChessEncoder.predict_move so PytorchModelAdapter / elo_eval work
-        unchanged. Sequence = z_0 (k latents); policy read at last latent."""
+        """Single-position FEN -> best move. Mirrors the *training* sequence
+        for one ply: [ z_0 (k latents) | value ] and reads policy_head at the
+        value slot (markdowns/12). The value token is the model's own
+        predicted WDL (teacher-forced with the target at train; predicted at
+        inference). PytorchModelAdapter / elo_eval signature unchanged."""
         self.eval()
         device = next(self.parameters()).device
         tokens = fen_to_position_tokens(fen)
         board_ids = torch.tensor([[token_to_idx[t] for t in tokens]],
                                  dtype=torch.long, device=device)
-        latents = self.encode_boards(board_ids)                 # [1,k,E]
-        h = self.decoder(latents)                                # [1,k,E]
-        logits = self.policy_head(h[0, -1, :])                   # [move_vocab]
+        z0 = self.encode_boards(board_ids)                       # [1,k,E]
+        mean_wdl = self.wdl_head.mean_wdl(self.wdl_head(z0))      # [1,3]
+        value_emb = self.embed_wdl(mean_wdl).unsqueeze(1)        # [1,1,E]
+        seq = torch.cat([z0, value_emb.to(z0.dtype)], dim=1)     # [1,k+1,E]
+        h = self.decoder(seq)                                    # [1,k+1,E]
+        logits = self.policy_head(h[0, self.num_latents, :])     # value slot
 
         if force_legal:
             board = chess.Board(fen)
