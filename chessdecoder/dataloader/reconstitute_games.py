@@ -10,6 +10,10 @@ from multiprocessing import Pool, cpu_count
 from concurrent.futures import ThreadPoolExecutor
 from chessdecoder.dataloader.policy_index import policy_index
 
+# Internal parallelism. Defaults to all cores (unchanged behaviour); set
+# RECON_WORKERS to bound it when running several conversions concurrently.
+NPROC = int(os.environ.get("RECON_WORKERS", cpu_count()))
+
 
 class Timer:
     """Simple context manager for timing code blocks."""
@@ -374,7 +378,7 @@ def main():
     print(f"{'='*60}")
     print(f"Processing: {tar_path}")
     print(f"Output:     {output_path}")
-    print(f"Workers:    {cpu_count()}")
+    print(f"Workers:    {NPROC}")
     print(f"{'='*60}")
     
     # 1. Read all raw records into memory first (bulk read with parallel decompression)
@@ -403,7 +407,7 @@ def main():
         
         raw_records = []
         total_bytes = 0
-        with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
+        with ThreadPoolExecutor(max_workers=NPROC) as executor:
             results = executor.map(decompress_and_parse, gz_contents)
             for records, nbytes in results:
                 raw_records.extend(records)
@@ -419,7 +423,7 @@ def main():
         batch_size = max(1000, len(raw_records) // (cpu_count() * 4))
         batches = [raw_records[i:i+batch_size] for i in range(0, len(raw_records), batch_size)]
         
-        with Pool(cpu_count()) as pool:
+        with Pool(NPROC) as pool:
             results = pool.map(process_batch, batches)
         
         all_rows = [row for batch in results for row in batch]
