@@ -18,6 +18,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.23.1",
     "pytest>=8.0",
+    "matplotlib>=3.10.9",
 ]
 
 [project.optional-dependencies]
