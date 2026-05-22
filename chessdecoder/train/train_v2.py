@@ -31,6 +31,8 @@ from chessdecoder.utils.distributed import (
 from chessdecoder.utils.training import (
     load_config, save_training_checkpoint, init_wandb_with_resume)
 from chessdecoder.utils.muon import build_optimizer
+from chessdecoder.utils.fp8 import (
+    convert_model_to_fp8, compile_fp8_hot_path, count_fp8_linears)
 
 IGNORE_INDEX = -100
 
@@ -69,19 +71,17 @@ def train():
         max_plies=config["data"]["max_plies"],
         seed=seed, rank=rank, world_size=world_size)
 
-    optimizer = build_optimizer(
-        model,
-        config["training"].get("optimizer", "adamw"),
-        config["training"]["learning_rate"],
-        config["training"]["weight_decay"])
-    print_rank0(f"Optimizer: {config['training'].get('optimizer', 'adamw')} "
-                f"lr={config['training']['learning_rate']} "
-                f"wd={config['training']['weight_decay']}")
-
+    use_fp8 = config["training"].get("use_fp8", False)
     use_amp = config["training"].get("use_amp", False)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # FP8 pairs with bf16 autocast (same range as fp32 -> no GradScaler).
+    autocast_dtype = torch.bfloat16 if use_fp8 else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and not use_fp8))
 
+    # ----- model state must load BEFORE FP8 conversion (so the swap operates
+    # on already-trained weights; torchao Float8Linear's dynamic recipe stores
+    # no extra persistent state -> resume from a plain-fp32 checkpoint is fine.
     resume_from = config["training"].get("resume_from")
+    ck = None
     if resume_from:
         ckpts = sorted([f for f in os.listdir(resume_from)
                         if f.startswith("checkpoint_") and f.endswith(".pt")],
@@ -89,13 +89,50 @@ def train():
         latest = os.path.join(resume_from, ckpts[-1])
         print_rank0(f"Resuming from checkpoint: {latest}")
         ck = torch.load(latest, map_location=device, weights_only=False)
-        model.load_state_dict(ck["model_state_dict"])
+        # Strip any ``_orig_mod.`` torch.compile prefix in case the saved ckpt
+        # was written by an older version of save_training_checkpoint that
+        # didn't strip it (FP8 path wraps board_encoder + decoder).
+        model.load_state_dict({k.replace("_orig_mod.", ""): v
+                               for k, v in ck["model_state_dict"].items()})
+        start_epoch, step = ck["epoch"], ck["step"]
+        resume_epoch_step = ck.get("epoch_step", 0)
+
+    # ----- FP8 conversion (Phase 1): in-place swap of hot Linears -----
+    if use_fp8:
+        recipe = config["training"].get("fp8_recipe", "tensorwise")
+        convert_model_to_fp8(model, recipe=recipe)
+        nfp8, nrest = count_fp8_linears(model)
+        print_rank0(f"FP8: converted {nfp8} Linear modules to Float8 "
+                    f"(recipe={recipe}); {nrest} remained bf16/fp32.")
+        # torch.compile the encoder + decoder hot path — eager FP8 is slower
+        # than bf16 because cast+matmul stays unfused; submodule compile lets
+        # inductor fuse them. ~1.67× over fp16 measured on H200.
+        if config["training"].get("fp8_compile", True):
+            compile_fp8_hot_path(model)
+            print_rank0("FP8: torch.compile applied to board_encoder + decoder")
+
+    optimizer = build_optimizer(
+        model,
+        config["training"].get("optimizer", "adamw"),
+        config["training"]["learning_rate"],
+        config["training"]["weight_decay"])
+    print_rank0(f"Optimizer: {config['training'].get('optimizer', 'adamw')} "
+                f"lr={config['training']['learning_rate']} "
+                f"wd={config['training']['weight_decay']} "
+                f"autocast_dtype={autocast_dtype}")
+
+    if ck is not None:
         optimizer.load_state_dict(ck["optimizer_state_dict"])
         for pg in optimizer.param_groups:
             pg["lr"] = config["training"]["learning_rate"]
-        scaler.load_state_dict(ck["scaler_state_dict"])
-        start_epoch, step = ck["epoch"], ck["step"]
-        resume_epoch_step = ck.get("epoch_step", 0)
+        if not use_fp8 and "scaler_state_dict" in ck:
+            scaler.load_state_dict(ck["scaler_state_dict"])
+        # If dataset/curriculum changed under us, the saved within-epoch batch
+        # offset is meaningless -> don't fast-forward; iterate data fresh.
+        if config["training"].get("reset_data_iteration", False):
+            resume_epoch_step = 0
+            print_rank0("reset_data_iteration: starting data iteration fresh "
+                        "(resumed weights/optimizer/step only)")
         run_dir = resume_from
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -133,6 +170,11 @@ def train():
 
             bid = batch["board_ids"].to(device)            # [B,P,68]
             B, P, _ = bid.shape
+            # FP8 + torch.compile requires fixed shapes (K = B*S must be div
+            # by 16 statically). Drop partial last batches so the compiled
+            # graph only ever sees B == config['data']['batch_size'].
+            if use_fp8 and B != config["data"]["batch_size"]:
+                continue
             move_full = batch["move_full"].to(device)       # [B,P]
             pol_tgt = batch["policy_tgt"].to(device)
             pol_val = batch["policy_valid"].to(device)
@@ -145,7 +187,7 @@ def train():
             tr_val = batch["trans_valid"].to(device)
             ply_mask = batch["ply_mask"].to(device)
 
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_amp):
                 latents = model.encode_boards(
                     bid.reshape(B * P, 68)).reshape(B, P, -1, model.embed_dim)
                 E = model.embed_dim

@@ -146,9 +146,15 @@ def save_training_checkpoint(path, *, model, optimizer, scaler, step, extra_stat
     are handled transparently.
     """
     raw_model = model.module if hasattr(model, "module") else model
+    # Strip the ``_orig_mod.`` prefix that torch.compile inserts (e.g. when V2
+    # FP8 wraps board_encoder + decoder with `torch.compile`). Without this,
+    # every downstream consumer (eval / finetune / RL / export) sees foreign
+    # keys and load_state_dict fails — the prefix is purely a runtime marker
+    # of the compile wrapper, not a real part of the model architecture.
+    sd = {k.replace("_orig_mod.", ""): v for k, v in raw_model.state_dict().items()}
     state = {
         "step": step,
-        "model_state_dict": raw_model.state_dict(),
+        "model_state_dict": sd,
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
     }
@@ -166,7 +172,8 @@ def load_pretrained_checkpoint(model, checkpoint_path, device):
     initialize it from the trained ``policy_head``.
     """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint["model_state_dict"]
+    state_dict = {k.replace("_orig_mod.", ""): v
+                  for k, v in checkpoint["model_state_dict"].items()}
     state_dict["thinking_policy_head.weight"] = state_dict["policy_head.weight"].clone()
     state_dict["thinking_policy_head.bias"] = state_dict["policy_head.bias"].clone()
     model.load_state_dict(state_dict)
