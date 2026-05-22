@@ -68,3 +68,22 @@ chessdecoder/cpp/mcts/uv.lock
 
 # Verification cache
 scripts/.verify_cache/
+
+# Local pretraining-data working dirs and outputs (can be hundreds of GB)
+parquet_files_decoder/
+parquet_files_chessfens/
+lc0_work/
+lc0_tars/
+sweep_out/
+_cf_train/
+_cf_val/
+_smoke_data/
+
+# Scratch logs from local runs
+*.log
+logs/
+_smoke*.yaml
+.claude/scheduled_tasks.lock
+
+# One-off diagnostic outputs from exploration
+wdl_buckets.png
