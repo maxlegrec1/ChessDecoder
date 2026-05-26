@@ -1,4 +1,4 @@
-"""FP8 (Phase 1) — swap `nn.Linear` in the hot path for torchao Float8Linear.
+"""FP8 — swap ``nn.Linear`` in the hot path for torchao ``Float8Linear``.
 
 Transformer-Engine isn't installable on this stack (Python 3.13 + torch 2.9 +
 CUDA 12.8 has no prebuilt wheels and source builds run out of /tmp), so we use
@@ -7,15 +7,14 @@ signature as nn.Linear. Each Float8Linear casts its inputs/weights to
 ``e4m3fn`` per call (no persistent scale state -> resumable from any fp32/bf16
 checkpoint with no extra buffers).
 
-What gets converted: every nn.Linear whose `in_features` AND `out_features` are
-multiples of 16 AND >= 256 — i.e. all of the V2 hot path
-(attn q/k/v/output, SwiGLU gate/up/down, PerceiverPool q/k/v/o, fourier proj).
-What stays in bf16: tiny per-head linears (transition sq/stm/cas heads, WDLHead
-output 1024->405, policy_head 1024->1924 — the latter two have non-div-by-16
-outputs anyway), nn.Embedding, and RMSNorm.
+What gets converted: every ``nn.Linear`` whose ``in_features`` AND
+``out_features`` are multiples of 16 AND >= 256 — i.e. all of the encoder's hot
+path (attn q/k/v/output, SwiGLU gate/up/down). What stays in bf16: small
+heads (``policy_head`` 1024->1924, ``wdl_head`` 1024->N_CELLS), nn.Embedding,
+and RMSNorm.
 
-Pair with `torch.autocast("cuda", dtype=torch.bfloat16)` in the training forward
-— no GradScaler in bf16/fp8 mode (bf16 has the same range as fp32).
+Pair with ``torch.autocast("cuda", dtype=torch.bfloat16)`` in the training
+forward — no GradScaler in bf16/fp8 mode (bf16 has the same range as fp32).
 """
 from __future__ import annotations
 
@@ -58,17 +57,17 @@ def convert_model_to_fp8(model: nn.Module, recipe: str = "tensorwise") -> nn.Mod
 
 
 def compile_fp8_hot_path(model) -> None:
-    """``torch.compile`` the board_encoder + decoder in place.
+    """``torch.compile`` the encoder stack in place.
 
-    Without compile, eager Float8Linear costs 3 extra kernel launches per
-    layer (cast input fp32->bf16, amax+cast bf16->fp8 for input/weight, then
+    Without compile, eager Float8Linear costs 3 extra kernel launches per layer
+    (cast input fp32->bf16, amax+cast bf16->fp8 for input/weight, then
     scaled_mm). bf16 autocast fuses those into one cublasLt call -> eager FP8
-    is ~2× slower than bf16. Compiling the two big subgraphs (the encoder's 8
-    layers + the decoder's 10 layers) lets inductor fuse cast+matmul +
-    backward into ~1 kernel per Linear, turning the on-paper FP8 speedup into
-    actual wall-clock. Compile *whole-model* with fullgraph=False doesn't help
-    (torchtune control flow breaks the graph); per-submodule compile keeps the
-    biggest contiguous segments compile-able while everything else stays eager.
+    is ~2× slower than bf16. Compiling the encoder ``nn.Sequential`` lets
+    inductor fuse cast+matmul + backward into ~1 kernel per Linear, turning
+    the on-paper FP8 speedup into actual wall-clock.
+
+    Compiles ``model.encoder`` (the encoder layer stack) — the embeddings,
+    final norm, and per-head Linears stay eager.
     """
     import torch
     # dynamic=False: each recompile sees concrete shapes (no symbolic dims).
@@ -76,11 +75,8 @@ def compile_fp8_hot_path(model) -> None:
     # grad-weight matmul (K = B*S). With dynamic=False, inductor specializes
     # on each new shape — a few minutes of recompile cost up front, then
     # cached. Pair with a fixed batch size in the train loop.
-    if hasattr(model, "board_encoder"):
-        model.board_encoder = torch.compile(model.board_encoder,
-                                            mode="default", dynamic=False)
-    if hasattr(model, "decoder"):
-        model.decoder = torch.compile(model.decoder, mode="default",
+    if hasattr(model, "encoder"):
+        model.encoder = torch.compile(model.encoder, mode="default",
                                       dynamic=False)
 
 

@@ -1,12 +1,11 @@
-# ChessDecoder V2 — training-only base
+# ChessEncoder — encoder-only chess training base
 
-This branch is a **clean training base** for A/B architecture experiments. It contains only
-the V2 pretraining loop (encoder-latents + causal decoder + transition head), its dataloader,
-the V2 model, and the small set of utilities the loop needs (DDP, FP8, Muon, wandb).
-
-RL, finetuning, MCTS, C++ inference engines, TorchScript export, evaluation and inference
-scripts have been **removed** from this branch on purpose, so the next architecture
-iteration can be reasoned about and benchmarked against a known baseline.
+Single classical transformer encoder over the 68 board tokens. The same stack
+predicts policy and WDL from the CLS (``start_pos``) token — no decoder, no
+Perceiver latents, no transition head. This is the base point for A/B
+architecture experiments (different LR/decay schedules, attention variants,
+LC0-style 64-token boards with stm/castling folded into per-square embeddings,
+history planes, LC0's cross-attention policy head, etc.).
 
 ## Layout
 
@@ -14,42 +13,61 @@ iteration can be reasoned about and benchmarked against a known baseline.
 chessdecoder/
 ├── dataloader/
 │   ├── data.py           # FEN -> 68 position tokens
-│   └── loader_v2.py      # IterableDataset: group rows by game_id, build per-game arrays
+│   └── loader.py         # IterableDataset: group by game_id, sample N random plies per game
 ├── models/
 │   ├── vocab.py          # full vocab + move sub-vocab (1924 UCI moves)
-│   └── v2/
-│       ├── encoder_mode.py    # PerceiverPool / encoder benchmark
-│       ├── layers.py          # TransformerEncoderLayer, FourierEncoder
-│       ├── model_v2.py        # ChessDecoderV2 (encoder + causal decoder + heads)
-│       └── value_buckets.py   # 2-D-simplex WDL categorical
+│   ├── layers.py         # EncoderLayer (pre-RMSNorm, bidir attn, SwiGLU)
+│   ├── value_buckets.py  # 2-D-simplex WDL categorical (project_targets / mean_wdl)
+│   └── model.py          # ChessEncoder (tok+pos emb -> N layers -> policy/wdl heads off CLS)
 ├── train/
-│   ├── config_v2.yaml    # training config
-│   └── train_v2.py       # the training entrypoint
+│   ├── config.yaml
+│   └── train.py
 └── utils/
-    ├── distributed.py    # DDP helpers (no-op on single-GPU)
-    ├── fp8.py            # torchao Float8Linear conversion + compile
-    ├── muon.py           # Muon optimizer for hidden 2-D weights, AdamW elsewhere
+    ├── distributed.py    # DDP shims (no-op on single GPU)
+    ├── fp8.py            # torchao Float8Linear conversion + compile(model.encoder)
+    ├── muon.py           # Muon + AdamW (embeddings / heads / norms on AdamW arm)
     └── training.py       # load_config / save_checkpoint / wandb resume
+```
+
+## Forward shape
+
+```
+board_ids [N, 68]
+   layout:  [ start_pos | a1..h8 (64 squares) | end_pos | castling | stm ]
+      │
+      ▼  tok_emb + pos_emb (learned absolute)
+      ▼  EncoderLayer × num_layers (RMSNorm-attn-SwiGLU)
+      ▼  final RMSNorm   →  h [N, 68, E]
+      │
+      ├──► policy_head: Linear(E, 1924)  ←  h[:, 0, :]
+      └──► wdl_head:    Linear(E, N_CELLS) ← h[:, 0, :]
 ```
 
 ## Install
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh   # install uv (skip if already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh    # if needed
 uv sync
 ```
 
 ## Train
 
 ```bash
-uv run python chessdecoder/train/train_v2.py [chessdecoder/train/config_v2.yaml]
+CUDA_VISIBLE_DEVICES=0 uv run python chessdecoder/train/train.py [chessdecoder/train/config.yaml]
 ```
 
-Resume / FP8 / Muon are toggled in `config_v2.yaml`:
+Knobs in `config.yaml`:
 
-- `training.resume_from` — checkpoint dir to resume from (latest `checkpoint_*.pt` is picked).
-- `training.use_fp8` + `training.fp8_recipe` + `training.fp8_compile` — torchao FP8 Linear swap.
-- `training.optimizer` — `muon` (Muon for hidden 2-D weights + AdamW for the rest) or `adamw`.
+- `model.{embed_dim, num_heads, num_layers, d_ff, seq_len}` — the architecture A/B surface.
+- `data.{batch_size, positions_per_game}` — effective positions/step = `B × N`.
+- `training.optimizer` — `muon` (Muon on hidden matrices + AdamW on embeddings/heads/norms) or `adamw`.
+- `training.{use_fp8, fp8_recipe, fp8_compile}` — torchao Float8Linear swap of every Linear with both dims `% 16 == 0` and `>= 256`, plus `torch.compile(model.encoder)`.
+- `training.resume_from` — checkpoint dir; latest `checkpoint_*.pt` is picked.
+
+## Metrics (wandb)
+
+`total_loss / move_loss / wdl_loss`, `move_acc`, `wdl_acc / q_mae / d_mae / wdl_entropy`,
+`policy_logit_max / value_logit_max`, **`pos_per_s` (positions/second = `B × N / step_time`)**.
 
 ## Tests
 

@@ -1,0 +1,40 @@
+# Encoder-only chess training config — single classical transformer encoder
+# over the 68 board tokens, policy + WDL heads off CLS (start_pos).
+project_name: "chess-decoder"
+run_name: "encoder-v3"
+
+data:
+  parquet_dir: "/home/maxime/parquet_files_decoder/"
+  batch_size: 64               # games per batch; effective positions = B * positions_per_game
+  num_workers: 8
+  positions_per_game: 8        # random plies sampled per game (no consecutivity needed)
+
+model:
+  embed_dim: 1024
+  num_heads: 16
+  num_layers: 12
+  d_ff: 1536
+  seq_len: 68                  # start_pos | a1..h8 (64) | end_pos | castling | stm
+
+training:
+  optimizer: "muon"            # muon | adamw
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  grad_clip: 1.0
+  gradient_accumulation_steps: 1
+  num_epochs: 100
+  log_every_n_steps: 10
+  save_every_n_steps: 2000
+  device: "cuda"
+  use_amp: true
+  use_fp8: true                # torchao Float8Linear in-place swap of hot Linears
+  fp8_recipe: "tensorwise"     # tensorwise | rowwise | rowwise_with_gw_hp
+  fp8_compile: true            # torch.compile the encoder stack (needed for the FP8 speedup)
+  checkpoint_dir: "checkpoints/encoder_v3/"
+  seed: 42
+  resume_from: null
+  reset_data_iteration: false
+
+loss:
+  policy_weight: 5.0
+  wdl_weight: 1.0

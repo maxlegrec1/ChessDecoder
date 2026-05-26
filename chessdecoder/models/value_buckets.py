@@ -68,6 +68,12 @@ Q_CENTERS, D_CENTERS, _CID, CELL_WDL, CELL_QD = _build()
 N_CELLS = CELL_WDL.shape[0]
 
 
+def mean_wdl(logits: torch.Tensor, cell_wdl: torch.Tensor) -> torch.Tensor:
+    """[..., N_CELLS] cell logits -> [..., 3] mean WDL = E_p[(W,D,L)]."""
+    p = torch.softmax(logits.float(), dim=-1)
+    return p @ cell_wdl.to(p.dtype)
+
+
 def _bary(centers, v):
     """1-D barycentric: v [N] -> (lo_idx, hi_idx, w_lo, w_hi) onto sorted
     ``centers`` (value clamped into range)."""

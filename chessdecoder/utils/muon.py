@@ -1,6 +1,5 @@
 """Muon optimizer (Newton-Schulz orthogonalized momentum on 2-D hidden
-matrices; AdamW for embeddings / heads / norms / 1-D params). Promoted from
-scripts/v2_hp_sweep.py so train_v2 and the sweep share one implementation.
+matrices; AdamW for embeddings / output heads / norms / 1-D params).
 """
 import torch
 import torch.optim as optim
@@ -77,19 +76,19 @@ class MuonWithAdam(torch.optim.Optimizer):
 
 
 def build_optimizer(model, name, lr, wd):
-    """name: 'adamw' | 'muon'. Muon routes 2-D hidden matrices through
-    Newton-Schulz; embeddings / policy_head / latent_queries / norms / biases
-    go to the AdamW arm."""
+    """name: 'adamw' | 'muon'. Muon routes hidden 2-D matrices through
+    Newton-Schulz; embeddings (tok / pos), output heads (policy / wdl), norms
+    and 1-D params go to the AdamW arm."""
     if name == "adamw":
         return optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     if name == "muon":
         muon_p, adam_p = [], []
+        excluded = ("tok_embedding", "pos_embedding",
+                    "policy_head", "wdl_head")
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            is_matrix = p.ndim == 2 and not any(
-                k in n for k in ("tok_embedding", "policy_head",
-                                 "latent_queries"))
+            is_matrix = p.ndim == 2 and not any(k in n for k in excluded)
             (muon_p if is_matrix else adam_p).append(p)
         return MuonWithAdam(muon_p, adam_p, lr=lr, weight_decay=wd)
     raise ValueError(f"unknown optimizer {name!r}")
