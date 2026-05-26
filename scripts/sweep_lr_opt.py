@@ -19,8 +19,11 @@ import sys
 from pathlib import Path
 
 # --- sweep grid -------------------------------------------------------------
-OPTIMIZERS = ["muon", "adamw"]
-LRS = [1e-4, 3e-4, 1e-3, 3e-3]
+# muon clearly beat adamw at every shared step budget in the first sweep
+# (best muon=0.304 @ 3e-3 vs best adamw=0.279 @ 3e-4), and muon's curve was
+# monotone in LR up to 3e-3 — push the LR higher to find where it tips over.
+OPTIMIZERS = ["muon"]
+LRS = [5e-3, 1e-2, 3e-2]
 MAX_STEPS = 1500
 SEED = 42
 
