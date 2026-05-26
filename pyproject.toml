@@ -1,15 +1,13 @@
 [project]
 name = "decoder"
 version = "0.1.0"
-description = "Add your description here"
+description = "ChessDecoder V2 pretraining (training-only base for A/B architecture experiments)."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "bulletchess>=0.4.0",
-    "decoder-inference-cpp",
     "numpy>=2.4.0",
     "pyarrow>=22.0.0",
-    "pybind11>=3.0.1",
     "python-chess>=1.999",
     "pyyaml>=6.0.3",
     "torch>=2.9.1",
@@ -18,11 +16,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.23.1",
     "pytest>=8.0",
-    "matplotlib>=3.10.9",
 ]
-
-[project.optional-dependencies]
-mcts = ["chessrl-inference-cpp"]
 
 [build-system]
 requires = ["hatchling"]
@@ -30,25 +24,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["chessdecoder"]
-exclude = [
-    "chessdecoder/cpp/**/*.cpp",
-    "chessdecoder/cpp/**/*.h",
-    "chessdecoder/cpp/**/*.hpp",
-    "chessdecoder/cpp/**/*.so",
-    "chessdecoder/cpp/**/build/**",
-    "chessdecoder/cpp/**/CMakeFiles/**",
-    "chessdecoder/cpp/chess-library/**",
-]
-
-[tool.uv]
-no-build-isolation-package = ["decoder-inference-cpp"]
-
-[tool.uv.sources]
-chessrl-inference-cpp = { path = "chessdecoder/cpp/mcts", editable = true }
-decoder-inference-cpp = { path = "chessdecoder/cpp/decoder", editable = true }
 
 [tool.pytest.ini_options]
 markers = [
     "gpu: requires CUDA GPU",
-    "cpp: requires C++ inference engine and exported model in exports/",
 ]

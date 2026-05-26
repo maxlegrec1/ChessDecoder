@@ -125,7 +125,10 @@ def train():
         optimizer.load_state_dict(ck["optimizer_state_dict"])
         for pg in optimizer.param_groups:
             pg["lr"] = config["training"]["learning_rate"]
-        if not use_fp8 and "scaler_state_dict" in ck:
+        # Only restore the GradScaler state when both the saved scaler and the
+        # current scaler are enabled (the FP8 path saves an empty {} because it
+        # doesn't use a scaler — loading that into an enabled scaler raises).
+        if scaler.is_enabled() and ck.get("scaler_state_dict"):
             scaler.load_state_dict(ck["scaler_state_dict"])
         # If dataset/curriculum changed under us, the saved within-epoch batch
         # offset is meaningless -> don't fast-forward; iterate data fresh.

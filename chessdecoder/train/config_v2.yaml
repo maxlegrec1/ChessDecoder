@@ -4,7 +4,7 @@ project_name: "chess-decoder"   # same project as the original decoder for compa
 run_name: "v2-pretrain-muon1e3"
 
 data:
-  parquet_dir: "/workspace/ChessDecoder/parquet_files_decoder/"
+  parquet_dir: "/home/maxime/parquet_files_decoder/"
   batch_size: 384        # FP8 frees ~30 GiB peak -> bump batch from 256 (V1-like regime)
   num_workers: 8
   max_plies: 10          # random start + crop; seq = 10*(16+2) = 180. Curriculum:

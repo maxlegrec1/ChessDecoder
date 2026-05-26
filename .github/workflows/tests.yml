@@ -20,13 +20,12 @@ jobs:
       - name: Set up Python
         run: uv python install 3.13
 
-      - name: Install dependencies (no C++ extensions)
+      - name: Install dependencies
         run: |
           uv venv
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install pyarrow python-chess pyyaml numpy pytest torchtune pyflakes
-          # Install the chessdecoder package itself (editable, without the C++ extras)
-          uv pip install --no-deps -e . --config-setting editable_mode=compat || uv pip install --no-deps -e .
+          uv pip install --no-deps -e .
 
       - name: Lint (pyflakes — unused imports and undefined names)
         run: |
@@ -39,5 +38,5 @@ jobs:
             exit 1
           fi
 
-      - name: Run tests (CPU-only, no GPU/C++ engine)
-        run: .venv/bin/pytest tests/ -m "not gpu and not cpp" -v
+      - name: Run tests (CPU-only)
+        run: .venv/bin/pytest tests/ -m "not gpu" -v

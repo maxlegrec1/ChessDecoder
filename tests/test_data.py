@@ -1,11 +1,10 @@
-"""FEN conversion and game sequence tests (pure Python, no GPU)."""
+"""FEN conversion tests (pure Python, no GPU)."""
 
-import pandas as pd
 import pytest
 
-from chessdecoder.dataloader.data import fen_to_position_tokens, game_to_token_ids
+from chessdecoder.dataloader.data import fen_to_position_tokens
 from chessdecoder.models.vocab import (
-    token_to_idx, vocab_size, castling_tokens, POSITION_TOKEN_LENGTH,
+    token_to_idx, castling_tokens, POSITION_TOKEN_LENGTH,
 )
 from tests.conftest import SAMPLE_FENS
 
@@ -63,28 +62,3 @@ def test_fen_no_castling():
     assert tokens[66] == "no_castling_rights"
 
 
-def test_game_to_token_ids_basic():
-    data = [
-        {"fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-         "played_move": "e2e4", "best_move": "e2e4",
-         "win": 0.3, "draw": 0.5, "loss": 0.2, "ply": 0},
-        {"fen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-         "played_move": "e7e5", "best_move": "e7e5",
-         "win": 0.4, "draw": 0.4, "loss": 0.2, "ply": 1},
-    ]
-    game_df = pd.DataFrame(data)
-    ids, move_target_data, block_boundaries, value_data = game_to_token_ids(game_df)
-
-    # All IDs valid
-    for tid in ids:
-        assert 0 <= tid < vocab_size
-
-    # Block boundaries are 68-token board blocks
-    for start, end in block_boundaries:
-        assert ids[start] == token_to_idx["start_pos"]
-
-    # Value positions: wl = move+1, d = move+2
-    for wl_pos, d_pos, wl, d, valid in value_data:
-        assert d_pos == wl_pos + 1
-        assert ids[wl_pos] == token_to_idx["wl_value"]
-        assert ids[d_pos] == token_to_idx["d_value"]
