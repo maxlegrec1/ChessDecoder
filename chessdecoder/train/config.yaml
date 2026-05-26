@@ -4,7 +4,7 @@ project_name: "chess-decoder"
 run_name: "encoder-v3"
 
 data:
-  parquet_dir: "/home/maxime/parquet_files_decoder/"
+  parquet_dir: "/mnt/2tb_2/decoder/parquet_files_decoder/"
   batch_size: 64               # games per batch; effective positions = B * positions_per_game
   num_workers: 8
   positions_per_game: 8        # random plies sampled per game (no consecutivity needed)

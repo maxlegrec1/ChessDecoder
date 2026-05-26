@@ -126,12 +126,22 @@ class ChessIterableDataset(IterableDataset):
         for fp in files:
             try:
                 df = pd.read_parquet(fp)
-                grouped = df.groupby("game_id", sort=False)
-                gids = list(grouped.groups.keys())
+                # Sort once by (game_id, ply) so each game's rows are a
+                # contiguous slice. ~3s for a 1.4M-row parquet vs minutes of
+                # pandas overhead from per-game .get_group() / .indices.
+                df = df.sort_values(["game_id", "ply"], kind="stable")
+                gids = df["game_id"].to_numpy()
+                # Group boundaries: indices where game_id changes + edges.
+                change = np.flatnonzero(gids[1:] != gids[:-1]) + 1
+                bounds = np.concatenate(
+                    [[0], change, [len(gids)]]).astype(np.int64)
+                ngames = len(bounds) - 1
+                order = np.arange(ngames)
                 if self.shuffle_games:
-                    np.random.shuffle(gids)
-                for gid in gids:
-                    gdf = grouped.get_group(gid).sort_values("ply")
+                    np.random.shuffle(order)
+                for gi in order:
+                    s, e = bounds[gi], bounds[gi + 1]
+                    gdf = df.iloc[s:e]                    # already ply-sorted
                     sample = game_to_arrays(gdf, self.positions_per_game)
                     if sample is not None:
                         yield sample
@@ -144,4 +154,12 @@ def get_dataloader(parquet_dir, batch_size=16, num_workers=0,
                    positions_per_game=8, seed=42, rank=0, world_size=1):
     ds = ChessIterableDataset(parquet_dir, positions_per_game=positions_per_game,
                               seed=seed, rank=rank, world_size=world_size)
-    return DataLoader(ds, batch_size=batch_size, num_workers=num_workers), ds
+    # spawn context for num_workers>0: workers must not fork after the parent
+    # initialized CUDA (FP8 model on the GPU). Forked workers would inherit a
+    # broken CUDA context and hang on the first batch. persistent_workers
+    # amortizes spawn's ~10-30s startup over the whole training run.
+    kwargs = dict(batch_size=batch_size, num_workers=num_workers)
+    if num_workers > 0:
+        kwargs["multiprocessing_context"] = "spawn"
+        kwargs["persistent_workers"] = True
+    return DataLoader(ds, **kwargs), ds

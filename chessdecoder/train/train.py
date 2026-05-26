@@ -7,8 +7,14 @@ of plies from many games; the encoder itself sees every position independently
 (``[B, N, 68] -> [B*N, 68]``).
 
 Run:  CUDA_VISIBLE_DEVICES=0 uv run python chessdecoder/train/train.py \
-          [chessdecoder/train/config.yaml]
+          [chessdecoder/train/config.yaml] \
+          [--set training.learning_rate=3e-4 ...] [--max-steps 1500]
+
+The ``--set`` overrides take dotted keys and YAML-parsed values, so sweeps can
+launch the same entrypoint with different LR / optimizer / model size without
+generating one yaml file per run. ``--max-steps`` caps the training loop.
 """
+import argparse
 import os
 import sys
 import time
@@ -16,6 +22,7 @@ import time
 import torch
 import torch.nn as nn
 import wandb
+import yaml
 from datetime import datetime
 from tqdm import tqdm
 
@@ -34,9 +41,42 @@ from chessdecoder.utils.training import (
 IGNORE_INDEX = -100
 
 
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("config", nargs="?",
+                   default="chessdecoder/train/config.yaml")
+    p.add_argument("--set", action="append", default=[], dest="overrides",
+                   help="dotted-key override, e.g. --set training.learning_rate=3e-4")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="stop after this many gradient steps (sweep budget cap)")
+    return p.parse_args()
+
+
+def _apply_override(config: dict, dotted: str) -> None:
+    key, _, raw = dotted.partition("=")
+    parts = key.split(".")
+    d = config
+    for p in parts[:-1]:
+        d = d[p]
+    # yaml.safe_load handles ints/bools/null/strings cleanly but the YAML 1.1
+    # spec doesn't recognize bare scientific notation (``1e-3`` -> str ``"1e-3"``,
+    # ``1.0e-3`` -> float). Retry as float so sweep grids stay readable.
+    val = yaml.safe_load(raw)
+    if isinstance(val, str):
+        try:
+            val = float(raw)
+        except ValueError:
+            pass
+    d[parts[-1]] = val
+
+
 def train():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "chessdecoder/train/config.yaml"
-    config = load_config(config_path)
+    args = _parse_args()
+    config = load_config(args.config)
+    for kv in args.overrides:
+        _apply_override(config, kv)
+    if args.max_steps is not None:
+        config["training"]["max_steps"] = args.max_steps
 
     rank, local_rank, world_size = setup_distributed()
     device = get_device(local_rank)
@@ -143,6 +183,7 @@ def train():
     pos_per_step = config["data"]["batch_size"] * config["data"]["positions_per_game"]
     t_window = time.time()
     steps_in_window = 0
+    max_steps = config["training"].get("max_steps")
 
     for epoch in range(start_epoch, config["training"]["num_epochs"]):
         print_rank0(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
@@ -252,6 +293,11 @@ def train():
                     extra_state={"epoch": epoch, "epoch_step": epoch_step,
                                  "config": config})
                 barrier()
+
+            if max_steps is not None and step >= max_steps:
+                print_rank0(f"Reached max_steps={max_steps}, stopping.")
+                cleanup_distributed()
+                return
 
         if is_main_process():
             save_training_checkpoint(
