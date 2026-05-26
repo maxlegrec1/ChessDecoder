@@ -11,6 +11,7 @@ single 4090, fixed seed, fixed data shuffle, same step budget.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import re
 import subprocess
@@ -51,6 +52,12 @@ ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "sweep_out"
 LOG_DIR.mkdir(exist_ok=True)
 
+# One group per sweep invocation so the 8 runs cluster in the wandb UI; can
+# be overridden externally if you want to extend an existing group.
+WANDB_GROUP = os.environ.get(
+    "WANDB_RUN_GROUP",
+    f"lr-opt-sweep-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}")
+
 
 def run_name(opt: str, lr: float) -> str:
     return f"sweep_{opt}_lr{lr:g}".replace("+", "")
@@ -78,7 +85,11 @@ def launch(opt: str, lr: float) -> Path:
     print(f"[run]   {name}: {MAX_STEPS} steps -> {log_path}")
     env = {**os.environ,
            "CUDA_VISIBLE_DEVICES": "0",
-           "WANDB_MODE": os.environ.get("WANDB_MODE", "disabled"),
+           # wandb on by default so the sweep is fully observable; export
+           # ``WANDB_MODE=disabled`` if you want to skip logging.
+           "WANDB_MODE": os.environ.get("WANDB_MODE", "online"),
+           "WANDB_RUN_GROUP": WANDB_GROUP,
+           "WANDB_TAGS": "sweep,lr-opt",
            "PYTHONPATH": str(ROOT)}
     with log_path.open("w") as f:
         rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT,
