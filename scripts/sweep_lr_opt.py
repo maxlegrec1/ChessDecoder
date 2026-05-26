@@ -63,12 +63,31 @@ def run_name(opt: str, lr: float) -> str:
     return f"sweep_{opt}_lr{lr:g}".replace("+", "")
 
 
+_SUCCESS_MARKER = "Reached max_steps="
+
+
+def _log_is_complete(log_path: Path) -> bool:
+    """A run is 'done' only if it printed the max_steps marker — otherwise
+    a leftover log from a killed/OOM'd attempt would silently be skipped."""
+    if not log_path.exists():
+        return False
+    try:
+        with log_path.open("rb") as f:
+            f.seek(max(0, log_path.stat().st_size - 4096))
+            return _SUCCESS_MARKER.encode() in f.read()
+    except OSError:
+        return False
+
+
 def launch(opt: str, lr: float) -> Path:
     name = run_name(opt, lr)
     log_path = LOG_DIR / f"{name}.log"
-    if log_path.exists():
-        print(f"[skip]  {name}: log already exists ({log_path}).")
+    if _log_is_complete(log_path):
+        print(f"[skip]  {name}: completed previously ({log_path}).")
         return log_path
+    if log_path.exists():
+        print(f"[redo]  {name}: prior log incomplete, rerunning.")
+        log_path.unlink()
 
     overrides = {**COMMON_OVERRIDES,
                  "training.optimizer": opt,
