@@ -1,18 +1,15 @@
-"""Encoder-only dataloader.
+"""Encoder-only dataloader (pre-tokenized shard cache).
 
-Rows are grouped by ``game_id`` (so we sample positions from across the game
-population rather than reading sequentially through a parquet — that would
-over-represent neighbouring plies of the same game). For each game we sample
-``positions_per_game`` random plies and emit per-game arrays of shape
-``[N, ...]``. The training loop reshapes ``[B, N, 68] -> [B*N, 68]`` and the
-encoder processes every position independently.
+A shard (one parquet file, ~1.4M rows) is loaded once and immediately
+tokenized in bulk into NumPy/Tensor arrays kept on the worker. Per-batch work
+then collapses to (a) pick game-row indices, (b) gather precomputed rows.
 
 Schema produced per game:
-  - board_ids    [N, 68]  : board token ids (encoder input)
-  - policy_tgt   [N]      : best-move move-sub-vocab id (IGNORE_INDEX if invalid)
+  - board_ids    [N, 68]  : board token ids
+  - policy_tgt   [N]      : best-move move-sub-vocab id (-100 if invalid)
   - policy_valid [N]      : mask for the policy loss
-  - wdl_tgt      [N, C]   : soft-categorical target on the 2-D-simplex grid
-  - wdl_mean     [N, 3]   : exact target WDL (W,D,L) — for metric only
+  - wdl_tgt      [N, C]   : soft-categorical target on the 2-D simplex grid
+  - wdl_mean     [N, 3]   : exact target WDL (W,D,L) — used as a metric only
   - wdl_valid    [N]      : mask for the WDL loss
 
 If a game yields fewer than ``positions_per_game`` valid rows we sample with
@@ -28,70 +25,160 @@ import pandas as pd
 import torch
 from torch.utils.data import IterableDataset, DataLoader
 
-from chessdecoder.dataloader.data import fen_to_position_tokens
-from chessdecoder.models.vocab import (token_to_idx, full_idx_to_move_idx)
+from chessdecoder.models.vocab import (token_to_idx, full_idx_to_move_idx,
+                                       castling_tokens)
 from chessdecoder.models.value_buckets import N_CELLS, project_targets
 
 IGNORE_INDEX = -100
 
 
-def game_to_arrays(game_df, positions_per_game):
-    """Returns the per-game arrays described in the module docstring, or
-    ``None`` if the game has no rows with a played move (caller skips)."""
-    rows = [r for r in game_df.itertuples(index=False)
-            if getattr(r, "played_move", None)]
-    if not rows:
+# ---------- fast FEN tokenization (no python-chess) -------------------------
+
+# Map FEN piece chars to their vocab token ids. python-chess names pieces as
+# {white,black}_{king,queen,rook,bishop,knight,pawn}.
+_PIECE_IDX = {
+    "P": token_to_idx["white_pawn"], "N": token_to_idx["white_knight"],
+    "B": token_to_idx["white_bishop"], "R": token_to_idx["white_rook"],
+    "Q": token_to_idx["white_queen"], "K": token_to_idx["white_king"],
+    "p": token_to_idx["black_pawn"], "n": token_to_idx["black_knight"],
+    "b": token_to_idx["black_bishop"], "r": token_to_idx["black_rook"],
+    "q": token_to_idx["black_queen"], "k": token_to_idx["black_king"],
+}
+_EMPTY_IDX = token_to_idx["empty"]
+_START_IDX = token_to_idx["start_pos"]
+_END_IDX = token_to_idx["end_pos"]
+_WTM_IDX = token_to_idx["white_to_move"]
+_BTM_IDX = token_to_idx["black_to_move"]
+_NO_CASTLE_IDX = token_to_idx["no_castling_rights"]
+# castling_tokens already enumerates every subset of "KQkq" in canonical order
+# (matching the FEN castling field), so a direct lookup works.
+_CASTLE_IDX = {c: token_to_idx[c] for c in castling_tokens
+               if c != "no_castling_rights"}
+
+
+def fen_to_ids(fen: str, out: np.ndarray) -> None:
+    """Write 68 token ids into ``out[:]`` for a single FEN."""
+    out[0] = _START_IDX
+    parts = fen.split(" ", 4)
+    pieces, side, castling = parts[0], parts[1], parts[2]
+    # squares are written in chess.SQUARES order: a1, b1, ..., h8 (rank-major,
+    # rank 1 at the bottom). FEN walks rank 8 -> rank 1, file a -> h.
+    sq = np.empty(64, dtype=np.int32)
+    sq.fill(_EMPTY_IDX)
+    for fen_rank, rank_str in enumerate(pieces.split("/")):
+        chess_rank = 7 - fen_rank
+        f = 0
+        base = chess_rank * 8
+        for ch in rank_str:
+            d = ord(ch) - 48
+            if 0 <= d <= 8:
+                f += d
+            else:
+                sq[base + f] = _PIECE_IDX[ch]
+                f += 1
+    out[1:65] = sq
+    out[65] = _END_IDX
+    out[66] = _NO_CASTLE_IDX if castling == "-" else _CASTLE_IDX[castling]
+    out[67] = _WTM_IDX if side == "w" else _BTM_IDX
+
+
+def tokenize_shard(df: pd.DataFrame):
+    """Tokenize every row of a shard into compact arrays.
+
+    Returns a dict of NumPy/Tensor arrays of length R (the number of rows).
+    Rows lacking ``played_move`` are dropped first (callers rely on this so
+    every row corresponds to a valid training position).
+    """
+    df = df[df["played_move"].astype(bool)]
+    R = len(df)
+    if R == 0:
         return None
 
-    if len(rows) >= positions_per_game:
-        idx = random.sample(range(len(rows)), positions_per_game)
-    else:
-        idx = [random.randrange(len(rows)) for _ in range(positions_per_game)]
-    rows = [rows[i] for i in idx]
+    fens = df["fen"].to_numpy()
+    board_ids = np.empty((R, 68), dtype=np.int32)
+    for i in range(R):
+        fen_to_ids(fens[i], board_ids[i])
 
-    N = positions_per_game
-    board_ids = torch.zeros(N, 68, dtype=torch.long)
-    policy_tgt = torch.full((N,), IGNORE_INDEX, dtype=torch.long)
-    policy_valid = torch.zeros(N, dtype=torch.bool)
-    wdl_mean = torch.zeros(N, 3, dtype=torch.float32)
-    wdl_tgt = torch.zeros(N, N_CELLS, dtype=torch.float32)
-    wdl_valid = torch.zeros(N, dtype=torch.bool)
+    # policy target: map best_move -> move sub-vocab id (or IGNORE_INDEX).
+    best = df["best_move"].to_numpy()
+    policy_tgt = np.full(R, IGNORE_INDEX, dtype=np.int64)
+    policy_valid = np.zeros(R, dtype=bool)
+    for i in range(R):
+        m = best[i]
+        if m and m in token_to_idx:
+            full = token_to_idx[m]
+            sub = full_idx_to_move_idx.get(full)
+            if sub is not None:
+                policy_tgt[i] = sub
+                policy_valid[i] = True
 
-    q_buf, d_buf, q_idx = [], [], []
-    for i, row in enumerate(rows):
-        toks = fen_to_position_tokens(row.fen)
-        board_ids[i] = torch.tensor([token_to_idx[t] for t in toks])
-
-        bm = getattr(row, "best_move", None)
-        if bm is not None and bm in token_to_idx:
-            policy_tgt[i] = full_idx_to_move_idx[token_to_idx[bm]]
-            policy_valid[i] = True
-
-        q, dd = getattr(row, "orig_q", None), getattr(row, "orig_d", None)
-        if q is not None and pd.notna(q) and dd is not None and pd.notna(dd):
-            q, dd = float(q), float(dd)
-            w = (1.0 - dd + q) / 2.0
-            l = (1.0 - dd - q) / 2.0
-            v = torch.tensor([w, dd, l], dtype=torch.float32).clamp_(0.0, 1.0)
-            wdl_mean[i] = v / v.sum().clamp_(min=1e-8)
-            q_buf.append(max(-1.0, min(1.0, w - l)))
-            d_buf.append(dd)
-            q_idx.append(i)
-            wdl_valid[i] = True
-
-    if q_idx:
-        cat = project_targets(torch.tensor(q_buf), torch.tensor(d_buf))
-        wdl_tgt[torch.tensor(q_idx)] = cat
+    # WDL: orig_q / orig_d -> (W,D,L). Vectorized across the whole shard.
+    # We *don't* expand the [R, N_CELLS] cell-simplex target upfront — at
+    # ~1.4M rows x 405 cells x 4 bytes that's 2GB of mostly-cold floats per
+    # shard. The cached q/d are tiny (~22MB) and projecting just the picked
+    # rows per batch costs <1 ms.
+    q_raw = df["orig_q"].to_numpy(dtype=np.float32, na_value=np.nan)
+    d_raw = df["orig_d"].to_numpy(dtype=np.float32, na_value=np.nan)
+    valid = (~np.isnan(q_raw)) & (~np.isnan(d_raw))
+    q = np.clip(q_raw, -1.0, 1.0).astype(np.float32)
+    d = np.clip(d_raw, 0.0, 1.0).astype(np.float32)
+    w = np.clip((1.0 - d + q) * 0.5, 0.0, 1.0)
+    l_ = np.clip((1.0 - d - q) * 0.5, 0.0, 1.0)
+    wdl_mean = np.stack([w, d, l_], axis=-1)
+    s = wdl_mean.sum(-1, keepdims=True)
+    np.divide(wdl_mean, np.maximum(s, 1e-8), out=wdl_mean)
+    wdl_mean[~valid] = 0.0
 
     return {
-        "board_ids": board_ids,
-        "policy_tgt": policy_tgt, "policy_valid": policy_valid,
-        "wdl_tgt": wdl_tgt, "wdl_mean": wdl_mean, "wdl_valid": wdl_valid,
+        # int32 cache (half the RAM of int64); promote to long on gather.
+        "board_ids": torch.from_numpy(board_ids),         # int32 [R, 68]
+        "policy_tgt": torch.from_numpy(policy_tgt),       # int64 [R]
+        "policy_valid": torch.from_numpy(policy_valid),   # bool  [R]
+        "wdl_mean": torch.from_numpy(wdl_mean),           # f32   [R, 3]
+        "wdl_valid": torch.from_numpy(valid),             # bool  [R]
+        "q": torch.from_numpy(q),                         # f32   [R]
+        "d": torch.from_numpy(d),                         # f32   [R]
+        "_game_id": df["game_id"].to_numpy(),
     }
 
 
+# ---------- per-game sampler ------------------------------------------------
+
+def _pick_rows(s: int, e: int, n: int) -> np.ndarray:
+    """Pick ``n`` row indices uniformly from [s, e). Sampling without
+    replacement if the game has enough rows, with replacement otherwise."""
+    k = e - s
+    if k >= n:
+        return np.random.choice(k, n, replace=False).astype(np.int64) + s
+    return np.random.randint(s, e, size=n, dtype=np.int64)
+
+
+def _gather_game(shard, idx_arr):
+    """Slice every per-row tensor at ``idx_arr`` into a [N, ...] dict and
+    project (q, d) to the cell simplex for just those rows."""
+    t = torch.as_tensor(idx_arr, dtype=torch.long)
+    valid = shard["wdl_valid"][t]
+    wdl_tgt = torch.zeros(t.shape[0], N_CELLS, dtype=torch.float32)
+    if bool(valid.any()):
+        wdl_tgt[valid] = project_targets(
+            shard["q"][t][valid], shard["d"][t][valid])
+    return {
+        "board_ids":    shard["board_ids"][t].to(torch.long),  # [N, 68]
+        "policy_tgt":   shard["policy_tgt"][t],                # [N]
+        "policy_valid": shard["policy_valid"][t],              # [N]
+        "wdl_tgt":      wdl_tgt,                               # [N, C]
+        "wdl_mean":     shard["wdl_mean"][t],                  # [N, 3]
+        "wdl_valid":    valid,                                 # [N]
+    }
+
+
+# ---------- iterable dataset ------------------------------------------------
+
 class ChessIterableDataset(IterableDataset):
-    """Iterate parquet shards, group rows by ``game_id``, yield per-game arrays."""
+    """Iterate parquet shards, group rows by ``game_id``, yield per-game arrays.
+
+    Each shard is tokenized once on read; subsequent yields are tensor gathers.
+    """
 
     def __init__(self, parquet_dir, positions_per_game=8, shuffle_files=True,
                  shuffle_games=True, seed=42, rank=0, world_size=1):
@@ -123,15 +210,15 @@ class ChessIterableDataset(IterableDataset):
         if self.shuffle_files:
             random.shuffle(files)
 
+        N = self.positions_per_game
         for fp in files:
             try:
                 df = pd.read_parquet(fp)
-                # Sort once by (game_id, ply) so each game's rows are a
-                # contiguous slice. ~3s for a 1.4M-row parquet vs minutes of
-                # pandas overhead from per-game .get_group() / .indices.
                 df = df.sort_values(["game_id", "ply"], kind="stable")
-                gids = df["game_id"].to_numpy()
-                # Group boundaries: indices where game_id changes + edges.
+                shard = tokenize_shard(df)
+                if shard is None:
+                    continue
+                gids = shard["_game_id"]
                 change = np.flatnonzero(gids[1:] != gids[:-1]) + 1
                 bounds = np.concatenate(
                     [[0], change, [len(gids)]]).astype(np.int64)
@@ -140,11 +227,9 @@ class ChessIterableDataset(IterableDataset):
                 if self.shuffle_games:
                     np.random.shuffle(order)
                 for gi in order:
-                    s, e = bounds[gi], bounds[gi + 1]
-                    gdf = df.iloc[s:e]                    # already ply-sorted
-                    sample = game_to_arrays(gdf, self.positions_per_game)
-                    if sample is not None:
-                        yield sample
+                    s, e = int(bounds[gi]), int(bounds[gi + 1])
+                    idx = _pick_rows(s, e, N)
+                    yield _gather_game(shard, idx)
             except Exception as e:
                 print(f"Error reading file {fp}: {e}")
                 continue

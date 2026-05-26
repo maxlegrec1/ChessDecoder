@@ -32,7 +32,9 @@ COMMON_OVERRIDES = {
     # Big batch, max diversity: 2048 games x 1 position each = 2048 positions/step.
     "data.batch_size": 2048,
     "data.positions_per_game": 1,
-    "data.num_workers": 8,
+    # 2 workers + spawn + persistent: enough to hide ~30s parquet loads behind
+    # GPU compute, without contending too much on the single SSD.
+    "data.num_workers": 2,
     "training.weight_decay": 0.01,
     "training.grad_clip": 1.0,
     "training.gradient_accumulation_steps": 1,
