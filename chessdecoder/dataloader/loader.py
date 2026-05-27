@@ -198,8 +198,19 @@ def _load_cached_shard(fp: str):
 
 # ---------- iterable dataset ------------------------------------------------
 
+def _collate_batch(samples):
+    """Stack a list of per-game dicts into a single ``[B, N, ...]`` dict.
+
+    Done in the *worker* process so the main thread doesn't pay the 2048x
+    ``torch.stack`` + IPC-of-tiny-tensors overhead that
+    ``DataLoader.default_collate`` would. Pair with ``batch_size=None`` on
+    the DataLoader so it passes our pre-collated batches straight through.
+    """
+    return {k: torch.stack([s[k] for s in samples]) for k in samples[0]}
+
+
 class ChessIterableDataset(IterableDataset):
-    """Iterate shards, yield per-game arrays.
+    """Iterate shards, yield pre-collated ``[B, N, ...]`` batches.
 
     Two backends, chosen by extension at iteration time:
     - ``.npz`` from the offline cache: instant load, just tensor gather.
@@ -208,16 +219,21 @@ class ChessIterableDataset(IterableDataset):
     If ``cache_dir`` is set, the .npz cache wins; we fall back to the parquet
     dir for any shard the cache doesn't (yet) have. This keeps a half-built
     cache safe to use while the rest is still being precomputed.
+
+    The dataset itself batches: each worker accumulates ``batch_size``
+    per-game samples and yields a single stacked dict, so the DataLoader
+    must be constructed with ``batch_size=None``.
     """
 
     def __init__(self, parquet_dir, positions_per_game=8, shuffle_files=True,
                  shuffle_games=True, seed=42, rank=0, world_size=1,
-                 cache_dir=None):
+                 cache_dir=None, batch_size=1):
         self.parquet_dir = parquet_dir
         self.cache_dir = cache_dir
         self.positions_per_game = positions_per_game
         self.shuffle_files = shuffle_files
         self.shuffle_games = shuffle_games
+        self.batch_size = batch_size
         self.seed = seed
         self.epoch = 0
         self.rank = rank
@@ -259,6 +275,8 @@ class ChessIterableDataset(IterableDataset):
             random.shuffle(files)
 
         N = self.positions_per_game
+        B = self.batch_size
+        acc = []
         shard = None
         for fp in files:
             try:
@@ -291,7 +309,10 @@ class ChessIterableDataset(IterableDataset):
                 for gi in order:
                     s, e = int(bounds[gi]), int(bounds[gi + 1])
                     idx = _pick_rows(s, e, N)
-                    yield _gather_game(shard, idx)
+                    acc.append(_gather_game(shard, idx))
+                    if len(acc) == B:
+                        yield _collate_batch(acc)
+                        acc = []
             except Exception as e:
                 print(f"Error reading file {fp}: {e}")
                 continue
@@ -302,13 +323,14 @@ def get_dataloader(parquet_dir, batch_size=16, num_workers=0,
                    cache_dir=None):
     ds = ChessIterableDataset(parquet_dir, positions_per_game=positions_per_game,
                               seed=seed, rank=rank, world_size=world_size,
-                              cache_dir=cache_dir)
+                              cache_dir=cache_dir, batch_size=batch_size)
+    # batch_size=None: the dataset already yields pre-collated [B, N, ...]
+    # batches. DataLoader's default collate would otherwise re-stack our
+    # batches into [1, B, N, ...].
     # pin_memory: copy each batch into page-locked host memory so the
     # subsequent ``.to(device, non_blocking=True)`` in the training loop can
-    # overlap H2D with the prior step's GPU compute. Without this the GPU
-    # stalls on each transfer.
-    kwargs = dict(batch_size=batch_size, num_workers=num_workers,
-                  pin_memory=True)
+    # overlap H2D with the prior step's GPU compute.
+    kwargs = dict(batch_size=None, num_workers=num_workers, pin_memory=True)
     if num_workers > 0:
         # spawn context: workers must not fork after the parent initialized
         # CUDA (FP8 model on the GPU). Forked workers would inherit a broken

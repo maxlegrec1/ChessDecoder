@@ -35,10 +35,10 @@ COMMON_OVERRIDES = {
     "model.d_ff": 2048,
     "data.batch_size": 2048,
     "data.positions_per_game": 1,
-    # 2 workers — fine on the 15GB box as long as we're not running the
-    # cache-converter in parallel (that's what cost us the baseline OOM).
-    # Bigger parallelism + the partial .npz cache keeps GPU fed.
-    "data.num_workers": 2,
+    # 3 workers — pre-batching dataset + spawn workers each hold a shard
+    # cache (~1-2GB). 3 fits in the 15GB RAM budget while keeping the
+    # GPU fed; 4+ risks OOM on the giant ~1.6GB cached shards.
+    "data.num_workers": 3,
     "training.optimizer": "muon",
     "training.learning_rate": 3e-3,
     "training.weight_decay": 0.01,
