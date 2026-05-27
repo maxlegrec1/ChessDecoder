@@ -122,7 +122,8 @@ def train():
         batch_size=config["data"]["batch_size"],
         num_workers=config["data"].get("num_workers", 0),
         positions_per_game=config["data"]["positions_per_game"],
-        seed=seed, rank=rank, world_size=world_size)
+        seed=seed, rank=rank, world_size=world_size,
+        cache_dir=config["data"].get("cache_dir"))
 
     use_fp8 = config["training"].get("use_fp8", False)
     use_amp = config["training"].get("use_amp", False)

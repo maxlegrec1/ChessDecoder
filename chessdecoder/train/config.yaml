@@ -5,6 +5,10 @@ run_name: "encoder-v3"
 
 data:
   parquet_dir: "/mnt/2tb_2/decoder/parquet_files_decoder/"
+  # If set, the loader prefers ``<cache_dir>/<shard>.npz`` (pre-tokenized
+  # via scripts/precompute_decoder_cache.py) and falls back to parquet for
+  # any shard not yet cached. Set to null to force parquet.
+  cache_dir: "/mnt/2tb_2/decoder/cached_decoder/"
   batch_size: 64               # games per batch; effective positions = B * positions_per_game
   num_workers: 8
   positions_per_game: 8        # random plies sampled per game (no consecutivity needed)

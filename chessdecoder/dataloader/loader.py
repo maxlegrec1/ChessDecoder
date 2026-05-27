@@ -173,17 +173,47 @@ def _gather_game(shard, idx_arr):
     }
 
 
+# ---------- cached-shard loader ---------------------------------------------
+
+def _load_cached_shard(fp: str):
+    """Load a .npz cache produced by ``scripts/precompute_decoder_cache.py``.
+
+    Reads in ~0.5s on SATA SSD vs ~30-40s for parquet+tokenize. Returns the
+    same dict the parquet path produces (minus the now-unneeded ``_game_id``;
+    the cache already stores game boundaries directly).
+    """
+    with np.load(fp) as z:
+        return {
+            "board_ids": torch.from_numpy(z["board_ids"].astype(np.int32)),
+            "policy_tgt": torch.from_numpy(z["policy_tgt"].astype(np.int64)),
+            "policy_valid": torch.from_numpy(z["policy_valid"]),
+            "wdl_mean": torch.from_numpy(z["wdl_mean"].astype(np.float32)),
+            "wdl_valid": torch.from_numpy(z["wdl_valid"]),
+            "q": torch.from_numpy(z["q"].astype(np.float32)),
+            "d": torch.from_numpy(z["d"].astype(np.float32)),
+            "_bounds": z["bounds"].astype(np.int64),
+        }
+
+
 # ---------- iterable dataset ------------------------------------------------
 
 class ChessIterableDataset(IterableDataset):
-    """Iterate parquet shards, group rows by ``game_id``, yield per-game arrays.
+    """Iterate shards, yield per-game arrays.
 
-    Each shard is tokenized once on read; subsequent yields are tensor gathers.
+    Two backends, chosen by extension at iteration time:
+    - ``.npz`` from the offline cache: instant load, just tensor gather.
+    - ``.parquet``: original path — pd.read_parquet + sort + tokenize.
+
+    If ``cache_dir`` is set, the .npz cache wins; we fall back to the parquet
+    dir for any shard the cache doesn't (yet) have. This keeps a half-built
+    cache safe to use while the rest is still being precomputed.
     """
 
     def __init__(self, parquet_dir, positions_per_game=8, shuffle_files=True,
-                 shuffle_games=True, seed=42, rank=0, world_size=1):
+                 shuffle_games=True, seed=42, rank=0, world_size=1,
+                 cache_dir=None):
         self.parquet_dir = parquet_dir
+        self.cache_dir = cache_dir
         self.positions_per_game = positions_per_game
         self.shuffle_files = shuffle_files
         self.shuffle_games = shuffle_games
@@ -191,9 +221,25 @@ class ChessIterableDataset(IterableDataset):
         self.epoch = 0
         self.rank = rank
         self.world_size = world_size
-        self.files = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
+        # Prefer cached .npz when available, else fall back to parquet.
+        parquets = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
+        files = []
+        n_cached = 0
+        for p in parquets:
+            stem = os.path.splitext(os.path.basename(p))[0]
+            cached = (os.path.join(cache_dir, f"{stem}.npz")
+                      if cache_dir else None)
+            if cached and os.path.exists(cached):
+                files.append(cached)
+                n_cached += 1
+            else:
+                files.append(p)
+        self.files = files
         if not self.files:
-            print(f"Warning: No parquet files found in {parquet_dir}")
+            print(f"Warning: No shards found in {parquet_dir} or {cache_dir}")
+        elif cache_dir:
+            print(f"Loader: {n_cached}/{len(self.files)} shards from cache, "
+                  f"{len(self.files) - n_cached} from parquet")
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
@@ -215,25 +261,28 @@ class ChessIterableDataset(IterableDataset):
         shard = None
         for fp in files:
             try:
-                # Free the previous shard's tensors before reading the next
-                # parquet — a 1.4M-row parquet briefly costs ~3-4GB while
-                # pandas + tokenize_shard are alive, and on a 15GB box two
-                # workers reloading simultaneously is enough to trigger the
-                # OOM killer (lost an attention-sweep run this way).
+                # Free the previous shard before reading the next — pandas
+                # peaks at ~3-4GB during a parquet read+tokenize, and on a
+                # 15GB box two workers reloading simultaneously is enough to
+                # OOM-kill us (lost an attention-sweep run that way).
                 if shard is not None:
                     del shard
                     shard = None
                     gc.collect()
-                df = pd.read_parquet(fp)
-                df = df.sort_values(["game_id", "ply"], kind="stable")
-                shard = tokenize_shard(df)
-                del df
-                if shard is None:
-                    continue
-                gids = shard["_game_id"]
-                change = np.flatnonzero(gids[1:] != gids[:-1]) + 1
-                bounds = np.concatenate(
-                    [[0], change, [len(gids)]]).astype(np.int64)
+                if fp.endswith(".npz"):
+                    shard = _load_cached_shard(fp)
+                    bounds = shard.pop("_bounds")
+                else:
+                    df = pd.read_parquet(fp)
+                    df = df.sort_values(["game_id", "ply"], kind="stable")
+                    shard = tokenize_shard(df)
+                    del df
+                    if shard is None:
+                        continue
+                    gids = shard["_game_id"]
+                    change = np.flatnonzero(gids[1:] != gids[:-1]) + 1
+                    bounds = np.concatenate(
+                        [[0], change, [len(gids)]]).astype(np.int64)
                 ngames = len(bounds) - 1
                 order = np.arange(ngames)
                 if self.shuffle_games:
@@ -248,9 +297,11 @@ class ChessIterableDataset(IterableDataset):
 
 
 def get_dataloader(parquet_dir, batch_size=16, num_workers=0,
-                   positions_per_game=8, seed=42, rank=0, world_size=1):
+                   positions_per_game=8, seed=42, rank=0, world_size=1,
+                   cache_dir=None):
     ds = ChessIterableDataset(parquet_dir, positions_per_game=positions_per_game,
-                              seed=seed, rank=rank, world_size=world_size)
+                              seed=seed, rank=rank, world_size=world_size,
+                              cache_dir=cache_dir)
     # spawn context for num_workers>0: workers must not fork after the parent
     # initialized CUDA (FP8 model on the GPU). Forked workers would inherit a
     # broken CUDA context and hang on the first batch. persistent_workers
