@@ -96,6 +96,27 @@ def train():
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")
 
+    # MFU bookkeeping. Approximate forward+backward FLOPs per token as
+    # ``6 * N_matmul`` (Kaplan/Chinchilla convention) where N_matmul is the
+    # total weight count of the model's nn.Linear modules — embedding lookups
+    # and norms are gathers/elementwise and don't add tensorcore FLOPs.
+    n_matmul = sum(m.in_features * m.out_features
+                   for m in model.modules() if isinstance(m, nn.Linear))
+    # Tokens per training step: (batch_size * positions_per_game) boards x
+    # 68 board tokens each (the encoder processes every position
+    # independently after the reshape inside the loop).
+    tokens_per_step = (config["data"]["batch_size"]
+                       * config["data"]["positions_per_game"] * 68)
+    flops_per_step = 6 * n_matmul * tokens_per_step
+    # Peak tensorcore FLOPs of the device the GEMMs actually run on. For an
+    # RTX 4090: 165.2 TFLOPs/s in bf16, 660.6 in FP8 (E4M3, dense). Override
+    # via ``training.peak_tflops`` if you're on different hardware.
+    default_peak_tflops = 660.6 if config["training"].get("use_fp8", False) else 165.2
+    peak_flops = config["training"].get("peak_tflops",
+                                        default_peak_tflops) * 1e12
+    print_rank0(f"FLOPs/step (approx): {flops_per_step/1e12:.2f} TF; "
+                f"peak: {peak_flops/1e12:.0f} TF/s")
+
     dataloader, dataset = get_dataloader(
         config["data"]["parquet_dir"],
         batch_size=config["data"]["batch_size"],
@@ -263,6 +284,7 @@ def train():
                     dt = max(now - t_window, 1e-6)
                     steps_per_s = steps_in_window / dt
                     pos_per_s = steps_per_s * pos_per_step
+                    mfu = (flops_per_step * steps_in_window) / (dt * peak_flops)
                     t_window = now
                     steps_in_window = 0
 
@@ -270,7 +292,8 @@ def train():
                       f"(pol {policy_loss.item():.4f} wdl {wdl_loss.item():.4f}) "
                       f"move_acc={move_acc.item():.3f} wdl_acc={wdl_acc.item():.3f} "
                       f"q_mae={q_mae.item():.3f} "
-                      f"pos/s={pos_per_s:.0f} steps/s={steps_per_s:.2f}")
+                      f"pos/s={pos_per_s:.0f} steps/s={steps_per_s:.2f} "
+                      f"mfu={mfu*100:.1f}%")
                 wandb.log({
                     "train/total_loss": total.item(),
                     "train/move_loss": policy_loss.item(),
@@ -284,6 +307,7 @@ def train():
                     "train/value_logit_max": value_logit_max.item(),
                     "train/pos_per_s": pos_per_s,
                     "train/steps_per_s": steps_per_s,
+                    "train/mfu": mfu,
                     "train/epoch": epoch, "train/step": step,
                 })
 
