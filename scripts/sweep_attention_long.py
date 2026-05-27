@@ -22,9 +22,11 @@ from pathlib import Path
 # baseline previously trained to step 6700 (move_acc 0.408) before the
 # competing cache-converter OOM'd its DataLoader worker. We're not retrying
 # it — the partial wandb run is sufficient evidence the baseline keeps
-# climbing past the short-sweep 0.282. Only the two open questions remain:
-# do geom / relpos2d catch up with more steps?
-VARIANTS = ["geom", "relpos2d"]
+# climbing past the short-sweep 0.282. The open questions are whether
+# {geom, relpos2d, smolgen} extend the gain at longer horizons. Smolgen
+# adds ~12M params (per-layer content-conditional bias) so it's the
+# heaviest variant.
+VARIANTS = ["geom", "relpos2d", "smolgen"]
 MAX_STEPS = 7500
 SEED = 42
 

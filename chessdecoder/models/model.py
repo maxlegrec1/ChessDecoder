@@ -22,7 +22,7 @@ import torch.nn as nn
 from torchtune.modules import RMSNorm
 
 from chessdecoder.models.layers import EncoderLayer, EncoderStack
-from chessdecoder.models.pos_variants import build_pos_modules
+from chessdecoder.models.pos_variants import Smolgen, build_pos_modules
 from chessdecoder.models.value_buckets import CELL_WDL, N_CELLS, mean_wdl as _mean_wdl
 from chessdecoder.models.vocab import move_vocab_size
 
@@ -39,9 +39,10 @@ class ChessEncoder(nn.Module):
 
         self.tok_embedding = nn.Embedding(vocab_size, embed_dim)
 
-        # Only ``baseline`` uses a token-level learned pos embedding;
-        # everything else encodes position inside attention.
-        if attention_variant == "baseline":
+        # Token-level pos embedding: kept for ``baseline`` and ``smolgen``
+        # (Leela BT pairs Smolgen with absolute pos info on the tokens — the
+        # content-conditional bias is spatial, not identity-providing).
+        if attention_variant in ("baseline", "smolgen"):
             self.pos_embedding = nn.Embedding(seq_len, embed_dim)
         else:
             self.pos_embedding = None
@@ -54,9 +55,14 @@ class ChessEncoder(nn.Module):
         # identical across layers, so sharing is functionally equivalent).
         self.bias_module = bias_module
 
+        # Smolgen is per-layer (each layer's input is different, so we want
+        # each layer to compute its own content-conditional bias).
+        def _smolgen():
+            return (Smolgen(d_model=embed_dim, num_heads=num_heads)
+                    if attention_variant == "smolgen" else None)
         self.encoder = EncoderStack([
             EncoderLayer(embed_dim, num_heads, d_ff, max_seq_len=seq_len,
-                         pos_embeddings=pos_module)
+                         pos_embeddings=pos_module, smolgen=_smolgen())
             for _ in range(num_layers)
         ])
         self.norm = RMSNorm(dim=embed_dim)

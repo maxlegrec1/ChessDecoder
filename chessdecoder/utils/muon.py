@@ -88,8 +88,14 @@ def build_optimizer(model, name, lr, wd):
         # projections — Newton-Schulz orthogonalization treats each row as a
         # direction in bucket-space and demolishes the bucket semantics.
         # Route the whole submodule through AdamW.
+        # Also exclude smolgen's lookup-table-shaped params explicitly: the
+        # per-layer ``sp_bias`` (kind-pair table, same shape semantics as
+        # relpos2d's) and ``pos_enc_weight`` (one row per board-square
+        # pair — orthogonalizing those rows in gen-size space wrecks the
+        # spatial decoding the einsum relies on).
         excluded = ("tok_embedding", "pos_embedding",
-                    "policy_head", "wdl_head", "bias_module")
+                    "policy_head", "wdl_head", "bias_module",
+                    "sp_bias", "pos_enc_weight")
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue

@@ -270,6 +270,82 @@ class GeomAttnBias(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Smolgen — content-conditional attention bias (Leela BT style)
+# ---------------------------------------------------------------------------
+
+class Smolgen(nn.Module):
+    """Per-layer Smolgen attention bias generator (Leela BT style).
+
+    Takes ``x`` of shape ``(B, 68, d_model)`` — the *current layer's* input
+    activations — and emits a ``(B, num_heads, 68, 68)`` attention bias.
+    The 64x64 board-square sub-bias is generated *content-conditionally*
+    from the input via a small per-square -> pooled-board -> per-head MLP,
+    then "decoded" into 4096 pair logits through a shared
+    ``pos_enc_weight: (64*64, gen_size)``. Special-involving pairs (CLS,
+    end_pos, castling, stm) use a learned 5x5 table per head — same idea
+    as RelPos2DBias's special path.
+
+    The motivation vs ``geom`` / ``relpos2d``: those biases are
+    *static* (depend only on position). Smolgen lets the bias depend on
+    what's *on* the board right now — so the model can express patterns
+    like "this diagonal is hot for this position".
+
+    Param budget at defaults (d1=32, d_hidden=256, gen_size=256, H=8,
+    d_model=512): ~2M params per layer; per 6-layer model ~12M.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d1: int = 32,
+                 d_hidden: int = 256, gen_size: int = 256,
+                 init_std: float = 0.02):
+        super().__init__()
+        self.num_heads = num_heads
+        self.gen_size = gen_size
+        # Per-square content compression (small Linear, stays bf16 under
+        # the FP8 filter since d1 < 256).
+        self.sm1 = nn.Linear(d_model, d1, bias=False)
+        # Board summary -> per-head intent. Both linears are big enough to
+        # hit the FP8 conversion path.
+        self.sm2 = nn.Linear(64 * d1, d_hidden, bias=False)
+        self.ln1 = nn.LayerNorm(d_hidden)
+        self.sm3 = nn.Linear(d_hidden, num_heads * gen_size, bias=False)
+        self.ln2 = nn.LayerNorm(num_heads * gen_size)
+        # Shared "decoder" — turns a (H, gen_size) intent into (H, 64*64)
+        # board-square bias logits.
+        self.pos_enc_weight = nn.Parameter(
+            torch.empty(64 * 64, gen_size))
+        nn.init.normal_(self.pos_enc_weight, std=init_std)
+        # Per-head learned 5x5 special-token bias table.
+        self.sp_bias = nn.Parameter(torch.zeros(num_heads, N_KINDS * N_KINDS))
+        nn.init.normal_(self.sp_bias, std=init_std)
+        _, _, sp_bucket = _build_pair_buckets()
+        is_sq, _, _ = _build_pair_buckets()
+        self.register_buffer("is_sq", is_sq, persistent=False)
+        self.register_buffer("sp_bucket", sp_bucket, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 68, d_model)
+        B = x.shape[0]
+        squares = x[:, 1:65]                                      # (B, 64, d_model)
+        y = self.sm1(squares)                                     # (B, 64, d1)
+        y = y.reshape(B, -1)                                      # (B, 64*d1)
+        y = torch.nn.functional.gelu(self.sm2(y))                 # (B, d_hidden)
+        y = self.ln1(y)
+        y = torch.nn.functional.gelu(self.sm3(y))                 # (B, H*gen)
+        y = self.ln2(y).view(B, self.num_heads, self.gen_size)    # (B, H, gen)
+        # einsum: "bhi,oi->bho" — same decoder used across heads.
+        b_sq = torch.einsum("bhi,oi->bho", y, self.pos_enc_weight)
+        b_sq = b_sq.view(B, self.num_heads, 64, 64)
+        # Pad the 64x64 board-square bias to 68x68 (zeros in the special
+        # rows/cols), then ``where`` selects the special-pair bias for
+        # those slots — avoids in-place assignment under torch.compile.
+        b_sq_padded = torch.nn.functional.pad(b_sq, (1, 3, 1, 3))     # (B, H, 68, 68)
+        sp_full = self.sp_bias[:, self.sp_bucket]                     # (H, 68, 68)
+        return torch.where(self.is_sq[None, None],
+                           b_sq_padded,
+                           sp_full.unsqueeze(0))
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -280,10 +356,11 @@ def build_pos_modules(variant: str, embed_dim: int, num_heads: int,
     ``pos_embeddings`` is the per-layer module passed to MHA (rotates Q/K).
     ``bias_module`` is a parameter-bearing module whose ``__call__()`` returns
     ``[num_heads, seq_len, seq_len]`` added to attention logits each forward.
-    Either may be ``None``.
+    Either may be ``None``. The ``smolgen`` variant doesn't use either —
+    per-layer Smolgen instances live inside each ``EncoderLayer`` instead.
     """
     head_dim = embed_dim // num_heads
-    if variant == "baseline":
+    if variant in ("baseline", "smolgen"):
         return None, None
     if variant == "rope1d":
         return RotaryPositionalEmbeddings(dim=head_dim,
@@ -295,4 +372,4 @@ def build_pos_modules(variant: str, embed_dim: int, num_heads: int,
     if variant == "geom":
         return None, GeomAttnBias(num_heads=num_heads)
     raise ValueError(f"unknown attention_variant {variant!r} "
-                     f"(expected one of baseline/rope1d/rope2d/relpos2d/geom)")
+                     f"(expected baseline/rope1d/rope2d/relpos2d/geom/smolgen)")

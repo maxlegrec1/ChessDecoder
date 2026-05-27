@@ -66,11 +66,19 @@ class BidirAttn(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    """Bidirectional self-attention + SwiGLU MLP, pre-RMSNorm."""
+    """Bidirectional self-attention + SwiGLU MLP, pre-RMSNorm.
+
+    Optional ``smolgen`` is a per-layer module that, given the layer's
+    input ``x``, returns a ``[B, H, S, S]`` attention bias (content-
+    conditional). When present, it's *added to* any ``mask`` already
+    passed in — so the encoder-wide shared bias and the per-layer
+    Smolgen-generated bias can compose if you ever want both.
+    """
 
     def __init__(self, embed_dim: int, num_heads: int, d_ff: int,
                  max_seq_len: int = 128,
-                 pos_embeddings: Optional[nn.Module] = None):
+                 pos_embeddings: Optional[nn.Module] = None,
+                 smolgen: Optional[nn.Module] = None):
         super().__init__()
         self.attn = BidirAttn(embed_dim=embed_dim, num_heads=num_heads,
                               pos_embeddings=pos_embeddings)
@@ -80,9 +88,13 @@ class EncoderLayer(nn.Module):
             up_proj=nn.Linear(embed_dim, d_ff, bias=False))
         self.sa_norm = RMSNorm(dim=embed_dim)
         self.mlp_norm = RMSNorm(dim=embed_dim)
+        self.smolgen = smolgen
 
     def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.smolgen is not None:
+            sm_mask = self.smolgen(x)
+            mask = sm_mask if mask is None else mask + sm_mask
         n = self.sa_norm(x)
         h = x + self.attn(n, mask=mask)
         return h + self.mlp(self.mlp_norm(h))
