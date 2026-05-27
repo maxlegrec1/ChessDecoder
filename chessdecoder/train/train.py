@@ -93,6 +93,8 @@ def train():
         num_layers=mc["num_layers"], seq_len=mc.get("seq_len", 68),
         d_ff=mc["d_ff"],
         attention_variant=mc.get("attention_variant", "baseline"),
+        input_mode=mc.get("input_mode", "default"),
+        policy_head=mc.get("policy_head", "linear"),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")
