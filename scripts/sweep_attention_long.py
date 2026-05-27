@@ -19,7 +19,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-VARIANTS = ["baseline", "geom", "relpos2d"]
+# baseline previously trained to step 6700 (move_acc 0.408) before the
+# competing cache-converter OOM'd its DataLoader worker. We're not retrying
+# it — the partial wandb run is sufficient evidence the baseline keeps
+# climbing past the short-sweep 0.282. Only the two open questions remain:
+# do geom / relpos2d catch up with more steps?
+VARIANTS = ["geom", "relpos2d"]
 MAX_STEPS = 7500
 SEED = 42
 
