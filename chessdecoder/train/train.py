@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from chessdecoder.dataloader.loader import get_dataloader
 from chessdecoder.models.model import ChessEncoder
+from chessdecoder.models.value_buckets import N_CELLS, project_targets
 from chessdecoder.models.vocab import vocab_size, move_vocab_size
 from chessdecoder.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
@@ -220,22 +221,34 @@ def train():
             if epoch_step <= skip:
                 continue
 
-            bid = batch["board_ids"].to(device)            # [B,N,68]
+            bid = batch["board_ids"].to(device, non_blocking=True)     # [B,N,68]
             B, N, _ = bid.shape
             # FP8 + torch.compile requires a fixed batch size (K = B*N*S must
             # be statically divisible by 16). Drop partial last batches.
             if use_fp8 and B != config["data"]["batch_size"]:
                 continue
-            pol_tgt = batch["policy_tgt"].to(device)       # [B,N]
-            pol_val = batch["policy_valid"].to(device)
-            wdl_tgt = batch["wdl_tgt"].to(device)          # [B,N,N_CELLS]
-            wdl_mean = batch["wdl_mean"].to(device)        # [B,N,3]
-            wdl_val = batch["wdl_valid"].to(device)
+            pol_tgt = batch["policy_tgt"].to(device, non_blocking=True)
+            pol_val = batch["policy_valid"].to(device, non_blocking=True)
+            wdl_mean = batch["wdl_mean"].to(device, non_blocking=True)  # [B,N,3]
+            wdl_val = batch["wdl_valid"].to(device, non_blocking=True)
+            q_in = batch["q"].to(device, non_blocking=True)             # [B,N]
+            d_in = batch["d"].to(device, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_amp):
                 out = model(bid.reshape(B * N, 68))
                 pol_logits = out["policy"].reshape(B, N, -1)
                 wdl_logits = out["wdl"].reshape(B, N, -1)
+                # One GPU call instead of 2048 per-yield CPU calls (see
+                # loader._gather_game). Zero-fills invalid rows so the
+                # downstream ``vmask`` zeroing still applies cleanly.
+                valid_flat = wdl_val.reshape(-1)
+                wdl_tgt = torch.zeros(B * N, N_CELLS,
+                                      device=device, dtype=torch.float32)
+                if valid_flat.any():
+                    wdl_tgt[valid_flat] = project_targets(
+                        q_in.reshape(-1)[valid_flat],
+                        d_in.reshape(-1)[valid_flat])
+                wdl_tgt = wdl_tgt.reshape(B, N, N_CELLS)
 
                 pmask = pol_val
                 policy_loss = ce(

@@ -155,21 +155,22 @@ def _pick_rows(s: int, e: int, n: int) -> np.ndarray:
 
 
 def _gather_game(shard, idx_arr):
-    """Slice every per-row tensor at ``idx_arr`` into a [N, ...] dict and
-    project (q, d) to the cell simplex for just those rows."""
+    """Slice every per-row tensor at ``idx_arr`` into a [N, ...] dict.
+
+    We *do not* call ``project_targets`` here — at B=2048, N=1 that's 2048
+    small per-yield torch ops in worker land (CPython overhead dominates).
+    Instead the training loop runs ``project_targets`` once per batch on
+    GPU, on the concatenated [B*N] q/d, which is essentially free.
+    """
     t = torch.as_tensor(idx_arr, dtype=torch.long)
-    valid = shard["wdl_valid"][t]
-    wdl_tgt = torch.zeros(t.shape[0], N_CELLS, dtype=torch.float32)
-    if bool(valid.any()):
-        wdl_tgt[valid] = project_targets(
-            shard["q"][t][valid], shard["d"][t][valid])
     return {
         "board_ids":    shard["board_ids"][t].to(torch.long),  # [N, 68]
         "policy_tgt":   shard["policy_tgt"][t],                # [N]
         "policy_valid": shard["policy_valid"][t],              # [N]
-        "wdl_tgt":      wdl_tgt,                               # [N, C]
         "wdl_mean":     shard["wdl_mean"][t],                  # [N, 3]
-        "wdl_valid":    valid,                                 # [N]
+        "wdl_valid":    shard["wdl_valid"][t],                 # [N]
+        "q":            shard["q"][t],                         # [N]  for GPU projection
+        "d":            shard["d"][t],                         # [N]
     }
 
 
@@ -302,12 +303,20 @@ def get_dataloader(parquet_dir, batch_size=16, num_workers=0,
     ds = ChessIterableDataset(parquet_dir, positions_per_game=positions_per_game,
                               seed=seed, rank=rank, world_size=world_size,
                               cache_dir=cache_dir)
-    # spawn context for num_workers>0: workers must not fork after the parent
-    # initialized CUDA (FP8 model on the GPU). Forked workers would inherit a
-    # broken CUDA context and hang on the first batch. persistent_workers
-    # amortizes spawn's ~10-30s startup over the whole training run.
-    kwargs = dict(batch_size=batch_size, num_workers=num_workers)
+    # pin_memory: copy each batch into page-locked host memory so the
+    # subsequent ``.to(device, non_blocking=True)`` in the training loop can
+    # overlap H2D with the prior step's GPU compute. Without this the GPU
+    # stalls on each transfer.
+    kwargs = dict(batch_size=batch_size, num_workers=num_workers,
+                  pin_memory=True)
     if num_workers > 0:
+        # spawn context: workers must not fork after the parent initialized
+        # CUDA (FP8 model on the GPU). Forked workers would inherit a broken
+        # CUDA context and hang on the first batch. persistent_workers
+        # amortizes spawn's ~10-30s startup over the whole training run.
+        # prefetch_factor=4: keep a deeper queue of ready batches so a slow
+        # shard transition can't stall the GPU.
         kwargs["multiprocessing_context"] = "spawn"
         kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
     return DataLoader(ds, **kwargs), ds
