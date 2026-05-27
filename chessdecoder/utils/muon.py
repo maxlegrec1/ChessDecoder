@@ -83,8 +83,13 @@ def build_optimizer(model, name, lr, wd):
         return optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     if name == "muon":
         muon_p, adam_p = [], []
+        # bias_module owns the relpos / geometric attention-bias tables.
+        # Those are 2-D lookup tables (``[num_heads, n_buckets]``), not linear
+        # projections — Newton-Schulz orthogonalization treats each row as a
+        # direction in bucket-space and demolishes the bucket semantics.
+        # Route the whole submodule through AdamW.
         excluded = ("tok_embedding", "pos_embedding",
-                    "policy_head", "wdl_head")
+                    "policy_head", "wdl_head", "bias_module")
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
