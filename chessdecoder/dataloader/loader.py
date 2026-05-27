@@ -15,6 +15,7 @@ Schema produced per game:
 If a game yields fewer than ``positions_per_game`` valid rows we sample with
 replacement (keeps a fixed [N, ...] shape so FP8 + compile sees fixed shapes).
 """
+import gc
 import glob
 import math
 import os
@@ -211,11 +212,22 @@ class ChessIterableDataset(IterableDataset):
             random.shuffle(files)
 
         N = self.positions_per_game
+        shard = None
         for fp in files:
             try:
+                # Free the previous shard's tensors before reading the next
+                # parquet — a 1.4M-row parquet briefly costs ~3-4GB while
+                # pandas + tokenize_shard are alive, and on a 15GB box two
+                # workers reloading simultaneously is enough to trigger the
+                # OOM killer (lost an attention-sweep run this way).
+                if shard is not None:
+                    del shard
+                    shard = None
+                    gc.collect()
                 df = pd.read_parquet(fp)
                 df = df.sort_values(["game_id", "ply"], kind="stable")
                 shard = tokenize_shard(df)
+                del df
                 if shard is None:
                     continue
                 gids = shard["_game_id"]
