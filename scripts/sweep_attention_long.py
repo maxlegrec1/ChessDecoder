@@ -30,9 +30,10 @@ COMMON_OVERRIDES = {
     "model.d_ff": 2048,
     "data.batch_size": 2048,
     "data.positions_per_game": 1,
-    # 1 worker not 2 — we hit the 15GB RAM ceiling otherwise (see loader.py
-    # comment + the prior sweep's OOM kill).
-    "data.num_workers": 1,
+    # 2 workers — fine on the 15GB box as long as we're not running the
+    # cache-converter in parallel (that's what cost us the baseline OOM).
+    # Bigger parallelism + the partial .npz cache keeps GPU fed.
+    "data.num_workers": 2,
     "training.optimizer": "muon",
     "training.learning_rate": 3e-3,
     "training.weight_decay": 0.01,
