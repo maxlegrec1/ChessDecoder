@@ -33,7 +33,9 @@ COMMON_OVERRIDES = {
     "model.d_ff": 2048,
     "data.batch_size": 2048,
     "data.positions_per_game": 1,
-    "data.num_workers": 2,
+    # 1 worker not 2 — we sit close to the 15GB RAM ceiling during shard
+    # transitions and two workers reloading at once is enough to trigger OOM.
+    "data.num_workers": 1,
     "training.optimizer": "muon",
     "training.learning_rate": 3e-3,
     "training.weight_decay": 0.01,
