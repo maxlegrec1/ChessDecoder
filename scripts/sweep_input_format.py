@@ -21,24 +21,35 @@ import sys
 from pathlib import Path
 
 INPUT_MODES = ["lc0_64", "cls_65"]
-MAX_STEPS = 7500
+# max_steps counts forward+backward iterations, not optimizer updates.
+# With grad_accum=4, 30000 iterations -> 7500 optimizer steps, same as the
+# prior small-model sweeps (which had grad_accum=1). Keeps data-seen and
+# optimizer-update count comparable.
+MAX_STEPS = 30000
 SEED = 42
 
 COMMON_OVERRIDES = {
-    "model.embed_dim": 512,
-    "model.num_heads": 8,
-    "model.num_layers": 6,
-    "model.d_ff": 2048,
+    # ~91M params: 15L x 768d x 12h (head_dim=64) x 1536 d_ff. Roughly
+    # BT3-shape on width/depth, BT4-shape on FFN. 2x expansion (narrower
+    # than the standard 4x because we're following the Leela conventions).
+    # d_ff=1536 (multiple of 16) so the MLP Linears stay on the FP8
+    # tensorcore path — d_ff=1532 forced 45 of them back to bf16.
+    "model.embed_dim": 768,
+    "model.num_heads": 12,
+    "model.num_layers": 15,
+    "model.d_ff": 1536,
     "model.attention_variant": "geom",
     "model.policy_head": "cross_attn",
-    "data.batch_size": 2048,
+    # B=512 + grad_accum=4 -> effective batch 2048 (matches every prior
+    # sweep). The 91M model with 15 layers OOMs at B>=1024 on a 24GB 4090.
+    "data.batch_size": 512,
     "data.positions_per_game": 1,
     "data.num_workers": 3,
     "training.optimizer": "muon",
     "training.learning_rate": 3e-3,
     "training.weight_decay": 0.01,
     "training.grad_clip": 1.0,
-    "training.gradient_accumulation_steps": 1,
+    "training.gradient_accumulation_steps": 4,
     "training.num_epochs": 1000,
     "training.log_every_n_steps": 100,
     "training.save_every_n_steps": 1000000,
@@ -54,11 +65,11 @@ LOG_DIR.mkdir(exist_ok=True)
 
 WANDB_GROUP = os.environ.get(
     "WANDB_RUN_GROUP",
-    f"input-format-sweep-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    f"bt3-input-format-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}")
 
 
 def run_name(input_mode: str) -> str:
-    return f"sweep_inputfmt_{input_mode}"
+    return f"sweep_bt3_{input_mode}"
 
 
 _SUCCESS_MARKER = "Reached max_steps="
