@@ -18,13 +18,18 @@ model:
   num_heads: 16
   num_layers: 12
   d_ff: 1536
-  seq_len: 68                  # start_pos | a1..h8 (64) | end_pos | castling | stm
   # geom attention bias (chess-specific Δrank/Δfile/diag/knight features)
-  # won the attention sweep over plain MHA at long horizons. Default to it.
+  # won the attention sweep over plain MHA at long horizons.
   attention_variant: "geom"
   # cross_attn policy head beat the Linear head by ~+0.06 move_acc at the
-  # same compute budget. Default to it.
+  # same compute budget.
   policy_head: "cross_attn"
+  # Two input modes:
+  #   lc0_64  (64 squares only; stm/castling broadcast; mean-pool readout)
+  #   cls_65  (CLS + 64 squares; stm/castling broadcast; CLS readout)
+  # The input-format sweep showed all 64/65/66/67/68 modes tied within seed
+  # noise once geom backbone is on; we keep the cleanest two.
+  input_mode: "lc0_64"
 
 training:
   optimizer: "muon"            # muon | adamw

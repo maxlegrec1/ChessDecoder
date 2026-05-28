@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-INPUT_MODES = ["default", "no_end", "no_cls_no_end", "lc0_64"]
+INPUT_MODES = ["lc0_64", "cls_65"]
 MAX_STEPS = 7500
 SEED = 42
 

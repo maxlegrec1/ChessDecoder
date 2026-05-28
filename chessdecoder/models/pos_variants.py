@@ -1,6 +1,6 @@
 """Positional / attention-bias schemes for the chess encoder.
 
-Five variants, selectable via ``model.attention_variant``:
+Variants selectable via ``model.attention_variant``:
 
 - ``baseline``: learned absolute position embedding added before layer 0,
   plain bidirectional MHA. (No work for this module — handled in ChessEncoder.)
@@ -75,29 +75,23 @@ class TokenLayout:
         object.__setattr__(self, "_sq_lookup", lookup)
 
 
-# Canonical layouts for each input mode.
-LAYOUT_68 = TokenLayout(
-    seq_len=68,
-    squares=tuple(range(1, 65)),
-    cls_pos=0, end_pos=65, castling_pos=66, stm_pos=67)
-LAYOUT_67 = TokenLayout(   # drop end_pos
-    seq_len=67,
-    squares=tuple(range(1, 65)),
-    cls_pos=0, end_pos=None, castling_pos=65, stm_pos=66)
-LAYOUT_66 = TokenLayout(   # drop CLS + end_pos
-    seq_len=66,
-    squares=tuple(range(0, 64)),
-    cls_pos=None, end_pos=None, castling_pos=64, stm_pos=65)
-LAYOUT_64 = TokenLayout(   # squares only (stm/castling as broadcast embeds)
+# Canonical layouts for each input mode. The input-format sweep showed all
+# of {68, 67, 66, 64}-token modes tied within seed noise once the geom
+# attention bias was on the backbone — so we keep just the cleanest two:
+# pure 64 squares (LC0 layout), and 64 squares + a dedicated CLS slot.
+# stm and castling are always added as broadcast embeddings to every token.
+LAYOUT_64 = TokenLayout(   # squares only
     seq_len=64,
     squares=tuple(range(0, 64)),
     cls_pos=None, end_pos=None, castling_pos=None, stm_pos=None)
+LAYOUT_65 = TokenLayout(   # CLS + 64 squares
+    seq_len=65,
+    squares=tuple(range(1, 65)),
+    cls_pos=0, end_pos=None, castling_pos=None, stm_pos=None)
 
 INPUT_MODE_TO_LAYOUT = {
-    "default": LAYOUT_68,
-    "no_end": LAYOUT_67,
-    "no_cls_no_end": LAYOUT_66,
     "lc0_64": LAYOUT_64,
+    "cls_65": LAYOUT_65,
 }
 
 
@@ -318,57 +312,6 @@ class GeomAttnBias(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Smolgen — content-conditional attention bias (Leela BT style)
-# ---------------------------------------------------------------------------
-
-class Smolgen(nn.Module):
-    """Per-layer Smolgen attention bias generator (Leela BT style).
-
-    Currently hardcoded to the 68-token layout (slices ``x[:, 1:65]`` for
-    the 64 board squares). For other input modes, set attention_variant to
-    something other than 'smolgen'. (The refactor for arbitrary layouts is
-    straightforward but unused for now.)
-    """
-
-    def __init__(self, d_model: int, num_heads: int, d1: int = 32,
-                 d_hidden: int = 256, gen_size: int = 256,
-                 init_std: float = 0.02):
-        super().__init__()
-        self.num_heads = num_heads
-        self.gen_size = gen_size
-        self.sm1 = nn.Linear(d_model, d1, bias=False)
-        self.sm2 = nn.Linear(64 * d1, d_hidden, bias=False)
-        self.ln1 = nn.LayerNorm(d_hidden)
-        self.sm3 = nn.Linear(d_hidden, num_heads * gen_size, bias=False)
-        self.ln2 = nn.LayerNorm(num_heads * gen_size)
-        self.pos_enc_weight = nn.Parameter(
-            torch.empty(64 * 64, gen_size))
-        nn.init.normal_(self.pos_enc_weight, std=init_std)
-        self.sp_bias = nn.Parameter(torch.zeros(num_heads, N_KINDS * N_KINDS))
-        nn.init.normal_(self.sp_bias, std=init_std)
-        is_sq, _, sp_bucket = _build_pair_buckets(LAYOUT_68)
-        self.register_buffer("is_sq", is_sq, persistent=False)
-        self.register_buffer("sp_bucket", sp_bucket, persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        squares = x[:, 1:65]
-        y = self.sm1(squares)
-        y = y.reshape(B, -1)
-        y = torch.nn.functional.gelu(self.sm2(y))
-        y = self.ln1(y)
-        y = torch.nn.functional.gelu(self.sm3(y))
-        y = self.ln2(y).view(B, self.num_heads, self.gen_size)
-        b_sq = torch.einsum("bhi,oi->bho", y, self.pos_enc_weight)
-        b_sq = b_sq.view(B, self.num_heads, 64, 64)
-        b_sq_padded = torch.nn.functional.pad(b_sq, (1, 3, 1, 3))
-        sp_full = self.sp_bias[:, self.sp_bucket]
-        return torch.where(self.is_sq[None, None],
-                           b_sq_padded,
-                           sp_full.unsqueeze(0))
-
-
-# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -376,14 +319,13 @@ def build_pos_modules(variant: str, embed_dim: int, num_heads: int,
                       layout: TokenLayout):
     """Return ``(pos_embeddings, bias_module)``.
 
-    ``pos_embeddings`` is the per-layer module passed to MHA (rotates Q/K).
-    ``bias_module`` is a parameter-bearing module whose ``__call__()`` returns
-    ``[1, num_heads, seq_len, seq_len]`` added to attention logits each forward.
-    Either may be ``None``. The ``smolgen`` variant doesn't use either —
-    per-layer Smolgen instances live inside each ``EncoderLayer`` instead.
+    ``pos_embeddings`` is the per-layer module passed to attention (rotates
+    Q/K). ``bias_module`` is a parameter-bearing module whose ``__call__()``
+    returns ``[1, num_heads, seq_len, seq_len]`` added to attention logits
+    each forward. Either may be ``None``.
     """
     head_dim = embed_dim // num_heads
-    if variant in ("baseline", "smolgen"):
+    if variant == "baseline":
         return None, None
     if variant == "rope1d":
         return RotaryPositionalEmbeddings(
@@ -395,4 +337,4 @@ def build_pos_modules(variant: str, embed_dim: int, num_heads: int,
     if variant == "geom":
         return None, GeomAttnBias(num_heads=num_heads, layout=layout)
     raise ValueError(f"unknown attention_variant {variant!r} "
-                     f"(expected baseline/rope1d/rope2d/relpos2d/geom/smolgen)")
+                     f"(expected baseline/rope1d/rope2d/relpos2d/geom)")
