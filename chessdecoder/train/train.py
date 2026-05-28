@@ -95,6 +95,8 @@ def train():
         attention_variant=mc.get("attention_variant", "baseline"),
         input_mode=mc.get("input_mode", "default"),
         policy_head=mc.get("policy_head", "linear"),
+        use_gradient_checkpointing=mc.get(
+            "use_gradient_checkpointing", False),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")
