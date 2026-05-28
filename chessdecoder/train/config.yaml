@@ -19,6 +19,12 @@ model:
   num_layers: 12
   d_ff: 1536
   seq_len: 68                  # start_pos | a1..h8 (64) | end_pos | castling | stm
+  # geom attention bias (chess-specific Δrank/Δfile/diag/knight features)
+  # won the attention sweep over plain MHA at long horizons. Default to it.
+  attention_variant: "geom"
+  # cross_attn policy head beat the Linear head by ~+0.06 move_acc at the
+  # same compute budget. Default to it.
+  policy_head: "cross_attn"
 
 training:
   optimizer: "muon"            # muon | adamw
