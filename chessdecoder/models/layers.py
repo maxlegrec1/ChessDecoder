@@ -96,26 +96,14 @@ class EncoderStack(nn.Module):
     learned relpos / geometric bias) through the stack without recomputing it
     per layer. ``torch.compile`` traces through this for-loop fine as long as
     ``layers`` is a static ``nn.ModuleList``.
-
-    Optional ``use_gradient_checkpointing``: wraps each layer in
-    ``torch.utils.checkpoint`` so the intermediate activations are dropped
-    on the way down and recomputed on the way up. Trades ~30% extra
-    forward FLOPs for ~4x lower activation memory — useful when training
-    big models at large batch on a single GPU.
     """
 
-    def __init__(self, layers, use_gradient_checkpointing: bool = False):
+    def __init__(self, layers):
         super().__init__()
         self.layers = nn.ModuleList(layers)
-        self.use_gradient_checkpointing = use_gradient_checkpointing
 
     def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.use_gradient_checkpointing and self.training:
-            for layer in self.layers:
-                x = torch.utils.checkpoint.checkpoint(
-                    layer, x, mask, use_reentrant=False)
-        else:
-            for layer in self.layers:
-                x = layer(x, mask=mask)
+        for layer in self.layers:
+            x = layer(x, mask=mask)
         return x

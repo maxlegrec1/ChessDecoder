@@ -63,8 +63,7 @@ class ChessEncoder(nn.Module):
                  seq_len: int = 64, d_ff: int = 1536,
                  attention_variant: str = "geom",
                  input_mode: str = "lc0_64",
-                 policy_head: str = "cross_attn",
-                 use_gradient_checkpointing: bool = False):
+                 policy_head: str = "cross_attn"):
         super().__init__()
         self.embed_dim = embed_dim
         self.input_mode = input_mode
@@ -93,12 +92,12 @@ class ChessEncoder(nn.Module):
             num_heads=num_heads, layout=layout)
         self.bias_module = bias_module
 
-        self.encoder = EncoderStack(
-            [EncoderLayer(embed_dim, num_heads, d_ff,
-                          max_seq_len=layout.seq_len,
-                          pos_embeddings=pos_module)
-             for _ in range(num_layers)],
-            use_gradient_checkpointing=use_gradient_checkpointing)
+        self.encoder = EncoderStack([
+            EncoderLayer(embed_dim, num_heads, d_ff,
+                         max_seq_len=layout.seq_len,
+                         pos_embeddings=pos_module)
+            for _ in range(num_layers)
+        ])
         self.norm = RMSNorm(dim=embed_dim)
 
         # Heads.
