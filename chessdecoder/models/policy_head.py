@@ -2,13 +2,29 @@
 
 Two variants, selectable via ``model.policy_head``:
 
-- ``linear`` (default): a single ``nn.Linear`` from the readout vector to the
-  full move-sub-vocab. The original setup — fast, no spatial bias.
-- ``cross_attn``: LC0-style attention policy. Per-square Q and K projections
-  produce a pairwise ``[B, 64, 64]`` score table; the logit for each of the
-  1924 move tokens is looked up as ``scores[b, from_sq, to_sq]`` plus a small
-  learned per-promotion bias for the ``r/b/q`` underpromotion variants
-  (knight is the no-suffix default in our vocab — promo_idx 0).
+- ``linear`` (default): a single ``nn.Linear`` from the readout vector to
+  the move sub-vocab. Fast, no spatial structure.
+
+- ``cross_attn``: LC0's attention-policy head. Per-square Q and K
+  projections produce a pairwise ``[B, 64, 64]`` score table — the move
+  logit for each of the 1924 (from, to)-indexed tokens is gathered as
+  ``scores[from_sq, to_sq]``. Queen promotions and 4-char "non-pawn move"
+  tokens share the same ``(from, to)`` slot (LC0 main-path convention; the
+  model disambiguates from board context). Rook and bishop underpromotions
+  get an additional *content-dependent* offset from a small
+  ``Linear(d_pol, 2)`` over the K vectors of the promotion-target squares
+  — so the model can say "in *this* board, promote to a rook here because
+  of the discovered check".
+
+  Differences from LC0:
+    - LC0 has explicit knight underpromotion (``n`` suffix); our vocab
+      omits it entirely (verified empirically — 50/50 sampled 4-char
+      "promotion-pair" best_moves were actual *non-pawn moves* on
+      promotion-rank squares, not knight underpromotions). So we have 2
+      underpromotion pieces (r, b) instead of LC0's 3 (n, r, b).
+    - LC0 flips the board to side-to-move, so it only handles rank-8
+      promotions (8 target squares). We don't flip, so we handle both
+      rank-1 (black) and rank-8 (white) promotions — 16 target squares.
 """
 from __future__ import annotations
 
@@ -17,6 +33,18 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+
+
+# Promotion-target square indices in chess.SQUARES order (a1=0 .. h8=63):
+# - rank 1 squares: 0..7   (black promotes here)
+# - rank 8 squares: 56..63 (white promotes here)
+_PROMO_SQUARES = list(range(0, 8)) + list(range(56, 64))
+_PROMO_SQ_TO_IDX = {sq: i for i, sq in enumerate(_PROMO_SQUARES)}
+
+# Underpromotion piece indices (queen is implicit in the main path; knight
+# is absent from our vocab — see module docstring).
+_UNDERPROMO_PIECE = {"r": 0, "b": 1}
+_N_UNDERPROMO_PIECES = 2
 
 
 def _file_id(c: str) -> int:
@@ -33,33 +61,53 @@ def _square_id(s: str) -> int:
     return _rank_id(s[1]) * 8 + _file_id(s[0])
 
 
-def _move_components(move: str):
-    """``(from_sq, to_sq, promo_idx)`` for a ``policy_index`` move string.
+def _is_promo_capable(from_sq: int, to_sq: int) -> bool:
+    """True iff ``(from_sq, to_sq)`` is a pawn promotion move (rank 7 -> 8
+    or rank 2 -> 1)."""
+    from_rank = from_sq // 8                      # 0..7
+    to_rank = to_sq // 8
+    return ((from_rank == 6 and to_rank == 7) or
+            (from_rank == 1 and to_rank == 0))
 
-    promo_idx: 0 = no suffix (knight under our vocab's convention, or
-    non-promotion for non-promotion moves); 1 = q; 2 = r; 3 = b.
+
+def _classify_move(move: str):
+    """Return ``(from_sq, to_sq, is_underpromo, promo_target_idx, piece_idx)``
+    for one ``policy_index`` move.
+
+    Only 5-char ``r`` and ``b`` suffix moves are underpromotions in our
+    vocab. 4-char moves are always non-promotion (regular piece moves);
+    5-char ``q`` moves share the ``(from, to)`` slot with the corresponding
+    4-char non-pawn move (LC0 main-path convention). ``promo_target_idx``
+    and ``piece_idx`` are 0 placeholders for non-underpromotion moves —
+    the forward-pass gather is masked out via ``is_underpromo_mask``.
     """
     from_sq = _square_id(move[:2])
     to_sq = _square_id(move[2:4])
-    if len(move) == 4:
-        promo = 0
-    else:
-        promo = {"q": 1, "r": 2, "b": 3}[move[4]]
-    return from_sq, to_sq, promo
+    suffix = move[4] if len(move) == 5 else ""
+    if suffix in _UNDERPROMO_PIECE:
+        return (from_sq, to_sq, True,
+                _PROMO_SQ_TO_IDX[to_sq], _UNDERPROMO_PIECE[suffix])
+    # Either 4-char (non-pawn move) or 5-char-"q" (queen promotion, shares
+    # slot with the 4-char non-pawn move): both use base score only.
+    return from_sq, to_sq, False, 0, 0
 
 
 class CrossAttnPolicyHead(nn.Module):
-    """LC0-style attention policy from the 64 board squares.
+    """LC0-style attention policy with content-dependent underpromotion offsets.
 
-    Input  : ``x_squares: [B, 64, d_model]`` — the encoder's output at the
-             64 board-square positions.
+    Input  : ``x_squares: [B, 64, d_model]`` — encoder output for the 64
+             board squares.
     Output : ``[B, move_vocab_size]`` move logits.
 
-    Implementation:
-        Q = x @ q_proj.T      [B, 64, d_pol]
-        K = x @ k_proj.T      [B, 64, d_pol]
-        S = Q @ K.T / sqrt(d) [B, 64, 64]
-        logit[b, m] = S[b, from[m], to[m]] + promo_bias[promo_idx[m]]
+    Forward:
+        q = Wq @ x_squares                                   [B, 64, d_pol]
+        k = Wk @ x_squares                                   [B, 64, d_pol]
+        scores = q @ k.T / sqrt(d_pol)                       [B, 64, 64]
+        promo_k = k[:, promo_target_squares, :]              [B, 16, d_pol]
+        promo_offsets = Wp @ promo_k                         [B, 16, 3]
+        base[b, m] = scores[b, from[m], to[m]]               [B, M]
+        offset[b, m] = promo_offsets[b, tgt[m], piece[m]] * is_underpromo[m]
+        return base + offset
     """
 
     def __init__(self, d_model: int, move_vocab_size: int,
@@ -71,27 +119,54 @@ class CrossAttnPolicyHead(nn.Module):
         self.q_proj = nn.Linear(d_model, d_pol, bias=False)
         self.k_proj = nn.Linear(d_model, d_pol, bias=False)
         self.scale = 1.0 / math.sqrt(d_pol)
-        # Pre-compute per-move (from, to, promo) lookup tensors.
+
+        # Per-promotion-target key -> underpromotion-piece offsets.
+        self.promo_offset_proj = nn.Linear(d_pol, _N_UNDERPROMO_PIECES,
+                                           bias=False)
+        # Zero init: at step 0 the underpromotion offset is exactly 0, so
+        # the policy matches the static-bias (or no-bias) baseline exactly
+        # in its early behavior — avoids the first-step loss spike from a
+        # default-Xavier promo projection randomly amplifying underpromo
+        # logits before any gradient has flowed.
+        nn.init.zeros_(self.promo_offset_proj.weight)
+
+        # Pre-compute per-move metadata.
         from_sq = torch.empty(move_vocab_size, dtype=torch.long)
         to_sq = torch.empty(move_vocab_size, dtype=torch.long)
-        promo_idx = torch.empty(move_vocab_size, dtype=torch.long)
+        is_underpromo = torch.zeros(move_vocab_size, dtype=torch.bool)
+        promo_target_idx = torch.zeros(move_vocab_size, dtype=torch.long)
+        piece_idx = torch.zeros(move_vocab_size, dtype=torch.long)
         for i, mv in enumerate(policy_index):
-            f, t, p = _move_components(mv)
+            f, t, up, tgt, p = _classify_move(mv)
             from_sq[i] = f
             to_sq[i] = t
-            promo_idx[i] = p
+            is_underpromo[i] = up
+            promo_target_idx[i] = tgt
+            piece_idx[i] = p
         self.register_buffer("from_sq", from_sq, persistent=False)
         self.register_buffer("to_sq", to_sq, persistent=False)
-        self.register_buffer("promo_idx", promo_idx, persistent=False)
-        # Underpromotion bias (knight/q/r/b). Init to zero so behaviour at
-        # step 0 is content-only (the score table alone determines moves).
-        self.promo_bias = nn.Parameter(torch.zeros(4))
+        # Float mask for vectorized application of the underpromo offset.
+        self.register_buffer("is_underpromo_mask",
+                             is_underpromo.float(), persistent=False)
+        self.register_buffer("promo_target_idx", promo_target_idx, persistent=False)
+        self.register_buffer("piece_idx", piece_idx, persistent=False)
+        # 16 promotion-target square indices in chess.SQUARES order (rank 1
+        # squares 0..7 for black, rank 8 squares 56..63 for white).
+        self.register_buffer("promo_target_squares",
+                             torch.tensor(_PROMO_SQUARES, dtype=torch.long),
+                             persistent=False)
 
     def forward(self, x_squares: torch.Tensor) -> torch.Tensor:
-        # x_squares: [B, 64, d_model]
-        q = self.q_proj(x_squares)                              # [B, 64, d_pol]
-        k = self.k_proj(x_squares)                              # [B, 64, d_pol]
+        # Standard (from, to) attention scores.
+        q = self.q_proj(x_squares)                             # [B, 64, d_pol]
+        k = self.k_proj(x_squares)                             # [B, 64, d_pol]
         scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale   # [B, 64, 64]
-        # Gather per-move scores: [B, M] = scores[B, from_sq, to_sq].
-        logits = scores[:, self.from_sq, self.to_sq]
-        return logits + self.promo_bias[self.promo_idx]
+        base = scores[:, self.from_sq, self.to_sq]             # [B, M]
+
+        # Content-dependent underpromotion offsets — gathered from the K
+        # vectors of the 16 promotion-target squares.
+        promo_k = k[:, self.promo_target_squares, :]           # [B, 16, d_pol]
+        promo_offsets = self.promo_offset_proj(promo_k)        # [B, 16, 3]
+        # Gather per-move offsets: [B, M].
+        underpromo = promo_offsets[:, self.promo_target_idx, self.piece_idx]
+        return base + underpromo * self.is_underpromo_mask
