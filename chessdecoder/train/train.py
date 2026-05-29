@@ -310,6 +310,11 @@ def train():
                       f"q_mae={q_mae.item():.3f} "
                       f"pos/s={pos_per_s:.0f} steps/s={steps_per_s:.2f} "
                       f"mfu={mfu*100:.1f}%")
+                # Cumulative compute since wandb.init: useful as a x-axis
+                # alongside ``_runtime`` for scaling-law fits. ``step`` here
+                # counts micro-batches (one forward+backward), so
+                # ``step * flops_per_step`` is total FLOPs spent.
+                cumulative_tf = (step + 1) * flops_per_step / 1e12
                 wandb.log({
                     "train/total_loss": total.item(),
                     "train/move_loss": policy_loss.item(),
@@ -324,6 +329,7 @@ def train():
                     "train/pos_per_s": pos_per_s,
                     "train/steps_per_s": steps_per_s,
                     "train/mfu": mfu,
+                    "train/cumulative_tflops": cumulative_tf,
                     "train/epoch": epoch, "train/step": step,
                 })
 
