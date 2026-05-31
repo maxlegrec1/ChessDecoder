@@ -20,6 +20,7 @@ import glob
 import math
 import os
 import random
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -227,7 +228,8 @@ class ChessIterableDataset(IterableDataset):
 
     def __init__(self, parquet_dir, positions_per_game=8, shuffle_files=True,
                  shuffle_games=True, seed=42, rank=0, world_size=1,
-                 cache_dir=None, batch_size=1):
+                 cache_dir=None, batch_size=1, split="all", val_pct=2,
+                 max_shards=None):
         self.parquet_dir = parquet_dir
         self.cache_dir = cache_dir
         self.positions_per_game = positions_per_game
@@ -235,22 +237,38 @@ class ChessIterableDataset(IterableDataset):
         self.shuffle_games = shuffle_games
         self.batch_size = batch_size
         self.seed = seed
+        # Leakage-free train/val split: a whole game is val iff
+        # crc32("<shard>:<gi>") % 100 < val_pct (no ply of a val game ever
+        # leaks into train). split="all" keeps the original behaviour.
+        self.split = split
+        self.val_pct = val_pct
+        self.max_shards = max_shards
         self.epoch = 0
         self.rank = rank
         self.world_size = world_size
-        # Prefer cached .npz when available, else fall back to parquet.
-        parquets = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
+        # Discover shards by stem from BOTH the parquet dir and the cache dir,
+        # so training still works after parquets are pruned (npz-only). Prefer
+        # the cached .npz when present, else fall back to the parquet.
+        stems = {os.path.splitext(os.path.basename(p))[0]
+                 for p in glob.glob(os.path.join(parquet_dir, "*.parquet"))}
+        if cache_dir:
+            stems |= {os.path.splitext(os.path.basename(z))[0]
+                      for z in glob.glob(os.path.join(cache_dir, "*.npz"))}
         files = []
         n_cached = 0
-        for p in parquets:
-            stem = os.path.splitext(os.path.basename(p))[0]
+        for stem in sorted(stems):
             cached = (os.path.join(cache_dir, f"{stem}.npz")
                       if cache_dir else None)
             if cached and os.path.exists(cached):
                 files.append(cached)
                 n_cached += 1
             else:
-                files.append(p)
+                files.append(os.path.join(parquet_dir, f"{stem}.parquet"))
+        # Optionally restrict to the first N shards (sorted by name = by date),
+        # e.g. to reproduce a smaller-data overfitting regime deterministically.
+        if max_shards is not None:
+            files = files[:max_shards]
+            n_cached = sum(1 for f in files if f.endswith(".npz"))
         self.files = files
         if not self.files:
             print(f"Warning: No shards found in {parquet_dir} or {cache_dir}")
@@ -261,7 +279,15 @@ class ChessIterableDataset(IterableDataset):
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
         wid = wi.id if wi is not None else 0
-        es = self.seed + self.epoch * 100003 + self.rank * 7919 + wid * 997
+        # BUG FIX: with persistent_workers=True the workers never see updates to
+        # self.epoch (it's set on the main-process copy), so the per-epoch RNG
+        # seed stayed constant and EVERY epoch re-sampled the SAME plies — the
+        # model just re-memorized a fixed 1-ply/game subset. Advance a per-worker
+        # counter on each __iter__ (DataLoader calls it once per epoch) so the
+        # seed actually changes every epoch.
+        self._epoch_iter = getattr(self, "_epoch_iter", -1) + 1
+        ep = max(int(self.epoch), self._epoch_iter)
+        es = self.seed + ep * 100003 + self.rank * 7919 + wid * 997
         random.seed(es)
         np.random.seed(es % (2**32))
 
@@ -303,10 +329,15 @@ class ChessIterableDataset(IterableDataset):
                     bounds = np.concatenate(
                         [[0], change, [len(gids)]]).astype(np.int64)
                 ngames = len(bounds) - 1
+                stem = os.path.splitext(os.path.basename(fp))[0]
                 order = np.arange(ngames)
                 if self.shuffle_games:
                     np.random.shuffle(order)
                 for gi in order:
+                    if self.split != "all":
+                        h = zlib.crc32(("%s:%d" % (stem, int(gi))).encode()) % 100
+                        if (h < self.val_pct) != (self.split == "val"):
+                            continue
                     s, e = int(bounds[gi]), int(bounds[gi + 1])
                     idx = _pick_rows(s, e, N)
                     acc.append(_gather_game(shard, idx))
@@ -320,10 +351,11 @@ class ChessIterableDataset(IterableDataset):
 
 def get_dataloader(parquet_dir, batch_size=16, num_workers=0,
                    positions_per_game=8, seed=42, rank=0, world_size=1,
-                   cache_dir=None):
+                   cache_dir=None, split="all", val_pct=2, max_shards=None):
     ds = ChessIterableDataset(parquet_dir, positions_per_game=positions_per_game,
                               seed=seed, rank=rank, world_size=world_size,
-                              cache_dir=cache_dir, batch_size=batch_size)
+                              cache_dir=cache_dir, batch_size=batch_size,
+                              split=split, val_pct=val_pct, max_shards=max_shards)
     # batch_size=None: the dataset already yields pre-collated [B, N, ...]
     # batches. DataLoader's default collate would otherwise re-stack our
     # batches into [1, B, N, ...].
