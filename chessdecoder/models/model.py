@@ -63,12 +63,17 @@ class ChessEncoder(nn.Module):
                  seq_len: int = 64, d_ff: int = 1536,
                  attention_variant: str = "geom",
                  input_mode: str = "lc0_64",
-                 policy_head: str = "cross_attn"):
+                 policy_head: str = "cross_attn",
+                 ffn_type: str = "dense", moe_num_experts: int = 8,
+                 moe_top_k: int = 2, moe_expert_d_ff: int = None,
+                 moe_aux_loss_weight: float = 1e-2,
+                 moe_capacity_factor: float = None, moe_router_noise: float = 0.0):
         super().__init__()
         self.embed_dim = embed_dim
         self.input_mode = input_mode
         self.policy_head_type = policy_head
         self.attention_variant = attention_variant
+        self.ffn_type = ffn_type
 
         layout: TokenLayout = INPUT_MODE_TO_LAYOUT[input_mode]
         self.layout = layout
@@ -95,7 +100,12 @@ class ChessEncoder(nn.Module):
         self.encoder = EncoderStack([
             EncoderLayer(embed_dim, num_heads, d_ff,
                          max_seq_len=layout.seq_len,
-                         pos_embeddings=pos_module)
+                         pos_embeddings=pos_module,
+                         ffn_type=ffn_type, moe_num_experts=moe_num_experts,
+                         moe_top_k=moe_top_k, moe_expert_d_ff=moe_expert_d_ff,
+                         moe_aux_loss_weight=moe_aux_loss_weight,
+                         moe_capacity_factor=moe_capacity_factor,
+                         moe_router_noise=moe_router_noise)
             for _ in range(num_layers)
         ])
         self.norm = RMSNorm(dim=embed_dim)
@@ -153,3 +163,14 @@ class ChessEncoder(nn.Module):
 
     def mean_wdl(self, wdl_logits: torch.Tensor) -> torch.Tensor:
         return _mean_wdl(wdl_logits, self.cell_wdl)
+
+    def moe_aux_loss(self):
+        """Sum of the per-layer MoE load-balancing aux losses (None if dense).
+        Each MoE layer stashes its aux loss in ``mlp.aux_loss`` during forward;
+        the training loop adds this to the total and the layers clear it."""
+        total = None
+        for layer in self.encoder.layers:
+            al = getattr(layer.mlp, "aux_loss", None)
+            if al is not None:
+                total = al if total is None else total + al
+        return total

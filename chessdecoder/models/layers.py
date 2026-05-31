@@ -66,18 +66,39 @@ class BidirAttn(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    """Bidirectional self-attention + SwiGLU MLP, pre-RMSNorm."""
+    """Bidirectional self-attention + SwiGLU MLP, pre-RMSNorm.
+
+    ``ffn_type``: ``dense`` (SwiGLU, default) or ``moe`` (top-k MoE SwiGLU). For
+    an iso-active-FLOP MoE set ``moe_expert_d_ff = d_ff // moe_top_k`` so the
+    ``moe_top_k`` active experts sum to the dense ``d_ff`` width.
+    """
 
     def __init__(self, embed_dim: int, num_heads: int, d_ff: int,
                  max_seq_len: int = 128,
-                 pos_embeddings: Optional[nn.Module] = None):
+                 pos_embeddings: Optional[nn.Module] = None,
+                 ffn_type: str = "dense", moe_num_experts: int = 8,
+                 moe_top_k: int = 2, moe_expert_d_ff: Optional[int] = None,
+                 moe_aux_loss_weight: float = 1e-2,
+                 moe_capacity_factor: Optional[float] = None,
+                 moe_router_noise: float = 0.0):
         super().__init__()
         self.attn = BidirAttn(embed_dim=embed_dim, num_heads=num_heads,
                               pos_embeddings=pos_embeddings)
-        self.mlp = FeedForward(
-            gate_proj=nn.Linear(embed_dim, d_ff, bias=False),
-            down_proj=nn.Linear(d_ff, embed_dim, bias=False),
-            up_proj=nn.Linear(embed_dim, d_ff, bias=False))
+        if ffn_type == "moe":
+            from chessdecoder.models.moe import MoEFeedForward
+            self.mlp = MoEFeedForward(
+                embed_dim, expert_d_ff=moe_expert_d_ff or (d_ff // moe_top_k),
+                num_experts=moe_num_experts, top_k=moe_top_k,
+                aux_loss_weight=moe_aux_loss_weight,
+                capacity_factor=moe_capacity_factor,
+                router_noise=moe_router_noise)
+        elif ffn_type == "dense":
+            self.mlp = FeedForward(
+                gate_proj=nn.Linear(embed_dim, d_ff, bias=False),
+                down_proj=nn.Linear(d_ff, embed_dim, bias=False),
+                up_proj=nn.Linear(embed_dim, d_ff, bias=False))
+        else:
+            raise ValueError(f"unknown ffn_type {ffn_type!r}")
         self.sa_norm = RMSNorm(dim=embed_dim)
         self.mlp_norm = RMSNorm(dim=embed_dim)
 

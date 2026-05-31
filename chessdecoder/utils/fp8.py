@@ -80,6 +80,28 @@ def compile_fp8_hot_path(model) -> None:
                                       dynamic=False)
 
 
+def convert_moe_experts_to_fp8(model) -> int:
+    """Wrap MoE expert weights (the 3-D gate/up/down params) with torchao's
+    ``ScaledGroupedMMTensor`` so their ``torch._grouped_mm`` calls run in rowwise
+    float8 — the MoE analogue of the Float8Linear swap for the dense path. The
+    small bf16 router Linear is left alone. Returns the number of MoE layers
+    converted (0 for a dense model)."""
+    from chessdecoder.models.moe import MoEFeedForward
+    from torchao.prototype.moe_training.tensor import ScaledGroupedMMTensor
+    from torchao.prototype.moe_training.conversion_utils import MoEScalingType
+    n = 0
+    for m in model.modules():
+        if isinstance(m, MoEFeedForward):
+            for name in ("gate_w", "up_w", "down_w"):
+                p = getattr(m, name)
+                if not isinstance(p.data, ScaledGroupedMMTensor):
+                    setattr(m, name, nn.Parameter(
+                        ScaledGroupedMMTensor(p.data, MoEScalingType.FP8_ROWWISE),
+                        requires_grad=p.requires_grad))
+            n += 1
+    return n
+
+
 def count_fp8_linears(model: nn.Module) -> tuple[int, int]:
     """(#fp8_linears, #total_linears) — for a sanity print after conversion."""
     from torchao.float8.float8_linear import Float8Linear

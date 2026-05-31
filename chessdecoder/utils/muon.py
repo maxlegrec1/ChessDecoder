@@ -6,18 +6,22 @@ import torch.optim as optim
 
 
 def _newtonschulz5(G, steps=5, eps=1e-7):
+    """Newton-Schulz orthogonalization. Works on a 2-D matrix or a BATCH of
+    matrices (3-D, e.g. MoE expert weights ``[E, out, in]``) — the matmuls
+    operate on the last two dims so each expert is orthogonalized independently.
+    """
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G.bfloat16()
-    X = X / (X.norm() + eps)
-    transposed = G.size(0) > G.size(1)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)   # per-matrix norm
+    transposed = X.size(-2) > X.size(-1)
     if transposed:
-        X = X.T
+        X = X.transpose(-2, -1)
     for _ in range(steps):
-        A = X @ X.T
+        A = X @ X.transpose(-2, -1)
         B = b * A + c * A @ A
         X = a * X + B @ X
     if transposed:
-        X = X.T
+        X = X.transpose(-2, -1)
     return X.to(G.dtype)
 
 
@@ -44,12 +48,17 @@ class MuonWithAdam(torch.optim.Optimizer):
                         continue
                     st = self.state[p]
                     if "buf" not in st:
-                        st["buf"] = torch.zeros_like(p)
+                        # plain momentum buffer (p may be a ScaledGroupedMMTensor
+                        # for fp8 MoE experts; keep all the orthogonalization math
+                        # on the plain grad tensor and only touch p in-place).
+                        st["buf"] = torch.zeros_like(p.grad)
                     buf = st["buf"]
                     buf.mul_(mom).add_(p.grad)
                     upd = p.grad.add(buf, alpha=mom)            # Nesterov
-                    o = _newtonschulz5(upd)
-                    scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                    o = _newtonschulz5(upd)                     # 2-D or batched 3-D
+                    # scale by sqrt(out/in) using the matrix dims (last two axes),
+                    # so 3-D expert weights [E, out, in] use out/in, not E.
+                    scale = max(1.0, p.shape[-2] / p.shape[-1]) ** 0.5
                     if wd:
                         p.mul_(1 - lr * wd)
                     p.add_(o, alpha=-lr * scale)
@@ -93,13 +102,18 @@ def build_optimizer(model, name, lr, wd):
         # relpos2d's) and ``pos_enc_weight`` (one row per board-square
         # pair — orthogonalizing those rows in gen-size space wrecks the
         # spatial decoding the einsum relies on).
+        # ``router`` (MoE gate, a small [E, d] matrix) stays on AdamW — Newton-
+        # Schulz orthogonalizes the routing directions and destabilizes routing.
         excluded = ("tok_embedding", "pos_embedding",
                     "policy_head", "wdl_head", "bias_module",
-                    "sp_bias", "pos_enc_weight")
+                    "sp_bias", "pos_enc_weight", "router")
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            is_matrix = p.ndim == 2 and not any(k in n for k in excluded)
+            # 2-D Linear matrices AND 3-D MoE expert weights [E, out, in] go to
+            # Muon (each expert orthogonalized independently); embeddings / heads
+            # / norms / biases / router go to AdamW.
+            is_matrix = p.ndim in (2, 3) and not any(k in n for k in excluded)
             (muon_p if is_matrix else adam_p).append(p)
         return MuonWithAdam(muon_p, adam_p, lr=lr, weight_decay=wd)
     raise ValueError(f"unknown optimizer {name!r}")

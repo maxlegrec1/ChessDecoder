@@ -34,7 +34,8 @@ from chessdecoder.utils.distributed import (
     setup_distributed, cleanup_distributed, is_main_process, get_device,
     average_gradients, barrier, print_rank0)
 from chessdecoder.utils.fp8 import (
-    convert_model_to_fp8, compile_fp8_hot_path, count_fp8_linears)
+    convert_model_to_fp8, compile_fp8_hot_path, count_fp8_linears,
+    convert_moe_experts_to_fp8)
 from chessdecoder.utils.muon import build_optimizer
 from chessdecoder.utils.training import (
     load_config, save_training_checkpoint, init_wandb_with_resume)
@@ -95,6 +96,13 @@ def train():
         attention_variant=mc.get("attention_variant", "baseline"),
         input_mode=mc.get("input_mode", "default"),
         policy_head=mc.get("policy_head", "linear"),
+        ffn_type=mc.get("ffn_type", "dense"),
+        moe_num_experts=mc.get("moe_num_experts", 8),
+        moe_top_k=mc.get("moe_top_k", 2),
+        moe_expert_d_ff=mc.get("moe_expert_d_ff"),
+        moe_aux_loss_weight=mc.get("moe_aux_loss_weight", 1e-2),
+        moe_capacity_factor=mc.get("moe_capacity_factor"),
+        moe_router_noise=mc.get("moe_router_noise", 0.0),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")
@@ -120,13 +128,16 @@ def train():
     print_rank0(f"FLOPs/step (approx): {flops_per_step/1e12:.2f} TF; "
                 f"peak: {peak_flops/1e12:.0f} TF/s")
 
+    val_pct = config["training"].get("val_pct", 2)
+    max_shards = config["data"].get("max_shards")
     dataloader, dataset = get_dataloader(
         config["data"]["parquet_dir"],
         batch_size=config["data"]["batch_size"],
         num_workers=config["data"].get("num_workers", 0),
         positions_per_game=config["data"]["positions_per_game"],
         seed=seed, rank=rank, world_size=world_size,
-        cache_dir=config["data"].get("cache_dir"))
+        cache_dir=config["data"].get("cache_dir"),
+        split="train", val_pct=val_pct, max_shards=max_shards)
 
     use_fp8 = config["training"].get("use_fp8", False)
     use_amp = config["training"].get("use_amp", False)
@@ -156,6 +167,11 @@ def train():
         nfp8, nrest = count_fp8_linears(model)
         print_rank0(f"FP8: converted {nfp8} Linear modules to Float8 "
                     f"(recipe={recipe}); {nrest} remained bf16/fp32.")
+        if config["training"].get("moe_fp8", True):
+            nmoe = convert_moe_experts_to_fp8(model)
+            if nmoe:
+                print_rank0(f"FP8: converted {nmoe} MoE expert blocks to rowwise "
+                            f"float8 grouped-GEMM.")
         if config["training"].get("fp8_compile", True):
             compile_fp8_hot_path(model)
             print_rank0("FP8: torch.compile applied to encoder stack")
@@ -211,6 +227,83 @@ def train():
     steps_in_window = 0
     max_steps = config["training"].get("max_steps")
 
+    # ---- held-out validation (leakage-free game-hash split) ----
+    # Materialize a FIXED set of val batches once so every eval scores the
+    # exact same held-out positions (clean train-vs-val curve).
+    val_every = config["training"].get("val_every_n_steps", 1000)
+    n_val_batches = config["training"].get("val_batches", 8)
+    val_data = []
+    if is_main_process() and n_val_batches > 0:
+        v_loader, _ = get_dataloader(
+            config["data"]["parquet_dir"],
+            batch_size=config["data"]["batch_size"],
+            num_workers=min(4, config["data"].get("num_workers", 0)),
+            positions_per_game=config["data"]["positions_per_game"],
+            seed=seed, rank=rank, world_size=world_size,
+            cache_dir=config["data"].get("cache_dir"),
+            split="val", val_pct=val_pct, max_shards=max_shards)
+        vit = iter(v_loader)
+        for _ in range(n_val_batches):
+            try:
+                val_data.append(next(vit))
+            except StopIteration:
+                break
+        del v_loader, vit
+        print_rank0(f"Val: {len(val_data)} fixed batches "
+                    f"({len(val_data) * config['data']['batch_size']} positions, "
+                    f"{val_pct}% game-hash holdout)")
+
+    @torch.no_grad()
+    def run_val(val_data):
+        model.eval()
+        agg = dict(total_loss=0.0, move_loss=0.0, wdl_loss=0.0,
+                   move_acc=0.0, wdl_acc=0.0, q_mae=0.0)
+        nb = 0
+        for vb in val_data:
+            bid = vb["board_ids"].to(device, non_blocking=True)
+            Bv, Nv, _ = bid.shape
+            pol_tgt = vb["policy_tgt"].to(device, non_blocking=True)
+            pol_val = vb["policy_valid"].to(device, non_blocking=True)
+            wdl_mean = vb["wdl_mean"].to(device, non_blocking=True)
+            wdl_val = vb["wdl_valid"].to(device, non_blocking=True)
+            q_in = vb["q"].to(device, non_blocking=True)
+            d_in = vb["d"].to(device, non_blocking=True)
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype,
+                                enabled=use_amp):
+                out = model(bid.reshape(Bv * Nv, 68))
+                pol_logits = out["policy"].reshape(Bv, Nv, -1)
+                wdl_logits = out["wdl"].reshape(Bv, Nv, -1)
+                vflat = wdl_val.reshape(-1)
+                wdl_tgt = torch.zeros(Bv * Nv, N_CELLS, device=device,
+                                      dtype=torch.float32)
+                if vflat.any():
+                    wdl_tgt[vflat] = project_targets(
+                        q_in.reshape(-1)[vflat], d_in.reshape(-1)[vflat])
+                wdl_tgt = wdl_tgt.reshape(Bv, Nv, N_CELLS)
+                pmask = pol_val
+                policy_loss = ce(
+                    pol_logits.reshape(-1, move_vocab_size),
+                    torch.where(pmask, pol_tgt,
+                                torch.full_like(pol_tgt, IGNORE_INDEX)).reshape(-1))
+                vmask = wdl_val
+                logp = torch.log_softmax(wdl_logits.float(), -1)
+                wdl_loss = (-(wdl_tgt * logp).sum(-1) * vmask).sum() / (vmask.sum() + 1e-8)
+                total = w_pol * policy_loss + w_wdl * wdl_loss
+            move_acc = ((pol_logits.argmax(-1) == pol_tgt) & pmask).sum() / (pmask.sum() + 1e-8)
+            wdl_p = model.mean_wdl(wdl_logits)
+            vf = vmask.float(); vn = vf.sum() + 1e-8
+            q_pred = wdl_p[..., 0] - wdl_p[..., 2]
+            q_tgt = wdl_mean[..., 0] - wdl_mean[..., 2]
+            agg["q_mae"] += (((q_pred - q_tgt).abs() * vf).sum() / vn).item()
+            agg["wdl_acc"] += (((wdl_p.argmax(-1) == wdl_mean.argmax(-1)) & vmask).sum() / vn).item()
+            agg["total_loss"] += total.item()
+            agg["move_loss"] += policy_loss.item()
+            agg["wdl_loss"] += wdl_loss.item()
+            agg["move_acc"] += move_acc.item()
+            nb += 1
+        model.train()
+        return {k: v / max(nb, 1) for k, v in agg.items()}
+
     for epoch in range(start_epoch, config["training"]["num_epochs"]):
         print_rank0(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
         dataset.epoch = epoch
@@ -264,6 +357,11 @@ def train():
                 wdl_loss = (wdl_ce * vmask).sum() / (vmask.sum() + 1e-8)
 
                 total = w_pol * policy_loss + w_wdl * wdl_loss
+                # MoE load-balancing aux loss (None for the dense FFN). Already
+                # scaled by moe_aux_loss_weight inside each expert block.
+                moe_aux = model.moe_aux_loss()
+                if moe_aux is not None:
+                    total = total + moe_aux
 
             (scaler.scale(total / grad_accum)).backward()
             if (step + 1) % grad_accum == 0:
@@ -315,10 +413,12 @@ def train():
                 # counts micro-batches (one forward+backward), so
                 # ``step * flops_per_step`` is total FLOPs spent.
                 cumulative_tf = (step + 1) * flops_per_step / 1e12
-                wandb.log({
+                log_dict = {
                     "train/total_loss": total.item(),
                     "train/move_loss": policy_loss.item(),
                     "train/wdl_loss": wdl_loss.item(),
+                    "train/moe_aux_loss": (moe_aux.item()
+                                           if moe_aux is not None else 0.0),
                     "train/move_acc": move_acc.item(),
                     "train/wdl_acc": wdl_acc.item(),
                     "train/q_mae": q_mae.item(),
@@ -331,7 +431,19 @@ def train():
                     "train/mfu": mfu,
                     "train/cumulative_tflops": cumulative_tf,
                     "train/epoch": epoch, "train/step": step,
-                })
+                }
+                # held-out val on the fixed split (val_every must be a multiple
+                # of log_every so it lands inside this logging window).
+                if val_data and step % val_every == 0:
+                    tr_acc = move_acc.item()
+                    vm = run_val(val_data)
+                    log_dict.update({f"val/{k}": v for k, v in vm.items()})
+                    log_dict["val/move_acc_gap"] = tr_acc - vm["move_acc"]
+                    print(f"  [val @ {step}] train move_acc={tr_acc:.3f}  "
+                          f"val move_acc={vm['move_acc']:.3f} "
+                          f"(gap {tr_acc - vm['move_acc']:+.3f}) "
+                          f"wdl_acc={vm['wdl_acc']:.3f} q_mae={vm['q_mae']:.3f}")
+                wandb.log(log_dict)
 
             del pol_logits, wdl_logits, out, total
             step += 1
