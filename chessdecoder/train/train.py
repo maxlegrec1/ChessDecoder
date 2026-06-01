@@ -103,6 +103,7 @@ def train():
         moe_aux_loss_weight=mc.get("moe_aux_loss_weight", 1e-2),
         moe_capacity_factor=mc.get("moe_capacity_factor"),
         moe_router_noise=mc.get("moe_router_noise", 0.0),
+        moe_z_loss_weight=mc.get("moe_z_loss_weight", 0.0),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")

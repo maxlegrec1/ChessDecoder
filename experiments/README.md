@@ -78,6 +78,41 @@ converged to identical val regardless of capacity. Not physics, the bug.
 **Implication: ALL pre-c44a669 sweeps (scaling, attention, input-format, lr) are
 contaminated and should be re-run with the fixed loader before drawing conclusions.**
 
+## MoE vs dense FINAL verdict (06-01, fixed loader, fresh, smoothed val @14-20k)
+| run | active | val move_acc |
+|-----|--------|--------------|
+| 256M wide-dense (d_ff4096) | 256M | 0.5473 |
+| 138M baseline (d_ff1536)   | 138M | 0.5439 |
+| 351M MoE iso-FLOP (e768)   | 138M | 0.5345 |
+| 823M MoE big (e2048)       | 256M | 0.5095 |
+- Widening dense FFN (1536->4096) improves TRAIN (pol 1.299->1.222) but NOT val
+  (0.544->0.547, within noise) -> FFN width buys fitting, not generalization.
+- MoE is WORSE than dense on val at both sizes; bigger MoE much worse (anti-scaling).
+  Routers are balanced (aux ~0.017/layer, near floor) -> NOT collapse; the cause is
+  EXPERT UNDERTRAINING (each token updates 2/8 experts -> each expert sees ~1/4 the
+  data; bigger experts more undertrained -> anti-scaling). MoE is the wrong lever in
+  this data-limited / 20k-step regime. Confound: big MoE ran micro-512 (memory) vs
+  micro-1024, but small<big MoE anti-scaling holds regardless.
+- CONCLUSION: no FFN-capacity lever (dense width or MoE) beats the baseline on val.
+  We're val/data-limited; generalization is capped by embed/depth (fixed) + data.
+  Next val lever must add signal-per-step (aux supervision) or break the data limit
+  (more data / longer training), not capacity.
+
+## Big-batch test (06-01) — does feeding experts more tokens/update help MoE?
+Hypothesis (user): MoE trails dense because experts are undertrained; a much
+bigger batch (more tokens/expert/update) should fix it. Ran baseline + iso-FLOP
+MoE at effective batch 8192 (micro1024 x gradaccum8). LR notes: 3e-3 under-updates
+(4x fewer opt-steps), 1e-2 DIVERGES (the AdamW arm, not Muon, blows up), 6e-3 with
+adamw_lr_mult=1.0 converges poorly (AdamW too hot on heads). Fix: Muon 6e-3 +
+adamw_lr_mult=0.5 (AdamW 3e-3) -> clean & fast (pol 3.13 vs 3.97 @99 updates).
+Result @4000 opt-updates: dense pol 1.247 / val 0.5585; MoE pol 1.263 / val 0.5529.
+**SAME verdict as batch 2048: tied train, dense slightly ahead on val. Gap stable,
+not closing -> undertraining was NOT the cause.** MoE's only edge is extra params,
+which don't help in a data-limited regime (cf. wide-dense: more FFN -> better train,
+flat val), and it pays a routing/coherence tax (2-of-8 routed 768 experts < one
+co-trained 1536 FFN). MoE needs a capacity-limited regime to win; we're not in one.
+Also reconfirmed: AdamW arm must be LR-decoupled at high Muon LR (adamw_lr_mult<1).
+
 ## Gradient-flow analysis (experiments/grad_flow.py, on 20k checkpoints)
 Both dense and MoE are **clean** — signal reaches all 15 layers, no vanishing/
 exploding, no dead modules. Dense: attn grad-norm ~uniform across depth, FFN rises

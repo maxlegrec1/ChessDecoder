@@ -67,7 +67,8 @@ class ChessEncoder(nn.Module):
                  ffn_type: str = "dense", moe_num_experts: int = 8,
                  moe_top_k: int = 2, moe_expert_d_ff: int = None,
                  moe_aux_loss_weight: float = 1e-2,
-                 moe_capacity_factor: float = None, moe_router_noise: float = 0.0):
+                 moe_capacity_factor: float = None, moe_router_noise: float = 0.0,
+                 moe_z_loss_weight: float = 0.0):
         super().__init__()
         self.embed_dim = embed_dim
         self.input_mode = input_mode
@@ -105,7 +106,8 @@ class ChessEncoder(nn.Module):
                          moe_top_k=moe_top_k, moe_expert_d_ff=moe_expert_d_ff,
                          moe_aux_loss_weight=moe_aux_loss_weight,
                          moe_capacity_factor=moe_capacity_factor,
-                         moe_router_noise=moe_router_noise)
+                         moe_router_noise=moe_router_noise,
+                         moe_z_loss_weight=moe_z_loss_weight)
             for _ in range(num_layers)
         ])
         self.norm = RMSNorm(dim=embed_dim)

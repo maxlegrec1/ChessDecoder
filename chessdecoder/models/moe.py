@@ -21,13 +21,18 @@ import torch.nn.functional as F
 class MoEFeedForward(nn.Module):
     def __init__(self, embed_dim: int, expert_d_ff: int, num_experts: int = 8,
                  top_k: int = 2, aux_loss_weight: float = 1e-2,
-                 capacity_factor: float = None, router_noise: float = 0.0):
+                 capacity_factor: float = None, router_noise: float = 0.0,
+                 z_loss_weight: float = 0.0):
         super().__init__()
         self.embed_dim = embed_dim
         self.expert_d_ff = expert_d_ff
         self.num_experts = num_experts
         self.top_k = top_k
         self.aux_loss_weight = aux_loss_weight
+        # router z-loss (ST-MoE): penalize logsumexp(logits)^2 to keep router
+        # logits small. Without it the router logits blow up (we measured max~30+,
+        # top-1 prob ->1.0, early layers collapse to 2-3 of 8 experts). 0 = off.
+        self.z_loss_weight = z_loss_weight
         # capacity_factor: None -> dynamic token padding (no drops, EAGER only,
         #   data-dependent shapes). float -> fixed per-expert capacity
         #   ceil(cap * tokens*top_k/E) rounded to 16: STATIC shapes -> compiles
@@ -78,6 +83,11 @@ class MoEFeedForward(nn.Module):
                 f_i = one_hot.sum(dim=(0, 1)) / (T * self.top_k)        # [E]
             P_i = probs.mean(dim=0)                                     # [E]
             self.aux_loss = self.aux_loss_weight * self.num_experts * (f_i * P_i).sum()
+            # z-loss: penalize large logsumexp so router logits stay small and
+            # routing stays soft (keeps experts alive). Uses the raw logits.
+            if self.z_loss_weight > 0:
+                z = torch.logsumexp(logits, dim=-1)                    # [T]
+                self.aux_loss = self.aux_loss + self.z_loss_weight * (z * z).mean()
         else:
             self.aux_loss = None
 

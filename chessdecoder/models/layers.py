@@ -80,7 +80,8 @@ class EncoderLayer(nn.Module):
                  moe_top_k: int = 2, moe_expert_d_ff: Optional[int] = None,
                  moe_aux_loss_weight: float = 1e-2,
                  moe_capacity_factor: Optional[float] = None,
-                 moe_router_noise: float = 0.0):
+                 moe_router_noise: float = 0.0,
+                 moe_z_loss_weight: float = 0.0):
         super().__init__()
         self.attn = BidirAttn(embed_dim=embed_dim, num_heads=num_heads,
                               pos_embeddings=pos_embeddings)
@@ -91,7 +92,8 @@ class EncoderLayer(nn.Module):
                 num_experts=moe_num_experts, top_k=moe_top_k,
                 aux_loss_weight=moe_aux_loss_weight,
                 capacity_factor=moe_capacity_factor,
-                router_noise=moe_router_noise)
+                router_noise=moe_router_noise,
+                z_loss_weight=moe_z_loss_weight)
         elif ffn_type == "dense":
             self.mlp = FeedForward(
                 gate_proj=nn.Linear(embed_dim, d_ff, bias=False),
