@@ -176,3 +176,12 @@ class ChessEncoder(nn.Module):
             if al is not None:
                 total = al if total is None else total + al
         return total
+
+    def moe_z_loss(self):
+        """Sum of the per-layer router z-losses (None if dense / z-loss off)."""
+        total = None
+        for layer in self.encoder.layers:
+            zl = getattr(layer.mlp, "z_loss", None)
+            if zl is not None:
+                total = zl if total is None else total + zl
+        return total

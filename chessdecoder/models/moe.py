@@ -52,7 +52,8 @@ class MoEFeedForward(nn.Module):
         self.down_w = nn.Parameter(torch.empty(num_experts, embed_dim, expert_d_ff))
         self._reset_parameters()
         # set by forward, read+cleared by the training loop each step.
-        self.aux_loss = None
+        self.aux_loss = None   # load-balancing aux
+        self.z_loss = None     # router z-loss (tracked separately for logging)
 
     def _reset_parameters(self):
         # match nn.Linear(bias=False) init (uniform on 1/sqrt(fan_in)) per expert.
@@ -84,12 +85,16 @@ class MoEFeedForward(nn.Module):
             P_i = probs.mean(dim=0)                                     # [E]
             self.aux_loss = self.aux_loss_weight * self.num_experts * (f_i * P_i).sum()
             # z-loss: penalize large logsumexp so router logits stay small and
-            # routing stays soft (keeps experts alive). Uses the raw logits.
+            # routing stays soft (keeps experts alive). Tracked separately so it
+            # can be logged on its own; the training loop adds BOTH to the total.
             if self.z_loss_weight > 0:
                 z = torch.logsumexp(logits, dim=-1)                    # [T]
-                self.aux_loss = self.aux_loss + self.z_loss_weight * (z * z).mean()
+                self.z_loss = self.z_loss_weight * (z * z).mean()
+            else:
+                self.z_loss = None
         else:
             self.aux_loss = None
+            self.z_loss = None
 
         # ---- expert-sort the (token, expert) assignments ----
         M = T * self.top_k

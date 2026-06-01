@@ -362,11 +362,15 @@ def train():
                 wdl_loss = (wdl_ce * vmask).sum() / (vmask.sum() + 1e-8)
 
                 total = w_pol * policy_loss + w_wdl * wdl_loss
-                # MoE load-balancing aux loss (None for the dense FFN). Already
-                # scaled by moe_aux_loss_weight inside each expert block.
+                # MoE load-balancing aux loss + router z-loss (both None for the
+                # dense FFN). Already scaled by their weights inside each expert
+                # block; tracked separately so each can be logged on its own.
                 moe_aux = model.moe_aux_loss()
                 if moe_aux is not None:
                     total = total + moe_aux
+                moe_z = model.moe_z_loss()
+                if moe_z is not None:
+                    total = total + moe_z
 
             (scaler.scale(total / grad_accum)).backward()
             if (step + 1) % grad_accum == 0:
@@ -424,6 +428,8 @@ def train():
                     "train/wdl_loss": wdl_loss.item(),
                     "train/moe_aux_loss": (moe_aux.item()
                                            if moe_aux is not None else 0.0),
+                    "train/moe_z_loss": (moe_z.item()
+                                         if moe_z is not None else 0.0),
                     "train/move_acc": move_acc.item(),
                     "train/wdl_acc": wdl_acc.item(),
                     "train/q_mae": q_mae.item(),
