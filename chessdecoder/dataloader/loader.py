@@ -276,17 +276,37 @@ class ChessIterableDataset(IterableDataset):
             print(f"Loader: {n_cached}/{len(self.files)} shards from cache, "
                   f"{len(self.files) - n_cached} from parquet")
 
+    def _advance_epoch(self) -> int:
+        """Per-worker epoch index driving the RNG seed; call once per __iter__.
+
+        Seeded from the spawn-time ``self.epoch`` (== ``start_epoch`` on resume,
+        0 on a fresh run) then advanced locally each epoch, because with
+        ``persistent_workers=True`` the worker's ``self.epoch`` is frozen at
+        spawn and never updated. Returns a strictly increasing index so every
+        epoch — including the ones right after a resume — gets a fresh seed.
+        """
+        self._epoch_iter = getattr(self, "_epoch_iter", int(self.epoch) - 1) + 1
+        return self._epoch_iter
+
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
         wid = wi.id if wi is not None else 0
-        # BUG FIX: with persistent_workers=True the workers never see updates to
-        # self.epoch (it's set on the main-process copy), so the per-epoch RNG
-        # seed stayed constant and EVERY epoch re-sampled the SAME plies — the
-        # model just re-memorized a fixed 1-ply/game subset. Advance a per-worker
-        # counter on each __iter__ (DataLoader calls it once per epoch) so the
-        # seed actually changes every epoch.
-        self._epoch_iter = getattr(self, "_epoch_iter", -1) + 1
-        ep = max(int(self.epoch), self._epoch_iter)
+        # Per-epoch RNG seed. With persistent_workers=True the worker freezes its
+        # OWN copy of self.epoch at SPAWN time (main-process updates never
+        # propagate), so we can't read self.epoch each epoch. Instead advance a
+        # per-worker counter on each __iter__ (DataLoader calls it once per
+        # epoch). SEED the counter from the spawn-time epoch so RESUME works:
+        # on resume the worker spawns with self.epoch == start_epoch, and the
+        # counter must continue from there.
+        #
+        # The old formula `max(int(self.epoch), counter)` was wrong on resume:
+        # the counter resets to 0 while the frozen self.epoch == start_epoch
+        # dominates the max, so it emits seed start_epoch for start_epoch+1
+        # consecutive epochs — REPLAYING already-seen plies for one+ epoch.
+        # The model re-memorizes them (train acc spikes, val flat), then loss
+        # JUMPS when fresh data finally arrives. (On a fresh run start_epoch==0,
+        # so the bug was invisible — only resumed runs replayed.)
+        ep = self._advance_epoch()
         es = self.seed + ep * 100003 + self.rank * 7919 + wid * 997
         random.seed(es)
         np.random.seed(es % (2**32))

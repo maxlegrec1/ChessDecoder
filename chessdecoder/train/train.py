@@ -447,7 +447,10 @@ def train():
                           f"val move_acc={vm['move_acc']:.3f} "
                           f"(gap {tr_acc - vm['move_acc']:+.3f}) "
                           f"wdl_acc={vm['wdl_acc']:.3f} q_mae={vm['q_mae']:.3f}")
-                wandb.log(log_dict)
+                # step= pins the x-axis to the TRAINING step (not wandb's
+                # log-call counter), so curves line up across runs and a resume
+                # doesn't backtrack the axis.
+                wandb.log(log_dict, step=step)
 
             del pol_logits, wdl_logits, out, total
             step += 1
