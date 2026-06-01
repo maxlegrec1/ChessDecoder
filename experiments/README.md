@@ -61,6 +61,23 @@ tests/test_loader_epoch_resume.py. Also `wandb.log(..., step=step)`.
 the FRESH 0–20k runs (no resume) — there dense ≈ MoE (iso-FLOP, no win). Re-run
 extensions fresh (no resume) for clean long curves.
 
+## SCALING re-verification (06-01) — old flat scaling was the epoch bug
+User flagged that the 8M-120M sweep barely scaled. Root cause: that sweep
+(commit 8fcfc01) ran BEFORE the persistent_workers epoch fix (c44a669), with
+positions_per_game=1 — so every size trained on the SAME frozen subset → all
+converged to identical val regardless of capacity. Not physics, the bug.
+- Overfit probe (experiments/overfit_probe.py): 138M fits a fixed 512-pos batch
+  to 100% acc / 0.023 loss in BOTH bf16 and fp8 → model healthy, fp8 NOT a cap.
+- Fresh runs w/ FIXED loader, matched steps @20k: clear monotonic scaling:
+  | size | pol-loss | move_acc |
+  |------|----------|----------|
+  | 15M  | 1.408    | 0.532    |
+  | 35M  | (running)| (running)|
+  | 138M | 1.299    | 0.556    |
+  138M beats 15M at every step (Δpol up to -1.1 early). Scaling restored.
+**Implication: ALL pre-c44a669 sweeps (scaling, attention, input-format, lr) are
+contaminated and should be re-run with the fixed loader before drawing conclusions.**
+
 ## Gradient-flow analysis (experiments/grad_flow.py, on 20k checkpoints)
 Both dense and MoE are **clean** — signal reaches all 15 layers, no vanishing/
 exploding, no dead modules. Dense: attn grad-norm ~uniform across depth, FFN rises
