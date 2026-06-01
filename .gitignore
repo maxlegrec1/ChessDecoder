@@ -83,3 +83,6 @@ _smoke*.yaml
 
 # One-off diagnostic outputs from exploration
 wdl_buckets.png
+
+# experiment run logs
+experiments/*.log

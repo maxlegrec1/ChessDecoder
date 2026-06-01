@@ -1,0 +1,59 @@
+# BT4-shape with MoE FFN. Same shape as config_bt4_baseline (15L / embed 1024 /
+# 32 heads), but each dense SwiGLU 1536 -> 8 experts of expert_d_ff 768, top-2.
+# Active FFN width = top_k * expert_d_ff = 2 * 768 = 1536 = dense d_ff (ISO ACTIVE
+# FLOPs vs baseline), but ~4x the FFN params, sparsely accessed. Same LR as
+# baseline (Muon 3e-3, AdamW 3e-3) so the ONLY change vs baseline is FFN->MoE.
+project_name: "chess-decoder"
+run_name: "bt4_moe"
+
+data:
+  parquet_dir: "data/parquets"
+  cache_dir: "data/cache"
+  batch_size: 1024             # micro; effective = 1024 * grad_accum(2) = 2048 (FIXED)
+  num_workers: 4
+  positions_per_game: 1
+
+model:
+  embed_dim: 1024              # FIXED
+  num_heads: 32
+  num_layers: 15              # FIXED
+  d_ff: 1536                   # baseline dense width (= active MoE width)
+  attention_variant: "geom"
+  policy_head: "cross_attn"
+  input_mode: "lc0_64"
+  ffn_type: "moe"
+  moe_num_experts: 8
+  moe_top_k: 2
+  moe_expert_d_ff: 768         # 2 active * 768 = 1536 = dense d_ff (iso active FLOPs)
+  moe_aux_loss_weight: 1.0e-2
+  moe_router_noise: 0.0
+
+training:
+  optimizer: "muon"
+  learning_rate: 3.0e-3
+  adamw_lr_mult: 1.0
+  weight_decay: 0.01
+  grad_clip: 1.0
+  gradient_accumulation_steps: 2
+  num_epochs: 1000
+  log_every_n_steps: 5
+  save_every_n_steps: 5000
+  device: "cuda"
+  use_amp: true
+  use_fp8: true
+  fp8_recipe: "tensorwise"
+  fp8_compile: true
+  moe_fp8: true
+  checkpoint_dir: "checkpoints/bt4_moe/"
+  seed: 42
+  resume_from: null
+  reset_data_iteration: false
+  max_steps: 20000
+  peak_tflops: 1979
+  val_pct: 2
+  val_every_n_steps: 1000
+  val_batches: 8
+
+loss:
+  policy_weight: 5.0
+  wdl_weight: 1.0

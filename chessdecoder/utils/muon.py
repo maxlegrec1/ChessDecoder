@@ -27,11 +27,15 @@ def _newtonschulz5(G, steps=5, eps=1e-7):
 
 class MuonWithAdam(torch.optim.Optimizer):
     def __init__(self, muon_params, adam_params, lr=1e-3, weight_decay=0.0,
-                 momentum=0.95, betas=(0.9, 0.95), eps=1e-8):
+                 momentum=0.95, betas=(0.9, 0.95), eps=1e-8, adam_lr=None):
+        # adam_lr lets the AdamW arm (embeddings / heads / norms / router) run at
+        # a different LR from the Muon matrices — they have very different optimal
+        # scales. Defaults to lr (== old shared-LR behaviour).
+        adam_lr = lr if adam_lr is None else adam_lr
         groups = [
             dict(params=list(muon_params), kind="muon", lr=lr,
                  weight_decay=weight_decay, momentum=momentum),
-            dict(params=list(adam_params), kind="adam", lr=lr,
+            dict(params=list(adam_params), kind="adam", lr=adam_lr,
                  weight_decay=weight_decay, betas=betas, eps=eps),
         ]
         super().__init__(groups, dict(lr=lr))
@@ -84,10 +88,13 @@ class MuonWithAdam(torch.optim.Optimizer):
         return loss
 
 
-def build_optimizer(model, name, lr, wd):
+def build_optimizer(model, name, lr, wd, adamw_lr_mult=1.0):
     """name: 'adamw' | 'muon'. Muon routes hidden 2-D matrices through
     Newton-Schulz; embeddings (tok / pos), output heads (policy / wdl), norms
-    and 1-D params go to the AdamW arm."""
+    and 1-D params go to the AdamW arm.
+
+    adamw_lr_mult (muon only): the AdamW arm runs at ``lr * adamw_lr_mult``.
+    1.0 == legacy shared-LR. <1 decouples the AdamW layers (typically wanted)."""
     if name == "adamw":
         return optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     if name == "muon":
@@ -115,5 +122,6 @@ def build_optimizer(model, name, lr, wd):
             # / norms / biases / router go to AdamW.
             is_matrix = p.ndim in (2, 3) and not any(k in n for k in excluded)
             (muon_p if is_matrix else adam_p).append(p)
-        return MuonWithAdam(muon_p, adam_p, lr=lr, weight_decay=wd)
+        return MuonWithAdam(muon_p, adam_p, lr=lr, weight_decay=wd,
+                            adam_lr=lr * adamw_lr_mult)
     raise ValueError(f"unknown optimizer {name!r}")

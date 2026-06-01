@@ -176,20 +176,24 @@ def train():
             compile_fp8_hot_path(model)
             print_rank0("FP8: torch.compile applied to encoder stack")
 
+    adamw_lr_mult = config["training"].get("adamw_lr_mult", 1.0)
     optimizer = build_optimizer(
         model,
         config["training"].get("optimizer", "adamw"),
         config["training"]["learning_rate"],
-        config["training"]["weight_decay"])
+        config["training"]["weight_decay"],
+        adamw_lr_mult=adamw_lr_mult)
     print_rank0(f"Optimizer: {config['training'].get('optimizer', 'adamw')} "
                 f"lr={config['training']['learning_rate']} "
+                f"adamw_lr_mult={adamw_lr_mult} "
                 f"wd={config['training']['weight_decay']} "
                 f"autocast_dtype={autocast_dtype}")
 
     if ck is not None:
         optimizer.load_state_dict(ck["optimizer_state_dict"])
         for pg in optimizer.param_groups:
-            pg["lr"] = config["training"]["learning_rate"]
+            base = config["training"]["learning_rate"]
+            pg["lr"] = base * adamw_lr_mult if pg.get("kind") == "adam" else base
         # Only restore the GradScaler state when both the saved scaler and the
         # current scaler are enabled (FP8 mode saves an empty {}).
         if scaler.is_enabled() and ck.get("scaler_state_dict"):
