@@ -113,6 +113,34 @@ flat val), and it pays a routing/coherence tax (2-of-8 routed 768 experts < one
 co-trained 1536 FFN). MoE needs a capacity-limited regime to win; we're not in one.
 Also reconfirmed: AdamW arm must be LR-decoupled at high Muon LR (adamw_lr_mult<1).
 
+## ROUTER COLLAPSE + z-loss fix (06-01) — revives the MoE thread
+experiments/router_analysis.py on a trained MoE router shows COLLAPSE: logits
+blow up (logsumexp 9-19, max|logit| ~30), routing goes hard (top-1 prob ->1.0,
+~0 entropy -> top-2 degenerates to top-1), and EARLY LAYERS leave 4-6 of 8
+experts DEAD. Confirmed on a clean fixed-loader BT4 MoE (not just the pre-fix
+checkpoint) -> intrinsic MoE dynamics, a real reason MoE underperformed.
+**Fix: router z-loss (model.moe_z_loss_weight=1e-3).** A/B at 7500 steps (only
+z-loss differs): logsumexp 9-19 -> ~0; top-1 prob L0 1.00 -> 0.76; entropy L0
+0.00 -> 0.67; dead experts L0/L1/L2 5/4/6 -> 1/0/0 (total dead: many -> 1).
+Router fixed, all experts used. Early perf (7500): z-loss MoE pol 1.518 <
+dense 1.548 < ... wait dense 1.548, no-z 1.546, z-loss 1.518 -> z-loss MoE has
+LOWEST pol-loss (first time MoE edges dense on anything). move_acc dense 0.504
+still > z-loss 0.496. Running full 32k head-to-head (bt4_moe_zloss_full) vs
+dense big-batch + no-z-loss MoE to see if it holds. Next knob if needed: lower
+router LR (router is on AdamW arm).
+
+## z-loss 32k head-to-head (big-batch 8192, Muon 6e-3 / AdamW 3e-3)
+| run | pol@16k | pol@32k | acc@32k | val(>=24k) |
+|-----|---------|---------|---------|-----------|
+| dense              | 1.342 | 1.254 | 0.586 | 0.5585 |
+| MoE no-z-loss      | 1.376 | 1.299 | 0.572 | 0.5529 |
+| MoE z-loss 1e-3    | 1.328 | 1.259 | 0.584 | 0.5593 |
+z-loss (router fix) moved iso-FLOP MoE from clearly-behind to TIED with dense:
+val 0.5529 -> 0.5593 (= dense 0.5585, within noise). LED dense at 16k (pol 1.328
+vs 1.342). Not yet a decisive win -> data-limit caps the generalization gain.
+Next pushes: lower router LR; tune z-loss weight; train longer. train/moe_z_loss
+now logged separately (commit 9833e76) for future runs.
+
 ## Gradient-flow analysis (experiments/grad_flow.py, on 20k checkpoints)
 Both dense and MoE are **clean** — signal reaches all 15 layers, no vanishing/
 exploding, no dead modules. Dense: attn grad-norm ~uniform across depth, FFN rises
