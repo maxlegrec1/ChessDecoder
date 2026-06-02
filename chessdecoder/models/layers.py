@@ -83,7 +83,8 @@ class EncoderLayer(nn.Module):
                  moe_router_noise: float = 0.0,
                  moe_z_loss_weight: float = 0.0,
                  moe_bias_balance: bool = False,
-                 moe_bias_update_rate: float = 1e-3):
+                 moe_bias_update_rate: float = 1e-3,
+                 moe_gate_type: str = "softmax"):
         super().__init__()
         self.attn = BidirAttn(embed_dim=embed_dim, num_heads=num_heads,
                               pos_embeddings=pos_embeddings)
@@ -97,7 +98,8 @@ class EncoderLayer(nn.Module):
                 router_noise=moe_router_noise,
                 z_loss_weight=moe_z_loss_weight,
                 bias_balance=moe_bias_balance,
-                bias_update_rate=moe_bias_update_rate)
+                bias_update_rate=moe_bias_update_rate,
+                gate_type=moe_gate_type)
         elif ffn_type == "dense":
             self.mlp = FeedForward(
                 gate_proj=nn.Linear(embed_dim, d_ff, bias=False),

@@ -106,6 +106,7 @@ def train():
         moe_z_loss_weight=mc.get("moe_z_loss_weight", 0.0),
         moe_bias_balance=mc.get("moe_bias_balance", False),
         moe_bias_update_rate=mc.get("moe_bias_update_rate", 1e-3),
+        moe_gate_type=mc.get("moe_gate_type", "softmax"),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")

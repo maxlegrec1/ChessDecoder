@@ -23,10 +23,14 @@ class MoEFeedForward(nn.Module):
                  top_k: int = 2, aux_loss_weight: float = 1e-2,
                  capacity_factor: float = None, router_noise: float = 0.0,
                  z_loss_weight: float = 0.0, bias_balance: bool = False,
-                 bias_update_rate: float = 1e-3):
+                 bias_update_rate: float = 1e-3, gate_type: str = "softmax"):
         super().__init__()
         self.bias_balance = bias_balance
         self.bias_update_rate = bias_update_rate
+        # gate_type: "softmax" (normalized, peaked) or "sigmoid" (DeepSeek-V3:
+        # independent per-expert affinities -> bias balancing doesn't zero the
+        # gate weight of a bias-forced expert).
+        self.gate_type = gate_type
         self.embed_dim = embed_dim
         self.expert_d_ff = expert_d_ff
         self.num_experts = num_experts
@@ -81,15 +85,20 @@ class MoEFeedForward(nn.Module):
         logits = self.router(x.float())                        # [T, E] (router in fp32)
         if self.training and self.router_noise > 0:
             logits = logits + torch.randn_like(logits) * self.router_noise
-        probs = logits.softmax(dim=-1)
-        if self.bias_balance:
-            # DeepSeek: bias added to the pre-softmax affinity affects WHICH experts
-            # are picked; the gate weight still comes from the raw softmax probs.
-            topk_i = (logits + self.expert_bias).topk(self.top_k, dim=-1).indices
-            topk_w = probs.gather(-1, topk_i)
+        probs = logits.softmax(dim=-1)                         # for aux P_i (always)
+        # gate = per-expert weight source; sel_base = score the bias is added to.
+        # sigmoid: independent affinities, bias on the affinity (DeepSeek). softmax:
+        # gate from probs, bias on the *logits* (probs are too peaked to shift).
+        if self.gate_type == "sigmoid":
+            gate = logits.sigmoid()
+            sel_base = gate
         else:
-            topk_w, topk_i = probs.topk(self.top_k, dim=-1)    # [T, k]
-        topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)     # renormalize the k weights
+            gate = probs
+            sel_base = logits
+        sel = sel_base + self.expert_bias if self.bias_balance else sel_base
+        topk_i = sel.topk(self.top_k, dim=-1).indices          # [T, k]
+        topk_w = gate.gather(-1, topk_i)
+        topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-9)  # renormalize
 
         # load-balancing aux loss (Switch-Transformer): E * sum_i f_i * P_i,
         # f_i = fraction of tokens routed to expert i (top-1 of the k), P_i =
