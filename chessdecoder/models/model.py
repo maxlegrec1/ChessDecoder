@@ -68,7 +68,8 @@ class ChessEncoder(nn.Module):
                  moe_top_k: int = 2, moe_expert_d_ff: int = None,
                  moe_aux_loss_weight: float = 1e-2,
                  moe_capacity_factor: float = None, moe_router_noise: float = 0.0,
-                 moe_z_loss_weight: float = 0.0):
+                 moe_z_loss_weight: float = 0.0, moe_bias_balance: bool = False,
+                 moe_bias_update_rate: float = 1e-3):
         super().__init__()
         self.embed_dim = embed_dim
         self.input_mode = input_mode
@@ -107,7 +108,9 @@ class ChessEncoder(nn.Module):
                          moe_aux_loss_weight=moe_aux_loss_weight,
                          moe_capacity_factor=moe_capacity_factor,
                          moe_router_noise=moe_router_noise,
-                         moe_z_loss_weight=moe_z_loss_weight)
+                         moe_z_loss_weight=moe_z_loss_weight,
+                         moe_bias_balance=moe_bias_balance,
+                         moe_bias_update_rate=moe_bias_update_rate)
             for _ in range(num_layers)
         ])
         self.norm = RMSNorm(dim=embed_dim)
@@ -185,3 +188,11 @@ class ChessEncoder(nn.Module):
             if zl is not None:
                 total = zl if total is None else total + zl
         return total
+
+    def update_moe_bias(self):
+        """DeepSeek loss-free balancing: nudge every MoE layer's expert-selection
+        bias toward balanced load. Call once per optimizer step (no gradient)."""
+        for layer in self.encoder.layers:
+            upd = getattr(layer.mlp, "update_bias", None)
+            if upd is not None:
+                upd()

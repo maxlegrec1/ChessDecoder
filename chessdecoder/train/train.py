@@ -104,6 +104,8 @@ def train():
         moe_capacity_factor=mc.get("moe_capacity_factor"),
         moe_router_noise=mc.get("moe_router_noise", 0.0),
         moe_z_loss_weight=mc.get("moe_z_loss_weight", 0.0),
+        moe_bias_balance=mc.get("moe_bias_balance", False),
+        moe_bias_update_rate=mc.get("moe_bias_update_rate", 1e-3),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")
@@ -380,6 +382,9 @@ def train():
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                # DeepSeek loss-free balancing: nudge expert-selection biases
+                # toward balanced load (no-op unless moe_bias_balance is set).
+                model.update_moe_bias()
 
             steps_in_window += 1
             if step % log_every == 0 and is_main_process():

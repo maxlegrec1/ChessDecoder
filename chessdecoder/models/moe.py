@@ -22,8 +22,11 @@ class MoEFeedForward(nn.Module):
     def __init__(self, embed_dim: int, expert_d_ff: int, num_experts: int = 8,
                  top_k: int = 2, aux_loss_weight: float = 1e-2,
                  capacity_factor: float = None, router_noise: float = 0.0,
-                 z_loss_weight: float = 0.0):
+                 z_loss_weight: float = 0.0, bias_balance: bool = False,
+                 bias_update_rate: float = 1e-3):
         super().__init__()
+        self.bias_balance = bias_balance
+        self.bias_update_rate = bias_update_rate
         self.embed_dim = embed_dim
         self.expert_d_ff = expert_d_ff
         self.num_experts = num_experts
@@ -54,6 +57,13 @@ class MoEFeedForward(nn.Module):
         # set by forward, read+cleared by the training loop each step.
         self.aux_loss = None   # load-balancing aux
         self.z_loss = None     # router z-loss (tracked separately for logging)
+        # DeepSeek-V3 auxiliary-loss-free load balancing: a per-expert bias added
+        # to the routing score for SELECTION ONLY (gate weights use the raw probs),
+        # nudged each step OUTSIDE gradient descent toward balanced load. Lets us
+        # balance experts with NO gradient term polluting the policy/value loss.
+        # expert_load stashes this step's per-expert token count for that update.
+        self.register_buffer("expert_bias", torch.zeros(num_experts))
+        self.expert_load = None
 
     def _reset_parameters(self):
         # match nn.Linear(bias=False) init (uniform on 1/sqrt(fan_in)) per expert.
@@ -72,7 +82,13 @@ class MoEFeedForward(nn.Module):
         if self.training and self.router_noise > 0:
             logits = logits + torch.randn_like(logits) * self.router_noise
         probs = logits.softmax(dim=-1)
-        topk_w, topk_i = probs.topk(self.top_k, dim=-1)        # [T, k]
+        if self.bias_balance:
+            # DeepSeek: bias added to the pre-softmax affinity affects WHICH experts
+            # are picked; the gate weight still comes from the raw softmax probs.
+            topk_i = (logits + self.expert_bias).topk(self.top_k, dim=-1).indices
+            topk_w = probs.gather(-1, topk_i)
+        else:
+            topk_w, topk_i = probs.topk(self.top_k, dim=-1)    # [T, k]
         topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)     # renormalize the k weights
 
         # load-balancing aux loss (Switch-Transformer): E * sum_i f_i * P_i,
@@ -109,6 +125,8 @@ class MoEFeedForward(nn.Module):
         # token count per expert. bincount is a dynamic-shape op and graph-breaks
         # under torch.compile; one_hot().sum() is static-shape [E] and compiles.
         counts = F.one_hot(flat_expert, self.num_experts).sum(0)
+        if self.training and self.bias_balance:
+            self.expert_load = counts.detach().float()         # for the bias update
         orig_start = counts.cumsum(0) - counts                 # [E] start of each expert
         within = torch.arange(M, device=x.device) - orig_start[s_expert]  # pos in expert
 
@@ -140,6 +158,18 @@ class MoEFeedForward(nn.Module):
         y = torch.zeros_like(x)
         y.index_add_(0, s_token, out)
         return y.reshape(orig_shape)
+
+    @torch.no_grad()
+    def update_bias(self):
+        """DeepSeek loss-free balancing: nudge the per-expert selection bias toward
+        balanced load, OUTSIDE gradient descent. Call once per optimizer step.
+        Bias up for under-loaded experts, down for over-loaded; recentre to bound it."""
+        if not self.bias_balance or self.expert_load is None:
+            return
+        load = self.expert_load
+        err = load.mean() - load                               # >0 = under-loaded
+        self.expert_bias += self.bias_update_rate * torch.sign(err)
+        self.expert_bias -= self.expert_bias.mean()
 
     def _capacity(self, T: int) -> int:
         """Per-expert capacity (static for a fixed token count T), rounded up to
