@@ -84,10 +84,13 @@ class EncoderLayer(nn.Module):
                  moe_z_loss_weight: float = 0.0,
                  moe_bias_balance: bool = False,
                  moe_bias_update_rate: float = 1e-3,
-                 moe_gate_type: str = "softmax"):
+                 moe_gate_type: str = "softmax",
+                 smolgen: Optional[nn.Module] = None):
         super().__init__()
         self.attn = BidirAttn(embed_dim=embed_dim, num_heads=num_heads,
                               pos_embeddings=pos_embeddings)
+        # per-layer dynamic attention bias (lc0 smolgen), added on top of `mask`
+        self.smolgen = smolgen
         if ffn_type == "moe":
             from chessdecoder.models.moe import MoEFeedForward
             self.mlp = MoEFeedForward(
@@ -113,6 +116,9 @@ class EncoderLayer(nn.Module):
     def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         n = self.sa_norm(x)
+        if self.smolgen is not None:
+            dyn = self.smolgen(n)                      # [B, H, S, S] dynamic bias
+            mask = dyn if mask is None else mask + dyn  # static geom + dynamic
         h = x + self.attn(n, mask=mask)
         return h + self.mlp(self.mlp_norm(h))
 

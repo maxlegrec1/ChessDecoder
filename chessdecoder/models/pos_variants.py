@@ -32,6 +32,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchtune.modules import RotaryPositionalEmbeddings
 
 # Token-kind codes used to bucket special-involving pairs.
@@ -311,6 +312,43 @@ class GeomAttnBias(nn.Module):
         return torch.where(self.is_sq[None], b_mlp, b_sp).unsqueeze(0)
 
 
+class Smolgen(nn.Module):
+    """Dynamic, content-dependent attention bias (lc0 smolgen).
+
+    Pools the layer's tokens into a per-head latent and projects it through a
+    shared decoder to a ``[B, num_heads, S, S]`` bias that is ADDED on top of
+    the static geom bias for THIS layer's attention. Unlike geom (which depends
+    only on board geometry), this depends on the actual position content, so
+    attention can adapt per-position ("the rook should look down this open file").
+
+    One module per encoder layer (each reads its own layer's representation).
+    The decoder (gen -> S*S, shared across heads) is zero-initialised so training
+    starts as geom-only and smolgen is learned on top — a stable warm start.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int, seq_len: int,
+                 compress: int = 32, hidden: int = 256, gen: int = 128):
+        super().__init__()
+        self.num_heads = num_heads
+        self.seq_len = seq_len
+        self.compress_dim = compress
+        self.gen = gen
+        self.compress = nn.Linear(embed_dim, compress, bias=False)
+        self.dense1 = nn.Linear(seq_len * compress, hidden)
+        self.ln1 = nn.LayerNorm(hidden)
+        self.dense2 = nn.Linear(hidden, num_heads * gen)
+        self.ln2 = nn.LayerNorm(num_heads * gen)
+        self.decoder = nn.Linear(gen, seq_len * seq_len, bias=False)
+        nn.init.zeros_(self.decoder.weight)         # start at 0 -> geom-only init
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:    # x: [B, S, D]
+        B, S, _ = x.shape
+        c = self.compress(x).reshape(B, S * self.compress_dim)        # [B, S*c]
+        h = F.gelu(self.ln1(self.dense1(c)))                          # [B, hidden]
+        h = self.ln2(self.dense2(h)).reshape(B, self.num_heads, self.gen)
+        return self.decoder(h).reshape(B, self.num_heads, S, S)       # [B,H,S,S]
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -334,7 +372,9 @@ def build_pos_modules(variant: str, embed_dim: int, num_heads: int,
         return Rope2D(head_dim=head_dim, layout=layout), None
     if variant == "relpos2d":
         return None, RelPos2DBias(num_heads=num_heads, layout=layout)
-    if variant == "geom":
+    if variant in ("geom", "smolgen"):
+        # smolgen = the static geom bias PLUS per-layer dynamic biases that
+        # ChessEncoder attaches to each EncoderLayer (see model.py).
         return None, GeomAttnBias(num_heads=num_heads, layout=layout)
     raise ValueError(f"unknown attention_variant {variant!r} "
-                     f"(expected baseline/rope1d/rope2d/relpos2d/geom)")
+                     f"(expected baseline/rope1d/rope2d/relpos2d/geom/smolgen)")

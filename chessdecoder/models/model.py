@@ -26,7 +26,7 @@ from torchtune.modules import RMSNorm
 from chessdecoder.models.layers import EncoderLayer, EncoderStack
 from chessdecoder.models.policy_head import CrossAttnPolicyHead
 from chessdecoder.models.pos_variants import (
-    INPUT_MODE_TO_LAYOUT, TokenLayout, build_pos_modules)
+    INPUT_MODE_TO_LAYOUT, TokenLayout, build_pos_modules, Smolgen)
 from chessdecoder.models.value_buckets import CELL_WDL, N_CELLS, mean_wdl as _mean_wdl
 from chessdecoder.models.vocab import move_vocab_size, policy_index
 
@@ -99,6 +99,12 @@ class ChessEncoder(nn.Module):
             num_heads=num_heads, layout=layout)
         self.bias_module = bias_module
 
+        # smolgen: one dynamic-bias module per layer (added on top of the static
+        # geom bias). None for every other variant.
+        smolgens = ([Smolgen(embed_dim, num_heads, layout.seq_len)
+                     for _ in range(num_layers)]
+                    if attention_variant == "smolgen" else [None] * num_layers)
+
         self.encoder = EncoderStack([
             EncoderLayer(embed_dim, num_heads, d_ff,
                          max_seq_len=layout.seq_len,
@@ -111,8 +117,9 @@ class ChessEncoder(nn.Module):
                          moe_z_loss_weight=moe_z_loss_weight,
                          moe_bias_balance=moe_bias_balance,
                          moe_bias_update_rate=moe_bias_update_rate,
-                         moe_gate_type=moe_gate_type)
-            for _ in range(num_layers)
+                         moe_gate_type=moe_gate_type,
+                         smolgen=smolgens[i])
+            for i in range(num_layers)
         ])
         self.norm = RMSNorm(dim=embed_dim)
 
