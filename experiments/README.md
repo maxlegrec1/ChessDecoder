@@ -141,6 +141,24 @@ vs 1.342). Not yet a decisive win -> data-limit caps the generalization gain.
 Next pushes: lower router LR; tune z-loss weight; train longer. train/moe_z_loss
 now logged separately (commit 9833e76) for future runs.
 
+## MoE balancing-method sweep (06-02/03, big-batch 8192, smoothed pol-loss 28-32k ±0.0014)
+Metric note: val move_acc (8 batches) is too noisy (std ~0.006) to resolve sub-0.01
+diffs, and run-to-run pol-loss gaps are PARALLEL not fanning out -> longer training
+won't discriminate. Use mean pol-loss over 28-32k (n=800, SE ±0.0014) instead.
+| run | balancing | pol-loss 28-32k | val |
+|-----|-----------|-----------------|-----|
+| z-loss MoE        | aux 1e-2 + z-loss (simple) | **1.266** (best) | 0.5593 |
+| dense (ref)       | -                          | 1.268 | 0.5585 |
+| sigmoid loss-free | aux=0 + bias, sigmoid gate | 1.275 | 0.5579 |
+| hybrid            | aux 1e-3 + bias, softmax   | 1.285 | 0.5525 |
+| (fine-grained 16e top-4: running) | aux+z-loss | ... | ... |
+**Every MoE variant ties-or-loses to dense; simplest (z-loss+aux) is best.** DeepSeek
+bias balancing (commit cd68fc1) + sigmoid gate (1341909) fixed router internals
+(sigmoid 1.275 < hybrid 1.285 confirms the gate-weight-zeroing diagnosis) but never
+the OUTCOME: once the router isn't collapsed, perf is data-limited, not routing-limited.
+Pure loss-free (aux=0) hurt router health (logits blow up w/o aux gradient). New knobs:
+moe_bias_balance, moe_bias_update_rate, moe_gate_type, moe_z_loss_weight, train/moe_z_loss.
+
 ## Gradient-flow analysis (experiments/grad_flow.py, on 20k checkpoints)
 Both dense and MoE are **clean** — signal reaches all 15 layers, no vanishing/
 exploding, no dead modules. Dense: attn grad-norm ~uniform across depth, FFN rises
