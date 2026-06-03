@@ -111,9 +111,13 @@ def build_optimizer(model, name, lr, wd, adamw_lr_mult=1.0):
         # spatial decoding the einsum relies on).
         # ``router`` (MoE gate, a small [E, d] matrix) stays on AdamW — Newton-
         # Schulz orthogonalizes the routing directions and destabilizes routing.
+        # ``smolgen`` stays on AdamW too: its decoder/dense2 are very "tall"
+        # (out >> in, e.g. gen 128 -> S^2 4096), so Muon's sqrt(out/in) scaling
+        # gives them ~5x LR -> the dynamic attention bias grows uncontrolled and
+        # slowly diverges. AdamW (adaptive, per-param normalised) keeps it stable.
         excluded = ("tok_embedding", "pos_embedding",
                     "policy_head", "wdl_head", "bias_module",
-                    "sp_bias", "pos_enc_weight", "router")
+                    "sp_bias", "pos_enc_weight", "router", "smolgen")
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
