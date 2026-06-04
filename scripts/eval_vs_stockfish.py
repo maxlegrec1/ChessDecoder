@@ -47,8 +47,16 @@ def pick_move(model, board, dev):
         logits = model(bid)["policy"][0].float()              # [1924]
     best, best_lp = None, -1e30
     for mv in board.legal_moves:
-        idx = move_token_to_idx.get(mv.uci())
-        lp = logits[idx].item() if idx is not None else -1e29  # unknown move -> last resort
+        # lc0 encodes castling as king->rook-square (e1h1/e1a1) — the slot the
+        # model was TRAINED on — while python-chess uci() gives king->dest
+        # (e1g1/e1c1). Look up both notations and take the model's max.
+        keys = [mv.uci()]
+        if board.is_castling(mv):
+            frm = chess.square_name(mv.from_square)            # 'e1' / 'e8'
+            rook_file = "h" if board.is_kingside_castling(mv) else "a"
+            keys.append(frm + rook_file + frm[1])              # e.g. e1 + h + 1
+        lp = max((logits[move_token_to_idx[k]].item() for k in keys
+                  if k in move_token_to_idx), default=-1e29)
         if lp > best_lp:
             best_lp, best = lp, mv
     return best
