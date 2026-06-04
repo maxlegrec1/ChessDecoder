@@ -155,17 +155,29 @@ def _pick_rows(s: int, e: int, n: int) -> np.ndarray:
     return np.random.randint(s, e, size=n, dtype=np.int64)
 
 
-def _gather_game(shard, idx_arr):
+def _gather_game(shard, idx_arr, game_start=0, history=1):
     """Slice every per-row tensor at ``idx_arr`` into a [N, ...] dict.
 
     We *do not* call ``project_targets`` here — at B=2048, N=1 that's 2048
     small per-yield torch ops in worker land (CPython overhead dominates).
     Instead the training loop runs ``project_targets`` once per batch on
     GPU, on the concatenated [B*N] q/d, which is essentially free.
+
+    ``history``>1: board_ids becomes [N, history, 68] — the current ply and the
+    previous ``history-1`` plies of the SAME game (rows are sorted by
+    (game_id, ply), so previous rows are previous plies). Indices are clamped to
+    ``game_start`` so positions near the game's start repeat its first board.
+    Targets (policy/wdl/q/d) are always for the CURRENT ply only.
     """
     t = torch.as_tensor(idx_arr, dtype=torch.long)
+    if history > 1:
+        off = torch.arange(history)                                  # 0..H-1
+        hist = (t[:, None] - (history - 1 - off)[None, :]).clamp_min(game_start)
+        board = shard["board_ids"][hist].to(torch.long)              # [N, H, 68]
+    else:
+        board = shard["board_ids"][t].to(torch.long)                 # [N, 68]
     return {
-        "board_ids":    shard["board_ids"][t].to(torch.long),  # [N, 68]
+        "board_ids":    board,
         "policy_tgt":   shard["policy_tgt"][t],                # [N]
         "policy_valid": shard["policy_valid"][t],              # [N]
         "wdl_mean":     shard["wdl_mean"][t],                  # [N, 3]
@@ -229,10 +241,11 @@ class ChessIterableDataset(IterableDataset):
     def __init__(self, parquet_dir, positions_per_game=8, shuffle_files=True,
                  shuffle_games=True, seed=42, rank=0, world_size=1,
                  cache_dir=None, batch_size=1, split="all", val_pct=2,
-                 max_shards=None):
+                 max_shards=None, history=1):
         self.parquet_dir = parquet_dir
         self.cache_dir = cache_dir
         self.positions_per_game = positions_per_game
+        self.history = history
         self.shuffle_files = shuffle_files
         self.shuffle_games = shuffle_games
         self.batch_size = batch_size
@@ -360,7 +373,8 @@ class ChessIterableDataset(IterableDataset):
                             continue
                     s, e = int(bounds[gi]), int(bounds[gi + 1])
                     idx = _pick_rows(s, e, N)
-                    acc.append(_gather_game(shard, idx))
+                    acc.append(_gather_game(shard, idx, game_start=s,
+                                            history=self.history))
                     if len(acc) == B:
                         yield _collate_batch(acc)
                         acc = []
@@ -371,11 +385,13 @@ class ChessIterableDataset(IterableDataset):
 
 def get_dataloader(parquet_dir, batch_size=16, num_workers=0,
                    positions_per_game=8, seed=42, rank=0, world_size=1,
-                   cache_dir=None, split="all", val_pct=2, max_shards=None):
+                   cache_dir=None, split="all", val_pct=2, max_shards=None,
+                   history=1):
     ds = ChessIterableDataset(parquet_dir, positions_per_game=positions_per_game,
                               seed=seed, rank=rank, world_size=world_size,
                               cache_dir=cache_dir, batch_size=batch_size,
-                              split=split, val_pct=val_pct, max_shards=max_shards)
+                              split=split, val_pct=val_pct, max_shards=max_shards,
+                              history=history)
     # batch_size=None: the dataset already yields pre-collated [B, N, ...]
     # batches. DataLoader's default collate would otherwise re-stack our
     # batches into [1, B, N, ...].

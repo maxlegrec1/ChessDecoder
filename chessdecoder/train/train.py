@@ -107,6 +107,7 @@ def train():
         moe_bias_balance=mc.get("moe_bias_balance", False),
         moe_bias_update_rate=mc.get("moe_bias_update_rate", 1e-3),
         moe_gate_type=mc.get("moe_gate_type", "softmax"),
+        history=mc.get("history", config["data"].get("history", 1)),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")
@@ -134,6 +135,7 @@ def train():
 
     val_pct = config["training"].get("val_pct", 2)
     max_shards = config["data"].get("max_shards")
+    history = config["data"].get("history", 1)
     dataloader, dataset = get_dataloader(
         config["data"]["parquet_dir"],
         batch_size=config["data"]["batch_size"],
@@ -141,7 +143,7 @@ def train():
         positions_per_game=config["data"]["positions_per_game"],
         seed=seed, rank=rank, world_size=world_size,
         cache_dir=config["data"].get("cache_dir"),
-        split="train", val_pct=val_pct, max_shards=max_shards)
+        split="train", val_pct=val_pct, max_shards=max_shards, history=history)
 
     use_fp8 = config["training"].get("use_fp8", False)
     use_amp = config["training"].get("use_amp", False)
@@ -249,7 +251,8 @@ def train():
             positions_per_game=config["data"]["positions_per_game"],
             seed=seed, rank=rank, world_size=world_size,
             cache_dir=config["data"].get("cache_dir"),
-            split="val", val_pct=val_pct, max_shards=max_shards)
+            split="val", val_pct=val_pct, max_shards=max_shards,
+            history=history)
         vit = iter(v_loader)
         for _ in range(n_val_batches):
             try:
@@ -269,7 +272,7 @@ def train():
         nb = 0
         for vb in val_data:
             bid = vb["board_ids"].to(device, non_blocking=True)
-            Bv, Nv, _ = bid.shape
+            Bv, Nv = bid.shape[0], bid.shape[1]
             pol_tgt = vb["policy_tgt"].to(device, non_blocking=True)
             pol_val = vb["policy_valid"].to(device, non_blocking=True)
             wdl_mean = vb["wdl_mean"].to(device, non_blocking=True)
@@ -278,7 +281,7 @@ def train():
             d_in = vb["d"].to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=autocast_dtype,
                                 enabled=use_amp):
-                out = model(bid.reshape(Bv * Nv, 68))
+                out = model(bid.reshape(Bv * Nv, *bid.shape[2:]))
                 pol_logits = out["policy"].reshape(Bv, Nv, -1)
                 wdl_logits = out["wdl"].reshape(Bv, Nv, -1)
                 vflat = wdl_val.reshape(-1)
@@ -324,8 +327,8 @@ def train():
             if epoch_step <= skip:
                 continue
 
-            bid = batch["board_ids"].to(device, non_blocking=True)     # [B,N,68]
-            B, N, _ = bid.shape
+            bid = batch["board_ids"].to(device, non_blocking=True)     # [B,N,68] or [B,N,H,68]
+            B, N = bid.shape[0], bid.shape[1]
             # FP8 + torch.compile requires a fixed batch size (K = B*N*S must
             # be statically divisible by 16). Drop partial last batches.
             if use_fp8 and B != config["data"]["batch_size"]:
@@ -338,7 +341,7 @@ def train():
             d_in = batch["d"].to(device, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_amp):
-                out = model(bid.reshape(B * N, 68))
+                out = model(bid.reshape(B * N, *bid.shape[2:]))
                 pol_logits = out["policy"].reshape(B, N, -1)
                 wdl_logits = out["wdl"].reshape(B, N, -1)
                 # One GPU call instead of 2048 per-yield CPU calls (see

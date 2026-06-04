@@ -69,10 +69,18 @@ class ChessEncoder(nn.Module):
                  moe_aux_loss_weight: float = 1e-2,
                  moe_capacity_factor: float = None, moe_router_noise: float = 0.0,
                  moe_z_loss_weight: float = 0.0, moe_bias_balance: bool = False,
-                 moe_bias_update_rate: float = 1e-3, moe_gate_type: str = "softmax"):
+                 moe_bias_update_rate: float = 1e-3, moe_gate_type: str = "softmax",
+                 history: int = 1):
         super().__init__()
         self.embed_dim = embed_dim
         self.input_mode = input_mode
+        # history>1: each square's embedding is built from the current ply + the
+        # previous history-1 plies (concatenated piece embeddings -> projection),
+        # so the model sees how the position evolved (lc0 feeds 8 plies).
+        self.history = history
+        if history > 1:
+            self.history_proj = nn.Linear(history * embed_dim, embed_dim,
+                                          bias=False)
         self.policy_head_type = policy_head
         self.attention_variant = attention_variant
         self.ffn_type = ffn_type
@@ -145,10 +153,20 @@ class ChessEncoder(nn.Module):
                              persistent=False)
 
     def forward(self, board_ids_raw: torch.Tensor) -> dict:
-        # board_ids_raw is always [N, 68] (loader doesn't know input_mode).
-        board_ids, stm_id, castling_id = _slice_inputs(board_ids_raw,
-                                                       self.input_mode)
-        x = self.tok_embedding(board_ids)                       # [N, S, D]
+        # No history: board_ids_raw [N, 68]. History: [N, H, 68].
+        if self.history > 1:
+            cur = board_ids_raw[:, -1, :]                        # [N, 68] current ply
+            stm_id = cur[:, _RAW_STM_POS]
+            castling_id = cur[:, _RAW_CASTLING_POS]
+            sq = board_ids_raw[..., _RAW_SQ_START:_RAW_SQ_END]   # [N, H, 64]
+            emb = self.tok_embedding(sq)                         # [N, H, 64, D]
+            N_, H_, S_, D_ = emb.shape
+            emb = emb.permute(0, 2, 1, 3).reshape(N_, S_, H_ * D_)  # [N,64,H*D]
+            x = self.history_proj(emb)                           # [N, 64, D]
+        else:
+            board_ids, stm_id, castling_id = _slice_inputs(board_ids_raw,
+                                                           self.input_mode)
+            x = self.tok_embedding(board_ids)                   # [N, S, D]
         # stm/castling broadcast to every token (CLS, when present, also
         # picks them up — the model can learn to use or ignore).
         x = x + self.tok_embedding(stm_id).unsqueeze(1)
