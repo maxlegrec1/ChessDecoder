@@ -115,9 +115,14 @@ def build_optimizer(model, name, lr, wd, adamw_lr_mult=1.0):
         # (out >> in, e.g. gen 128 -> S^2 4096), so Muon's sqrt(out/in) scaling
         # gives them ~5x LR -> the dynamic attention bias grows uncontrolled and
         # slowly diverges. AdamW (adaptive, per-param normalised) keeps it stable.
+        # ``pre_lin`` (BT4-style input preprocessor) is very "tall" too:
+        # 64*13 -> 64*512 (out >> in), so Muon's sqrt(out/in) scaling over-LRs
+        # it just like smolgen. Keep it on AdamW; ``pre_proj`` (1536->1024) is a
+        # normal matrix and stays on Muon.
         excluded = ("tok_embedding", "pos_embedding",
                     "policy_head", "wdl_head", "bias_module",
-                    "sp_bias", "pos_enc_weight", "router", "smolgen")
+                    "sp_bias", "pos_enc_weight", "router", "smolgen",
+                    "pre_lin")
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue

@@ -21,6 +21,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchtune.modules import RMSNorm
 
 from chessdecoder.models.layers import EncoderLayer, EncoderStack
@@ -28,7 +29,8 @@ from chessdecoder.models.policy_head import CrossAttnPolicyHead
 from chessdecoder.models.pos_variants import (
     INPUT_MODE_TO_LAYOUT, TokenLayout, build_pos_modules, Smolgen)
 from chessdecoder.models.value_buckets import CELL_WDL, N_CELLS, mean_wdl as _mean_wdl
-from chessdecoder.models.vocab import move_vocab_size, policy_index
+from chessdecoder.models.vocab import (move_vocab_size, policy_index,
+                                       piece_tokens, token_to_idx)
 
 
 # Column indices in the raw cached 68-token board_ids:
@@ -70,7 +72,8 @@ class ChessEncoder(nn.Module):
                  moe_capacity_factor: float = None, moe_router_noise: float = 0.0,
                  moe_z_loss_weight: float = 0.0, moe_bias_balance: bool = False,
                  moe_bias_update_rate: float = 1e-3, moe_gate_type: str = "softmax",
-                 history: int = 1):
+                 history: int = 1,
+                 input_preprocess: bool = False, preprocess_dim: int = 512):
         super().__init__()
         self.embed_dim = embed_dim
         self.input_mode = input_mode
@@ -81,6 +84,26 @@ class ChessEncoder(nn.Module):
         if history > 1:
             self.history_proj = nn.Linear(history * embed_dim, embed_dim,
                                           bias=False)
+
+        # BT4-style global input preprocessor: a single dense layer mixes the
+        # whole board's piece placement (64 squares x 13 piece classes -> a
+        # per-square ``preprocess_dim`` summary), so every square sees where all
+        # the pieces are *before* any attention. The summary is concatenated
+        # with the per-square embedding and projected back to embed_dim.
+        # (lc0's embedding_preprocess: 64*12 -> 64*512 = ~25M params.)
+        self.input_preprocess = input_preprocess
+        self.preprocess_dim = preprocess_dim
+        if input_preprocess:
+            self._n_piece = len(piece_tokens) + 1            # 12 pieces + empty
+            piece_map = torch.full((vocab_size,), len(piece_tokens),
+                                   dtype=torch.long)          # default -> empty
+            for i, t in enumerate(piece_tokens):
+                piece_map[token_to_idx[t]] = i
+            self.register_buffer("_sq_piece_map", piece_map, persistent=False)
+            self.pre_lin = nn.Linear(64 * self._n_piece, 64 * preprocess_dim)
+            self.pre_proj = nn.Linear(embed_dim + preprocess_dim, embed_dim,
+                                      bias=False)
+
         self.policy_head_type = policy_head
         self.attention_variant = attention_variant
         self.ffn_type = ffn_type
@@ -167,6 +190,18 @@ class ChessEncoder(nn.Module):
             board_ids, stm_id, castling_id = _slice_inputs(board_ids_raw,
                                                            self.input_mode)
             x = self.tok_embedding(board_ids)                   # [N, S, D]
+
+        if self.input_preprocess:
+            # Current-position square tokens (the 64 squares of the latest ply),
+            # taken from the raw 68-token layout regardless of input_mode.
+            cur_raw = board_ids_raw[:, -1, :] if self.history > 1 else board_ids_raw
+            cur_sq = cur_raw[:, _RAW_SQ_START:_RAW_SQ_END]       # [N, 64]
+            pidx = self._sq_piece_map[cur_sq]                    # [N, 64] in 0..12
+            oh = F.one_hot(pidx, self._n_piece).to(x.dtype)      # [N, 64, 13]
+            oh = oh.reshape(oh.shape[0], 64 * self._n_piece)     # [N, 832]
+            summ = self.pre_lin(oh).reshape(oh.shape[0], 64, self.preprocess_dim)
+            x = self.pre_proj(torch.cat([x, summ], dim=-1))      # [N, 64, D]
+
         # stm/castling broadcast to every token (CLS, when present, also
         # picks them up — the model can learn to use or ignore).
         x = x + self.tok_embedding(stm_id).unsqueeze(1)
