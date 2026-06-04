@@ -27,7 +27,7 @@ def load_model(args, dev):
         num_layers=args.num_layers, d_ff=args.d_ff, attention_variant="geom",
         policy_head="cross_attn", input_mode="lc0_64", ffn_type=args.ffn_type,
         moe_num_experts=args.moe_experts, moe_top_k=args.moe_topk,
-        moe_expert_d_ff=args.moe_expert_dff).to(dev)
+        moe_expert_d_ff=args.moe_expert_dff, history=args.history).to(dev)
     sd = torch.load(args.ckpt, map_location=dev, weights_only=False)
     sd = sd.get("model_state_dict", sd)
     sd = {k.replace("_orig_mod.", ""): (v.to_local() if hasattr(v, "to_local")
@@ -38,11 +38,27 @@ def load_model(args, dev):
     return m
 
 
+def _board_ids(board, history):
+    """[68] for no-history, else [H, 68] = the current + previous H-1 positions
+    (oldest first, current last), reconstructed from the move stack. Positions
+    before the game start repeat the earliest board (matches training's clamp)."""
+    if history <= 1:
+        out = np.empty(68, dtype=np.int32); fen_to_ids(board.fen(), out)
+        return out
+    b = board.copy()
+    hist = []
+    for _ in range(history):
+        out = np.empty(68, dtype=np.int32); fen_to_ids(b.fen(), out)
+        hist.append(out)                       # [current, 1-ago, 2-ago, ...]
+        if b.move_stack:
+            b.pop()
+    return np.stack(hist[::-1])                 # [H, 68] oldest-first, current last
+
+
 @torch.no_grad()
 def pick_move(model, board, dev):
-    out = np.empty(68, dtype=np.int32)
-    fen_to_ids(board.fen(), out)
-    bid = torch.from_numpy(out.astype(np.int64)).unsqueeze(0).to(dev)
+    ids = _board_ids(board, model.history)
+    bid = torch.from_numpy(ids.astype(np.int64)).unsqueeze(0).to(dev)  # [1,68] or [1,H,68]
     with torch.autocast("cuda", dtype=torch.bfloat16):
         logits = model(bid)["policy"][0].float()              # [1924]
     best, best_lp = None, -1e30
@@ -92,6 +108,7 @@ def main():
     ap.add_argument("--moe-experts", type=int, default=8)
     ap.add_argument("--moe-topk", type=int, default=2)
     ap.add_argument("--moe-expert-dff", type=int, default=768)
+    ap.add_argument("--history", type=int, default=1)
     args = ap.parse_args()
     dev = "cuda"
     model = load_model(args, dev)
