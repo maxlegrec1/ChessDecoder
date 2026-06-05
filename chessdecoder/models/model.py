@@ -73,7 +73,8 @@ class ChessEncoder(nn.Module):
                  moe_z_loss_weight: float = 0.0, moe_bias_balance: bool = False,
                  moe_bias_update_rate: float = 1e-3, moe_gate_type: str = "softmax",
                  history: int = 1,
-                 input_preprocess: bool = False, preprocess_dim: int = 512):
+                 input_preprocess: bool = False, preprocess_dim: int = 512,
+                 policy_embedding: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.input_mode = input_mode
@@ -159,7 +160,7 @@ class ChessEncoder(nn.Module):
         if policy_head == "cross_attn":
             self.policy_head = CrossAttnPolicyHead(
                 d_model=embed_dim, move_vocab_size=move_vocab_size,
-                policy_index=policy_index)
+                policy_index=policy_index, policy_embedding=policy_embedding)
         elif policy_head == "linear":
             self.policy_head = nn.Linear(embed_dim, move_vocab_size)
         else:

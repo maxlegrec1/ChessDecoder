@@ -110,6 +110,7 @@ def train():
         history=mc.get("history", config["data"].get("history", 1)),
         input_preprocess=mc.get("input_preprocess", False),
         preprocess_dim=mc.get("preprocess_dim", 512),
+        policy_embedding=mc.get("policy_embedding", False),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print_rank0(f"Model: {n_params/1e6:.2f}M params")

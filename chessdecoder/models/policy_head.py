@@ -111,11 +111,19 @@ class CrossAttnPolicyHead(nn.Module):
     """
 
     def __init__(self, d_model: int, move_vocab_size: int,
-                 policy_index, d_pol: Optional[int] = None):
+                 policy_index, d_pol: Optional[int] = None,
+                 policy_embedding: bool = False):
         super().__init__()
         if d_pol is None:
             d_pol = d_model
         self.d_pol = d_pol
+        # Optional BT4-style pre-projection of the encoder output before the
+        # from/to attention map: policy_tokens = mish(policy_embedding(x)).
+        # This is the only structural difference between BT4's policy head and
+        # ours (+1.05M params).
+        self.policy_embedding = (nn.Sequential(nn.Linear(d_model, d_model),
+                                               nn.Mish())
+                                 if policy_embedding else None)
         self.q_proj = nn.Linear(d_model, d_pol, bias=False)
         self.k_proj = nn.Linear(d_model, d_pol, bias=False)
         self.scale = 1.0 / math.sqrt(d_pol)
@@ -157,6 +165,8 @@ class CrossAttnPolicyHead(nn.Module):
                              persistent=False)
 
     def forward(self, x_squares: torch.Tensor) -> torch.Tensor:
+        if self.policy_embedding is not None:
+            x_squares = self.policy_embedding(x_squares)       # [B, 64, d_model]
         # Standard (from, to) attention scores.
         q = self.q_proj(x_squares)                             # [B, 64, d_pol]
         k = self.k_proj(x_squares)                             # [B, 64, d_pol]
