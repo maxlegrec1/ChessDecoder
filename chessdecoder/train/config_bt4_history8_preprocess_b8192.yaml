@@ -1,0 +1,56 @@
+# PREPROCESS at the REAL deployment batch (effective 8192 = 1024 micro x
+# grad_accum 8), so it can be compared against the original bt4_history8_long
+# (also effective batch 8192). IDENTICAL to bt4_history8_long except
+# input_preprocess: true (+28.9M). Re-tests the input preprocessor at the
+# correct batch size (the earlier test was at batch 1024 / grad_accum 1).
+project_name: "chess-decoder"
+run_name: "bt4_history8_preprocess_b8192"
+
+data:
+  parquet_dir: "data/parquets"
+  cache_dir: "data/cache"
+  batch_size: 1024
+  num_workers: 4
+  positions_per_game: 1
+  history: 8
+
+model:
+  embed_dim: 1024
+  num_heads: 32
+  num_layers: 15
+  d_ff: 1536
+  attention_variant: "geom"
+  policy_head: "cross_attn"
+  input_mode: "lc0_64"
+  history: 8
+  input_preprocess: true
+  preprocess_dim: 512
+
+training:
+  optimizer: "muon"
+  learning_rate: 6.0e-3
+  adamw_lr_mult: 0.5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  gradient_accumulation_steps: 8     # 1024 x 8 = effective batch 8192
+  num_epochs: 1000
+  log_every_n_steps: 5
+  save_every_n_steps: 64000
+  device: "cuda"
+  use_amp: true
+  use_fp8: true
+  fp8_recipe: "tensorwise"
+  fp8_compile: true
+  checkpoint_dir: "checkpoints/bt4_history8_preprocess_b8192/"
+  seed: 42
+  resume_from: null
+  reset_data_iteration: false
+  max_steps: 64000
+  peak_tflops: 1979
+  val_pct: 2
+  val_every_n_steps: 1000
+  val_batches: 64
+
+loss:
+  policy_weight: 5.0
+  wdl_weight: 1.0
