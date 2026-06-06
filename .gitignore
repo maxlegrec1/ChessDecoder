@@ -11,6 +11,8 @@ wheels/
 
 parquets/
 parquets_variations/
+parquets_variations2/
+parquets_variations2_fixed/
 data/
 
 checkpoints/
@@ -68,3 +70,8 @@ chessdecoder/cpp/mcts/uv.lock
 
 # Verification cache
 scripts/.verify_cache/
+cached_decoder/
+parquet_files_decoder/
+results/
+*.json
+*.log
