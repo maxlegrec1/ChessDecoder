@@ -87,3 +87,9 @@ _smoke*.yaml
 
 # One-off diagnostic outputs from exploration
 wdl_buckets.png
+cached_decoder/
+parquets_variations2/
+parquets_variations2_fixed/
+results/
+*.json
+*.log
