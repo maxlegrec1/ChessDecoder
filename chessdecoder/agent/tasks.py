@@ -248,7 +248,7 @@ class AgentTaskDataset(IterableDataset):
             board, _ = self._sample_line(games, rng, 1)
             return make_t1(board) if board else None
         if task in (T2, T3):
-            k = 1 if task == T2 else rng.randint(2, 6)
+            k = 1 if task == T2 else rng.randint(2, 10)
             board, ucis = self._sample_line(games, rng, k)
             if board is None:
                 return None

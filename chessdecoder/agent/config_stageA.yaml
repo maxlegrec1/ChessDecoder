@@ -1,6 +1,6 @@
 # Stage-A agent pretraining (board literacy + long-context mechanics).
 project_name: "search-agent"
-run_name: "stageA-110M"
+run_name: "stageA-110M-r2"
 
 data:
   parquet_dir: "/mnt/2tb_2/decoder/parquet_files_decoder"
@@ -30,4 +30,4 @@ training:
   compile: true
   checkpoint_dir: "checkpoints/agent_stageA/"
   seed: 42
-  resume_from: null
+  resume_from: "/mnt/2tb_2/decoder/.claude/worktrees/search-agent/checkpoints/agent_stageA/stageA-110M_20260610_170555/agent_40000.pt"
