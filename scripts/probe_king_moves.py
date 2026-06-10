@@ -88,9 +88,19 @@ def probe(feats, ys):
     return acc, mae
 
 
+CACHE = "agent_data/probe_dataset_kingmoves.pt"
+
+
 def main():
-    print("building probe dataset (held-out shard)...", flush=True)
-    ids, ys = build_dataset()
+    import os
+    if os.path.exists(CACHE):
+        d = torch.load(CACHE, weights_only=False)
+        ids, ys = d["ids"], d["ys"]
+        print(f"probe dataset from cache ({len(ids):,})", flush=True)
+    else:
+        print("building probe dataset (held-out shard)...", flush=True)
+        ids, ys = build_dataset()
+        torch.save({"ids": ids, "ys": ys}, CACHE)
     maj = ys[N_TRAIN:].bincount().max().item() / N_TEST
     print(f"labels: dist={ys.bincount().tolist()}  majority-baseline={maj:.3f}",
           flush=True)
