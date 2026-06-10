@@ -89,3 +89,9 @@ experiments/*.log
 
 # Agent label corpora (regenerable via scripts/gen_t5_labels.py)
 agent_data/
+
+# Local data/artifacts
+cached_decoder/
+parquets_variations2_fixed/
+agent_data/
+.claude/worktrees/
