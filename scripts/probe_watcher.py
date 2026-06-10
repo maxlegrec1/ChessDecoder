@@ -29,10 +29,10 @@ run = wandb.init(project="search-agent", name="king-probe",
                  id="king-probe-v2", resume="allow")
 
 while True:
-    cks = sorted(glob.glob(RUN_GLOB),
-                 key=lambda p: int(p.split("_")[-1].split(".")[0]))
+    cks = [c for c in glob.glob(RUN_GLOB) if not c.endswith("latest_full.pt")]
+    cks.sort(key=lambda p: int(p.split("_")[-1].split(".")[0]))
     for ck in cks:
-        if ck in seen or ck.endswith("latest_full.pt"):
+        if ck in seen:
             continue
         out = subprocess.run(
             ["uv", "run", "python", "scripts/probe_king_moves.py", ck],
