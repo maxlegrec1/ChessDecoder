@@ -1,0 +1,58 @@
+# 30M dense oracle encoder (search-agent plan, Milestone 0).
+#
+# This model becomes the FROZEN oracle the search agent probes:
+# position -> (policy over 1924 moves, WDL). Trained once, then frozen.
+# Sized exactly: D=512 H=8 L=10 d_ff=1152 -> 29.97M params
+# (encoder 28.2M, tok_embedding 1.0M, cross_attn policy 0.5M, wdl 0.2M).
+#
+# Architecture choices carried from the branch's sweeps (see config.yaml):
+# geom attention bias + cross_attn policy head + lc0_64 input mode.
+project_name: "chess-decoder"
+run_name: "oracle-30M"
+
+data:
+  parquet_dir: "/mnt/2tb_2/decoder/parquet_files_decoder/"
+  cache_dir: "/mnt/2tb_2/decoder/cached_decoder/"   # all 364 shards pre-tokenized
+  # bf16+compile OOMs at B=2048 on the 4090; B=1024 x accum 2 = same effective
+  # batch at 343.6 ms/opt-step (vs fp8@2048: 390.3) — benched 2026-06-09.
+  batch_size: 1024
+  num_workers: 3        # 15GiB-RAM box: each worker holds a decompressed npz
+                        # shard + torch runtime; 8 workers OOM (oomd kill).
+  positions_per_game: 1
+
+model:
+  embed_dim: 512
+  num_heads: 8          # head_dim 64
+  num_layers: 10
+  d_ff: 1152
+  attention_variant: "geom"
+  policy_head: "cross_attn"
+  input_mode: "lc0_64"
+
+training:
+  optimizer: "muon"
+  learning_rate: 3.0e-3
+  weight_decay: 0.01
+  grad_clip: 1.0
+  gradient_accumulation_steps: 2   # eff. batch 2048 (B=1024 x 2)
+  num_epochs: 100
+  log_every_n_steps: 200
+  save_every_n_steps: 2000
+  val_pct: 2
+  val_every_n_steps: 1000
+  val_batches: 8
+  device: "cuda"
+  use_amp: true
+  # bf16 + compiled encoder: fastest mode for this size on the RTX 4090
+  # (fp16 eager +66%, fp8 +10% — scripts/bench_fp8_4090.py). fp8 only wins
+  # at D>=1024.
+  precision: "bf16"
+  compile: true
+  checkpoint_dir: "checkpoints/oracle_30M/"
+  seed: 42
+  resume_from: null
+  reset_data_iteration: false
+
+loss:
+  policy_weight: 5.0
+  wdl_weight: 1.0

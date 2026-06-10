@@ -130,7 +130,9 @@ def train():
     # Peak tensorcore FLOPs of the device the GEMMs actually run on. For an
     # RTX 4090: 165.2 TFLOPs/s in bf16, 660.6 in FP8 (E4M3, dense). Override
     # via ``training.peak_tflops`` if you're on different hardware.
-    default_peak_tflops = 660.6 if config["training"].get("use_fp8", False) else 165.2
+    _prec = config["training"].get(
+        "precision", "fp8" if config["training"].get("use_fp8", False) else "fp16")
+    default_peak_tflops = 660.6 if _prec == "fp8" else 165.2
     peak_flops = config["training"].get("peak_tflops",
                                         default_peak_tflops) * 1e12
     print_rank0(f"FLOPs/step (approx): {flops_per_step/1e12:.2f} TF; "
@@ -148,11 +150,18 @@ def train():
         cache_dir=config["data"].get("cache_dir"),
         split="train", val_pct=val_pct, max_shards=max_shards, history=history)
 
-    use_fp8 = config["training"].get("use_fp8", False)
     use_amp = config["training"].get("use_amp", False)
-    # FP8 pairs with bf16 autocast (same range as fp32 -> no GradScaler).
-    autocast_dtype = torch.bfloat16 if use_fp8 else torch.float16
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and not use_fp8))
+    # precision knob (benchmarked on the RTX 4090 at 30M scale,
+    # scripts/bench_fp8_4090.py):
+    #   "fp16"  autocast fp16 + GradScaler, eager           (legacy default)
+    #   "bf16"  autocast bf16 + compiled encoder, no scaler (fastest at <=60M)
+    #   "fp8"   torchao Float8Linear + bf16 autocast + compile (wins at D>=1024)
+    # Legacy ``use_fp8: true`` maps to "fp8".
+    precision = config["training"].get(
+        "precision", "fp8" if config["training"].get("use_fp8", False) else "fp16")
+    use_fp8 = precision == "fp8"
+    autocast_dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and precision == "fp16"))
 
     # ----- model state must load BEFORE FP8 conversion -----
     resume_from = config["training"].get("resume_from")
@@ -184,6 +193,14 @@ def train():
         if config["training"].get("fp8_compile", True):
             compile_fp8_hot_path(model)
             print_rank0("FP8: torch.compile applied to encoder stack")
+
+    encoder_compiled = use_fp8 and config["training"].get("fp8_compile", True)
+    if precision == "bf16" and config["training"].get("compile", True):
+        # compile_fp8_hot_path is precision-agnostic: it just torch.compiles
+        # model.encoder with dynamic=False.
+        compile_fp8_hot_path(model)
+        encoder_compiled = True
+        print_rank0("bf16: torch.compile applied to encoder stack")
 
     adamw_lr_mult = config["training"].get("adamw_lr_mult", 1.0)
     optimizer = build_optimizer(
@@ -332,9 +349,10 @@ def train():
 
             bid = batch["board_ids"].to(device, non_blocking=True)     # [B,N,68] or [B,N,H,68]
             B, N = bid.shape[0], bid.shape[1]
-            # FP8 + torch.compile requires a fixed batch size (K = B*N*S must
-            # be statically divisible by 16). Drop partial last batches.
-            if use_fp8 and B != config["data"]["batch_size"]:
+            # torch.compile(dynamic=False) specializes on the batch shape (and
+            # FP8 additionally needs K = B*N*S divisible by 16). Drop partial
+            # last batches so the compiled graph sees one shape only.
+            if (use_fp8 or encoder_compiled) and B != config["data"]["batch_size"]:
                 continue
             pol_tgt = batch["policy_tgt"].to(device, non_blocking=True)
             pol_val = batch["policy_valid"].to(device, non_blocking=True)
