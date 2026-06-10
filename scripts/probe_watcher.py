@@ -34,8 +34,9 @@ while True:
     for ck in cks:
         if ck in seen:
             continue
+        import sys
         out = subprocess.run(
-            ["uv", "run", "python", "scripts/probe_king_moves.py", ck],
+            [sys.executable, "scripts/probe_king_moves.py", ck],
             capture_output=True, text=True,
             env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"}).stdout
         for line in out.splitlines():
