@@ -93,3 +93,5 @@ parquets_variations2_fixed/
 results/
 *.json
 *.log
+# Claude worktrees
+.claude/worktrees/

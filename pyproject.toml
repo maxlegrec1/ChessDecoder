@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "bulletchess>=0.4.0",
-    "decoder-inference-cpp",
+    "v2-inference-cpp",
     "numpy>=2.4.0",
     "pyarrow>=22.0.0",
     "pybind11>=3.0.1",
@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcts = ["chessrl-inference-cpp"]
+mcts-leela = ["chessrl-inference-cpp"]
 
 [build-system]
 requires = ["hatchling"]
@@ -41,14 +41,14 @@ exclude = [
 ]
 
 [tool.uv]
-no-build-isolation-package = ["decoder-inference-cpp"]
+no-build-isolation-package = ["v2-inference-cpp"]
 
 [tool.uv.sources]
 chessrl-inference-cpp = { path = "chessdecoder/cpp/mcts", editable = true }
-decoder-inference-cpp = { path = "chessdecoder/cpp/decoder", editable = true }
+v2-inference-cpp = { path = "chessdecoder/cpp/v2", editable = true }
 
 [tool.pytest.ini_options]
 markers = [
     "gpu: requires CUDA GPU",
-    "cpp: requires C++ inference engine and exported model in exports/",
+    "cpp: requires V2 C++ inference engine + exported BoardForward.ts",
 ]
