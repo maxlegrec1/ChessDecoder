@@ -26,7 +26,8 @@ from chessdecoder.agent.oracle import Oracle
 from chessdecoder.agent import patch_vocab as pv
 from chessdecoder.models.vocab import move_vocab, move_token_to_idx
 
-N_TRAIN = int(sys.argv[1]) if len(sys.argv) > 1 else 5_000_000
+_pos_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+N_TRAIN = int(_pos_args[0]) if _pos_args else 5_000_000
 N_VAL = 100_000
 BATCH = 4096
 OUT_DIR = "agent_data"
@@ -172,8 +173,7 @@ def gen_paired(n_target: int, out_prefix: str, shard_list):
 
 
 if "--paired" in sys.argv:
-    n = int(sys.argv[sys.argv.index("--paired") + 1]) \
-        if len(sys.argv) > sys.argv.index("--paired") + 1 else 1_000_000
+    n = int(_pos_args[0]) if _pos_args else 1_000_000
     gen_paired(50_000, "paired_labels_val", [VAL_SHARD])
     gen_paired(n, "paired_labels_train_000", train_shards)
     sys.exit(0)
