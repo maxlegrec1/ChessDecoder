@@ -11,7 +11,7 @@ data:
   val_paired_glob: "agent_data/paired_labels_val.parquet"
   batch_size: 8
   num_workers: 2
-  val_streams: 48
+  val_streams: 144
 
 task_mix:
   t1_copy: 0.02
