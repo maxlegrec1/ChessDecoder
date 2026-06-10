@@ -128,6 +128,57 @@ def sample_and_label(shard_list, n_target, out_prefix):
         print(f"wrote final {len(out):,} rows", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Paired corpus (for t14_swing): consecutive game positions, both labeled.
+# Run:  CUDA_VISIBLE_DEVICES=0 uv run python scripts/gen_t5_labels.py --paired [N]
+# ---------------------------------------------------------------------------
+
+def gen_paired(n_target: int, out_prefix: str, shard_list):
+    rows = []
+    for sp in shard_list:
+        df = pd.read_parquet(sp, columns=["fen", "played_move", "game_id"])
+        # consecutive rows within a game = (parent, move, child)
+        fens, mvs, gids = (df["fen"].tolist(), df["played_move"].tolist(),
+                          df["game_id"].tolist())
+        cand = [(fens[i], mvs[i], fens[i + 1])
+                for i in range(len(fens) - 1) if gids[i] == gids[i + 1]]
+        random.shuffle(cand)
+        cand = cand[:min(len(cand), n_target - len(rows) + 1000)]
+        parents = [c[0] for c in cand]
+        children = [c[2] for c in cand]
+        lp = {}
+        for i in range(0, len(parents), BATCH):
+            _, wdl = oracle._forward(parents[i:i + BATCH])
+            q = (wdl[:, 0] - wdl[:, 2]).tolist(); d = wdl[:, 1].tolist()
+            for j in range(len(q)):
+                lp[i + j] = (q[j], d[j])
+        lc = {}
+        for i in range(0, len(children), BATCH):
+            _, wdl = oracle._forward(children[i:i + BATCH])
+            q = (wdl[:, 0] - wdl[:, 2]).tolist(); d = wdl[:, 1].tolist()
+            for j in range(len(q)):
+                lc[i + j] = (q[j], d[j])
+        for i, (pf, mu, cf) in enumerate(cand):
+            qp, dp = lp[i]; qc, dc = lc[i]
+            rows.append((pf, pv.q_to_bin(qp), pv.d_to_bin(dp), mu,
+                         cf, pv.q_to_bin(qc), pv.d_to_bin(dc)))
+        print(f"paired: {len(rows):,}/{n_target:,}", flush=True)
+        if len(rows) >= n_target:
+            break
+    out = pd.DataFrame(rows[:n_target], columns=[
+        "parent_fen", "q_p", "d_p", "move", "child_fen", "q_c", "d_c"])
+    out.to_parquet(f"{OUT_DIR}/{out_prefix}.parquet")
+    print(f"wrote {out_prefix} ({len(out):,})", flush=True)
+
+
+if "--paired" in sys.argv:
+    n = int(sys.argv[sys.argv.index("--paired") + 1]) \
+        if len(sys.argv) > sys.argv.index("--paired") + 1 else 1_000_000
+    gen_paired(50_000, "paired_labels_val", [VAL_SHARD])
+    gen_paired(n, "paired_labels_train_000", train_shards)
+    sys.exit(0)
+
+
 print(f"labeling {N_VAL:,} val positions from {os.path.basename(VAL_SHARD)}",
       flush=True)
 df = pd.read_parquet(VAL_SHARD, columns=["fen"])

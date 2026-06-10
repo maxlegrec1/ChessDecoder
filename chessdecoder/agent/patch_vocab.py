@@ -39,7 +39,9 @@ N_NUM = 257                       # 0..256
 
 CTRL_TOKENS = ["<root>", "<oracle>", "<probe>", "<answer>", "<invalid>",
                "<line>", "<best>", "<recall>", "<pad>",
-               "<spare0>", "<spare1>", "<spare2>"]
+               "<legal>", "<played>", "<lastmove>", "<horizon>", "<target>",
+               "<next>", "<swing>", "<bestw>", "<bestb>", "<reach>",
+               "<opening>", "<fill>", "<mask>", "<spare0>", "<spare1>"]
 N_CTRL = len(CTRL_TOKENS)
 
 PATCH_BASE = 0
@@ -57,6 +59,20 @@ CTRL = {t: CTRL_BASE + i for i, t in enumerate(CTRL_TOKENS)}
 ROOT, ORACLE, PROBE, ANSWER = CTRL["<root>"], CTRL["<oracle>"], CTRL["<probe>"], CTRL["<answer>"]
 INVALID, LINE, BEST, RECALL, PAD = (CTRL["<invalid>"], CTRL["<line>"],
                                     CTRL["<best>"], CTRL["<recall>"], CTRL["<pad>"])
+LEGAL, PLAYED, LASTMOVE, HORIZON = (CTRL["<legal>"], CTRL["<played>"],
+                                    CTRL["<lastmove>"], CTRL["<horizon>"])
+TARGET, NEXT, SWING = CTRL["<target>"], CTRL["<next>"], CTRL["<swing>"]
+BESTW, BESTB, REACH = CTRL["<bestw>"], CTRL["<bestb>"], CTRL["<reach>"]
+OPENING, FILL, MASK = CTRL["<opening>"], CTRL["<fill>"], CTRL["<mask>"]
+
+
+def uci_to_token(uci: str) -> int | None:
+    """Corpus/python-chess uci -> MOVE-region id. Knight promotions follow
+    the lc0 convention (bare move string, no 'n' suffix)."""
+    t = MOVE_TO_ID.get(uci)
+    if t is None and uci.endswith("n"):
+        t = MOVE_TO_ID.get(uci[:-1])
+    return t
 
 BOARD_LEN = 19                    # 16 patches + castle + stm + ep
 REPLY_LEN = 7                     # <oracle> q d m1 m2 m3 m4  (budget appended

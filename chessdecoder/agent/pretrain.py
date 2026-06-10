@@ -22,12 +22,11 @@ from torch.utils.data import DataLoader
 
 from chessdecoder.agent.model import AgentDecoder
 from chessdecoder.agent.tasks import (AgentTaskDataset, build_val_streams,
-                                      STREAM_LEN, TASK_MIX)
+                                      TASK_NAMES)
 from chessdecoder.utils.training import load_config
 from chessdecoder.utils.muon import build_optimizer
 
-TASK_NAMES = {1: "t1_copy", 2: "t2_apply", 3: "t3_line", 4: "t4_agg",
-              5: "t5_distill", 6: "t6_distance"}
+
 
 
 def _per_task_metrics(pred: torch.Tensor, tgt: torch.Tensor,
@@ -53,10 +52,10 @@ def _per_task_metrics(pred: torch.Tensor, tgt: torch.Tensor,
         # split exact-board by task (board answers exist for T1/T2/T3/T6)
         first_of = torch.full((len(uniq),), -1, dtype=torch.long, device=pred.device)
         first_of.scatter_reduce_(0, inv, task[bm].long(), reduce="amax")
-        for tid in (1, 2, 3, 6):
+        for tid in TASK_NAMES:
             tm = first_of == tid
             if tm.any():
-                out[f"board_exact/{TASK_NAMES[tid]}"] = (ok[tm] == 1).float().mean().item()
+                out[f"span_exact/{TASK_NAMES[tid]}"] = (ok[tm] == 1).float().mean().item()
     return out
 
 
@@ -102,6 +101,8 @@ def train():
     print(f"AgentDecoder: {n_params/1e6:.1f}M params", flush=True)
 
     ds = AgentTaskDataset(dc["parquet_dir"], dc["label_glob"],
+                          paired_glob=dc.get("paired_glob", ""),
+                          task_mix=config.get("task_mix"),
                           seed=tc.get("seed", 42))
     loader = DataLoader(ds, batch_size=dc["batch_size"],
                         num_workers=dc["num_workers"], pin_memory=True,
@@ -109,7 +110,9 @@ def train():
 
     print("building fixed val streams...", flush=True)
     val_streams = build_val_streams(dc["parquet_dir"], dc["val_labels"],
-                                    dc["val_streams"])
+                                    dc["val_streams"],
+                                    paired_glob=dc.get("val_paired_glob", ""),
+                                    task_mix=config.get("task_mix"))
     vb = dc["batch_size"]
     val_batches = [tuple(torch.stack([s[j] for s in val_streams[i:i + vb]])
                          for j in range(5))
