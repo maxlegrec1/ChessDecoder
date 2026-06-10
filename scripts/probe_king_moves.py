@@ -24,6 +24,8 @@ from chessdecoder.agent.model import AgentDecoder
 from chessdecoder.agent import patch_vocab as pv
 
 DEV = "cuda"
+import os
+POOL = os.environ.get("PROBE_POOL", "last")
 N_TRAIN, N_TEST = 60_000, 10_000
 N_CLASSES = 11
 
@@ -60,7 +62,10 @@ def extract(model, ids):
         chunk = ids[i:i + 1024].to(DEV)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             h = model(chunk)
-        feats.append(h[:, -1, :].float().cpu())
+        if POOL == "mean":
+            feats.append(h[:, 1:, :].mean(dim=1).float().cpu())
+        else:
+            feats.append(h[:, -1, :].float().cpu())
     return torch.cat(feats)
 
 
