@@ -90,9 +90,10 @@ def main():
     print(f"labels: dist={ys.bincount().tolist()}  majority-baseline={maj:.3f}",
           flush=True)
     for ckpt in sys.argv[1:]:
-        model = AgentDecoder().to(DEV).eval()
         sd = torch.load(ckpt, map_location=DEV, weights_only=False)
         step = sd.get("step", "?")
+        v = sd["model_state_dict"]["tok_embedding.weight"].shape[0]
+        model = AgentDecoder(vocab_size=v).to(DEV).eval()
         model.load_state_dict(sd["model_state_dict"])
         feats = extract(model, ids)
         acc, mae = probe(feats, ys)
