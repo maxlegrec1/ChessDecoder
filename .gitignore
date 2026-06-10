@@ -86,3 +86,6 @@ wdl_buckets.png
 
 # experiment run logs
 experiments/*.log
+
+# Agent label corpora (regenerable via scripts/gen_t5_labels.py)
+agent_data/

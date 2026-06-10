@@ -1,0 +1,33 @@
+# Stage-A agent pretraining (board literacy + long-context mechanics).
+project_name: "search-agent"
+run_name: "stageA-110M"
+
+data:
+  parquet_dir: "/mnt/2tb_2/decoder/parquet_files_decoder"
+  label_glob: "agent_data/t5_labels_train_*.parquet"
+  val_labels: "agent_data/t5_labels_val.parquet"
+  batch_size: 8            # streams per batch (stream_len 4096 -> 32k tok/step)
+  num_workers: 2           # each worker holds a game shard + a label slice (15GiB box)
+  val_streams: 48
+
+model:
+  embed_dim: 768
+  num_heads: 12
+  num_layers: 12
+  d_ff: 2048
+  max_seq_len: 8192
+
+training:
+  optimizer: "muon"
+  learning_rate: 1.5e-3
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_steps: 500
+  max_steps: 200000
+  log_every_n_steps: 50
+  val_every_n_steps: 1000
+  save_every_n_steps: 5000
+  compile: true
+  checkpoint_dir: "checkpoints/agent_stageA/"
+  seed: 42
+  resume_from: null
