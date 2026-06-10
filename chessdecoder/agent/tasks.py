@@ -306,8 +306,10 @@ class AgentTaskDataset(IterableDataset):
                     next_eid += 1
                 cursor += n
                 examples_served += 1
-                if examples_served % 200_000 == 0:   # refresh shard slice
+                if examples_served % 200_000 == 0:   # refresh data slices
                     games = self._load_games(rng)
+                    labels = self._load_labels(rng)  # rotate label file too
+                    label_pos[0] = 0
             offset = rng.randrange(0, MAX_POS - S + 1)
             pos = np.arange(offset, offset + S, dtype=np.int64)
             yield (torch.from_numpy(ids), torch.from_numpy(loss),

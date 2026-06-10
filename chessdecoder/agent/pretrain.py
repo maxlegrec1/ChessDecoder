@@ -130,7 +130,21 @@ def train():
     wandb.init(project=config["project_name"], name=config["run_name"],
                config=config)
 
-    step, t_win, tok_win = 0, time.time(), 0
+    step = 0
+    resume_from = tc.get("resume_from")
+    if resume_from:
+        ck = torch.load(resume_from, map_location=device, weights_only=False)
+        raw = getattr(model, "_orig_mod", model)
+        raw.load_state_dict(ck["model_state_dict"])
+        if "optimizer_state_dict" in ck:
+            optimizer.load_state_dict(ck["optimizer_state_dict"])
+        else:
+            print("resume: no optimizer state in ckpt — momentum rebuilds "
+                  "over the first ~100 steps", flush=True)
+        step = ck["step"]
+        print(f"resumed from {resume_from} at step {step}", flush=True)
+
+    t_win, tok_win = time.time(), 0
     max_steps = tc.get("max_steps", 200_000)
     log_every, val_every = tc["log_every_n_steps"], tc["val_every_n_steps"]
     save_every = tc["save_every_n_steps"]
@@ -192,6 +206,11 @@ def train():
             torch.save({"model_state_dict": raw.state_dict(), "step": step,
                         "config": config},
                        os.path.join(run_dir, f"agent_{step}.pt"))
+            # full state (incl. optimizer) in one rolling file for clean resume
+            torch.save({"model_state_dict": raw.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "step": step, "config": config},
+                       os.path.join(run_dir, "agent_latest_full.pt"))
             print(f"  saved agent_{step}.pt", flush=True)
         step += 1
 
