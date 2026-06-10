@@ -1,7 +1,7 @@
 [project]
 name = "decoder"
 version = "0.1.0"
-description = "ChessDecoder V2 pretraining (training-only base for A/B architecture experiments)."
+description = "Search agent: RL over a frozen chess oracle (probe-any-board grammar)."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
