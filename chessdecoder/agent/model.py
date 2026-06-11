@@ -10,6 +10,8 @@ stream lengths.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,16 +56,56 @@ class AgentDecoder(nn.Module):
         self.norm = RMSNorm(dim=embed_dim)
 
     def forward(self, ids: torch.Tensor,
-                input_pos: torch.Tensor | None = None) -> torch.Tensor:
+                input_pos: torch.Tensor | None = None,
+                mask: torch.Tensor | None = None) -> torch.Tensor:
         """ids [B,S] int64, input_pos [B,S] (RoPE positions; defaults to
-        arange). Returns hidden [B,S,E]."""
+        arange). Returns hidden [B,S,E]. With KV caches enabled (see
+        setup_caches) an explicit bool mask [B,S,cache_len] is mandatory:
+        the cache buffer is full-length and zero-padded, and attending the
+        zeros dilutes attention weights."""
         b, s = ids.shape
         if input_pos is None:
             input_pos = torch.arange(s, device=ids.device).unsqueeze(0).expand(b, -1)
         h = self.tok_embedding(ids)
         for layer in self.layers:
-            h = layer(h, mask=None, input_pos=input_pos)   # is_causal -> flash
+            h = layer(h, mask=mask, input_pos=input_pos)   # is_causal -> flash
         return self.norm(h)
+
+    # -- KV-cache management (rollout engine) --------------------------------
+    def setup_caches(self, batch_size: int, dtype: torch.dtype,
+                     max_seq_len: int) -> None:
+        dev = self.tok_embedding.weight.device
+        with dev:                       # torchtune allocates on default device
+            for layer in self.layers:
+                layer.setup_caches(batch_size, dtype,
+                                   encoder_max_seq_len=None,
+                                   decoder_max_seq_len=max_seq_len)
+
+    def caches_are_enabled(self) -> bool:
+        return self.layers[0].caches_are_enabled()
+
+    def reset_caches(self) -> None:
+        for layer in self.layers:
+            layer.reset_cache()
+
+    @contextmanager
+    def caches_disabled(self):
+        """Plain causal forwards (teacher-forced) while caches stay set up.
+
+        kv_cache must be nulled, not just disabled: torchtune gates is_causal
+        on ``kv_cache is None and mask is None`` — with caches merely set up,
+        a mask=None forward silently runs BIDIRECTIONAL."""
+        saved = []
+        for layer in self.layers:
+            saved.append((layer.attn.kv_cache, layer.attn.cache_enabled))
+            layer.attn.kv_cache = None
+            layer.attn.cache_enabled = False
+        try:
+            yield
+        finally:
+            for layer, (kc, en) in zip(self.layers, saved):
+                layer.attn.kv_cache = kc
+                layer.attn.cache_enabled = en
 
     def logits_at(self, hidden_flat: torch.Tensor) -> torch.Tensor:
         """Tied unembedding on selected positions only. hidden_flat [N,E] ->
