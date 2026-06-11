@@ -75,6 +75,9 @@ class AgentDecoder(nn.Module):
     def setup_caches(self, batch_size: int, dtype: torch.dtype,
                      max_seq_len: int) -> None:
         dev = self.tok_embedding.weight.device
+        for layer in self.layers:       # torchtune skips setup if a cache
+            layer.attn.kv_cache = None  # exists — force a rebuild
+            layer.attn.cache_enabled = False
         with dev:                       # torchtune allocates on default device
             for layer in self.layers:
                 layer.setup_caches(batch_size, dtype,
