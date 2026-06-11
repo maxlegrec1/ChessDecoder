@@ -150,7 +150,11 @@ def search_batch(engine: OracleEngine, roots: list[chess.Board],
     out = []
     for t in trees:
         r = t.nodes[0]
-        q = np.where(r.N > 0, r.W / np.maximum(r.N, 1), -1.0)
+        # unvisited root moves: "worse than anything explored", not a -1.0
+        # cliff (the rewarder reads these q's; a cliff distorts regret scale)
+        vis = r.N > 0
+        floor = float((r.W[vis] / r.N[vis]).min()) - 0.1 if vis.any() else -1.0
+        q = np.where(vis, r.W / np.maximum(r.N, 1), max(-1.0, floor))
         bi = int(np.argmax(r.N + q))           # visits, Q breaks ties
         out.append(QRefResult(
             fen=t.root_board.fen(), moves=r.moves,
