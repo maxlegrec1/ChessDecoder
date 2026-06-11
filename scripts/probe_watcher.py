@@ -12,7 +12,7 @@ import time
 
 import wandb
 
-RUN_GLOB = "checkpoints/agent_pretrain_v2/*/agent_*.pt"
+RUN_GLOB = "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_[12]*/agent_*.pt"
 CSV = "agent_data/probe_results.csv"
 POLL_S = 600
 
@@ -25,8 +25,8 @@ else:
     with open(CSV, "w") as f:
         csv.writer(f).writerow(["ckpt", "step", "acc", "mae"])
 
-run = wandb.init(project="search-agent", name="king-probe",
-                 id="king-probe-v2", resume="allow")
+run = wandb.init(project="search-agent", name="king-probe-scratch",
+                 id="king-probe-v3", resume="allow")
 
 while True:
     cks = [c for c in glob.glob(RUN_GLOB) if not c.endswith("latest_full.pt")]

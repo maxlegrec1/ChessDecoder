@@ -10,7 +10,7 @@ data:
   paired_glob: "agent_data/paired_labels_train_*.parquet"
   val_paired_glob: "agent_data/paired_labels_val.parquet"
   batch_size: 8
-  num_workers: 1   # 15GiB box: coexist with the probe watcher
+  num_workers: 1   # 15GiB box: stay conservative on RAM
   val_streams: 144
 
 task_mix:
@@ -45,11 +45,11 @@ training:
   weight_decay: 0.01
   grad_clip: 1.0
   warmup_steps: 500
-  max_steps: 200000
+  max_steps: 50000
   log_every_n_steps: 50
   val_every_n_steps: 1000
   save_every_n_steps: 5000
   compile: true
   checkpoint_dir: "checkpoints/agent_pretrain_v2/"
   seed: 42
-  resume_from: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_021209/agent_latest_full.pt"
+  resume_from: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_144726/agent_latest_full.pt"
