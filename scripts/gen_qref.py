@@ -30,7 +30,7 @@ def main():
     args = ap.parse_args()
 
     from chessdecoder.agent.rl.oracle_engine import OracleEngine
-    from chessdecoder.agent.rl.qref import search_batch
+    from chessdecoder.agent.rl.qref import search_batch_cpp as search_batch
 
     os.makedirs(OUT_DIR, exist_ok=True)
     engine = OracleEngine()
@@ -47,7 +47,7 @@ def main():
         shard = shards[rng.integers(len(shards))]
         df = pd.read_parquet(shard, columns=["fen", "best_move", "root_q",
                                              "orig_q"])
-        w = 0.05 + (df.root_q - df.orig_q).abs()
+        w = (0.05 + (df.root_q - df.orig_q).abs()).fillna(0.0)
         idx = rng.choice(len(df), size=min(50_000, len(df)), replace=False,
                          p=(w / w.sum()).values)
         df = df.iloc[idx]

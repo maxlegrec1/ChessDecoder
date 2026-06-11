@@ -162,3 +162,49 @@ def search_batch(engine: OracleEngine, roots: list[chess.Board],
             oracle_greedy=r.moves[int(np.argmax(r.P))],
             search_best=r.moves[bi]))
     return out
+
+
+# -- C++ engine (chessdecoder/cpp/puct) --------------------------------------
+_cpp_ready = False
+
+
+def _init_cpp() -> None:
+    global _cpp_ready
+    if _cpp_ready:
+        return
+    import _puct_cpp
+    from chessdecoder.models.vocab import move_token_to_idx
+    from chessdecoder.dataloader import loader as L
+    consts = {"start": L._START_IDX, "end": L._END_IDX,
+              "empty": L._EMPTY_IDX, "wtm": L._WTM_IDX, "btm": L._BTM_IDX,
+              "nocastle": L._NO_CASTLE_IDX}
+    for ch, tok in L._PIECE_IDX.items():
+        consts[ch] = int(tok)
+    _puct_cpp.init_maps(dict(move_token_to_idx),
+                        {k: int(v) for k, v in consts.items()},
+                        {k: int(v) for k, v in L._CASTLE_IDX.items()})
+    _cpp_ready = True
+
+
+def search_batch_cpp(engine: OracleEngine, roots: list[chess.Board],
+                     sims: int = 800) -> list[QRefResult]:
+    """C++ trees, python GPU eval. Same semantics as search_batch (the
+    first wave is the root expansion, then `sims` PUCT waves)."""
+    import _puct_cpp
+    _init_cpp()
+    t = _puct_cpp.BatchedPuct([b.fen() for b in roots])
+    for _ in range(sims + 1):
+        idx, ids = t.select()
+        if idx:
+            q, _, pol = engine.eval_ids(ids)
+            t.expand_backup(idx,
+                            q.float().cpu().numpy(),
+                            pol.float().cpu().numpy())
+    out = []
+    for b, (moves, q, vis, greedy, best) in zip(roots, t.results()):
+        moves = list(moves)
+        out.append(QRefResult(
+            fen=b.fen(), moves=moves, q=[float(x) for x in q],
+            visits=[int(x) for x in vis], oracle_greedy=moves[greedy],
+            search_best=moves[best]))
+    return out

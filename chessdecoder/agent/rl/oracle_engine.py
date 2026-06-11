@@ -111,8 +111,15 @@ class OracleEngine:
         ids = np.empty((len(fens), 68), dtype=np.int32)
         for i, f in enumerate(fens):
             fen_to_ids(f, ids[i])
+        return self.eval_ids(ids)
+
+    @torch.no_grad()
+    def eval_ids(self, ids: np.ndarray) -> tuple[torch.Tensor, torch.Tensor,
+                                                 torch.Tensor]:
+        """Like eval_batch but takes pre-encoded [N,68] int32 board ids
+        (the C++ PUCT encodes boards itself)."""
         pol, wdl = self._forward_padded(ids)
-        self.n_queries += len(fens)
+        self.n_queries += ids.shape[0]
         return wdl[:, 0] - wdl[:, 2], wdl[:, 1], pol
 
     @torch.no_grad()

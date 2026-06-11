@@ -2,7 +2,14 @@
 the rollout process — never a separate service (reward = table lookup).
 
 R = Q_ref(root, a_agent) - max_a Q_ref(root, a)      (regret, <= 0)
+    + corpus_bonus * 1[a_agent == corpus_best]        (sparse, default 0.1)
     - invalid_eps * probes_invalid                    (config, default 0.01)
+
+The sparse term defers to the STRONGER external judge (lc0 ~400-visit
+search of a big net) on close calls: measured on 8k roots, judges disagree
+30.6% of the time with a Q_ref gap of p50=0.037 / p75=0.10, so bonus=0.1
+makes corpus_best win the within-group comparison in ~75% of disagreements
+while large gaps (oracle-verifiable refutations) still override the label.
 
 Metrics attached per episode (consumed by the trainer's wandb writer):
 beat_greedy (Q_ref(a_agent) > Q_ref(oracle_greedy)), match_search_best,
@@ -24,6 +31,17 @@ QREF_DIR = "agent_data/qref"
 
 def _key(fen: str) -> str:
     return fen.rsplit(" ", 2)[0]
+
+
+_LC0_CASTLE = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
+
+
+def _norm_corpus_best(cb, moves) -> str | None:
+    """Corpus moves use lc0 castling spelling; normalize to our uci list."""
+    if cb in moves:
+        return cb
+    alt = _LC0_CASTLE.get(cb)
+    return alt if alt in moves else None
 
 
 @dataclass
@@ -51,10 +69,12 @@ class QRefTable:
                 continue
             df = pd.read_parquet(f)
             for r in df.itertuples(index=False):
+                moves = list(r.moves)
                 self._table[_key(r.fen)] = RootRef(
-                    moves=list(r.moves), q=np.asarray(r.q, dtype=np.float32),
+                    moves=moves, q=np.asarray(r.q, dtype=np.float32),
                     oracle_greedy=r.oracle_greedy, search_best=r.search_best,
-                    corpus_best=getattr(r, "corpus_best", None),
+                    corpus_best=_norm_corpus_best(
+                        getattr(r, "corpus_best", None), moves),
                     sensitive=bool(getattr(r, "search_sensitive", False)))
                 added += 1
             self._loaded.add(f)
@@ -91,7 +111,8 @@ def move_id_to_uci(root: chess.Board, move_id: int) -> str | None:
 
 
 def score_episode(ep, ref: RootRef, root: chess.Board,
-                  invalid_eps: float = 0.01) -> dict:
+                  invalid_eps: float = 0.01,
+                  corpus_bonus: float = 0.0) -> dict:
     """Returns reward + metrics. ep: rl.episodes.Episode (final_move set)."""
     uci = move_id_to_uci(root, ep.final_move)
     assert uci is not None, "grammar guarantees a legal final move"
@@ -101,6 +122,8 @@ def score_episode(ep, ref: RootRef, root: chess.Board,
     ig = ref.moves.index(ref.oracle_greedy)
     q_greedy = float(ref.q[ig])
     reward = (q_agent - q_best) - invalid_eps * ep.probes_invalid
+    if corpus_bonus and uci == ref.corpus_best:
+        reward += corpus_bonus
     return dict(
         reward=reward,
         regret=q_agent - q_best,

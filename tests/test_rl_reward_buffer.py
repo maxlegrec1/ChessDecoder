@@ -125,3 +125,25 @@ def test_batch_positions_synthetic():
     # advantages: episode 0 (R=0.0) positive, episode 1 negative, broadcast
     assert adv[0] == adv[1] and adv[2] == adv[3]
     assert adv[0] > 0 > adv[2]
+
+
+def test_corpus_bonus():
+    """Sparse bonus tips near-ties toward the external judge; large Q_ref
+    gaps still override it. Also castling-spelling normalization."""
+    from chessdecoder.agent.rl.reward import _norm_corpus_best
+    ref = _ref()                      # corpus_best = e2e4 (also search best)
+    e, root = _ep("e2e4")
+    s = score_episode(e, ref, root, corpus_bonus=0.1)
+    assert s["reward"] == pytest.approx(0.1)        # regret 0 + bonus
+    e, root = _ep("d2d4")
+    s = score_episode(e, ref, root, corpus_bonus=0.1)
+    assert s["reward"] == pytest.approx(-0.20)      # no bonus, regret only
+    # exchange rate: corpus_best with regret -0.05 nets +0.05 > search_best 0
+    ref2 = _ref()
+    ref2.corpus_best = "d2d4"
+    ref2.q = np.array([0.30, 0.25, -0.05], dtype=np.float32)
+    e, root = _ep("d2d4")
+    s = score_episode(e, ref2, root, corpus_bonus=0.1)
+    assert s["reward"] == pytest.approx(0.05)
+    assert _norm_corpus_best("e1h1", ["e1g1", "a2a3"]) == "e1g1"
+    assert _norm_corpus_best("e7e5", ["e1g1", "a2a3"]) is None

@@ -46,3 +46,37 @@ def test_q_monotone_with_sims(engine):
         r = search_batch(engine, [b], sims=sims)[0]
         i = r.moves.index(r.search_best)
         assert r.q[i] > 0.3, f"sims={sims}: q {r.q[i]}"
+
+
+def test_cpp_mate_in_1(engine):
+    from chessdecoder.agent.rl.qref import search_batch_cpp
+    roots = [chess.Board(f) for f, _ in MATE_IN_1]
+    res = search_batch_cpp(engine, roots, sims=200)
+    for (fen, mate), r in zip(MATE_IN_1, res):
+        assert r.search_best == mate, f"{fen}: best {r.search_best} != {mate}"
+        i = r.moves.index(mate)
+        assert r.q[i] > 0.95, f"{fen}: mate Q {r.q[i]}"
+
+
+def test_cpp_python_parity(engine):
+    """Same roots, both engines: search_best agree on >=80% (bf16 batch
+    jitter lets trees diverge on near-ties), greedy move identical, visit
+    counts sum to sims."""
+    import glob
+
+    import pandas as pd
+    from chessdecoder.agent.rl.qref import search_batch, search_batch_cpp
+    f = sorted(glob.glob("/mnt/2tb_2/decoder/parquet_files_decoder/*.parquet"))[-1]
+    fens = pd.read_parquet(f, columns=["fen"]).fen.drop_duplicates().head(64)
+    roots = [chess.Board(x) for x in fens
+             if not chess.Board(x).is_game_over()][:48]
+    rp = search_batch(engine, roots, sims=200)
+    rc = search_batch_cpp(engine, roots, sims=200)
+    agree_best = greedy_same = 0
+    for a, b in zip(rp, rc):
+        assert sum(b.visits) == 200, f"visits {sum(b.visits)} != 200"
+        assert set(a.moves) == set(b.moves)
+        agree_best += a.search_best == b.search_best
+        greedy_same += a.oracle_greedy == b.oracle_greedy
+    assert greedy_same >= len(roots) * 0.95, f"greedy {greedy_same}/{len(roots)}"
+    assert agree_best >= len(roots) * 0.8, f"best {agree_best}/{len(roots)}"

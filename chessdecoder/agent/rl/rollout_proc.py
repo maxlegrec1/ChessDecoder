@@ -81,7 +81,8 @@ def main(cfg_path: str):
             grp = eps[gi * G:(gi + 1) * G]
             ref = qref.get(grp[0].root_fen)
             scores = [score_episode(e, ref, chess.Board(e.root_fen),
-                                    invalid_eps=cfg["invalid_eps"])
+                                    invalid_eps=cfg["invalid_eps"],
+                                    corpus_bonus=cfg.get("corpus_bonus", 0.0))
                       for e in grp]
             L = len(grp[0].ids)
             buf.write(dict(
