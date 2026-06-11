@@ -87,7 +87,11 @@ def _expand(node: _Node, board: chess.Board, q: float,
     for j, g in enumerate(gids):
         if g not in best or lg[j] > lg[best[g]]:
             best[g] = j
-    sel = [best[g] for g in range(len(moves))]
+    # moves with no vocab key (rare) are unplayable for the agent too:
+    # exclude them from the search rather than crash
+    keep = [g for g in range(len(moves)) if g in best]
+    sel = [best[g] for g in keep]
+    moves = [moves[g] for g in keep]
     pri = torch.softmax(lg[sel], 0).numpy()
     node.moves = [m.uci() for m in moves]
     node.child = [-1] * len(moves)
