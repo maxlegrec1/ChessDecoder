@@ -58,7 +58,7 @@ def build_dataset():
 @torch.no_grad()
 def extract(model, ids):
     feats = []
-    for i in range(0, len(ids), 1024):
+    for i in range(0, len(ids), 256):
         chunk = ids[i:i + 1024].to(DEV)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             h = model(chunk)
