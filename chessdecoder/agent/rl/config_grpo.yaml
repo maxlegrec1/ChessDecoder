@@ -1,0 +1,41 @@
+# Online GRPO vs the frozen oracle — two processes share this file.
+# Launch:
+#   systemd-run ... python -m chessdecoder.agent.rl.rollout_proc <this file>
+#   systemd-run ... python -m chessdecoder.agent.rl.grpo        <this file>
+project_name: "search-agent"
+run_name: "grpo-v1"
+
+rollout:
+  base_ckpt: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_231151/agent_50000.pt"
+  qref_dir: "agent_data/qref"
+  buffer_dir: "/dev/shm/grpo_buffer"
+  weights_dir: "/dev/shm/grpo_weights"
+  min_roots: 20000          # wait for the qref producer before starting
+  batch_size: 128           # episodes per lockstep batch
+  group_size: 8             # G episodes per root (GRPO group)
+  probe_budget: 16          # K
+  temperature: 1.0
+  sensitive_frac: 0.7       # fraction of roots that are search-sensitive
+  invalid_eps: 0.01         # reward penalty per invalid probe
+  buffer_max_depth: 64      # backpressure: stop generating beyond this
+  seed: 0
+
+trainer:
+  base_ckpt: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_231151/agent_50000.pt"
+  buffer_dir: "/dev/shm/grpo_buffer"
+  weights_dir: "/dev/shm/grpo_weights"
+  checkpoint_dir: "checkpoints/agent_grpo_v1"
+  optimizer: "muon"
+  learning_rate: 3.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  clip_eps: 0.2
+  ent_coef: 0.003
+  groups_per_step: 16       # groups consumed per optimizer step
+  min_buffer_groups: 8
+  max_staleness: 3          # drop groups older than this many versions
+  sync_every: 4             # publish weights every N steps
+  trainer_wait_s: 0.0       # artificial wait → GPU share for rollouts
+  ckpt_every: 200
+  max_steps: 100000
+  seed: 0

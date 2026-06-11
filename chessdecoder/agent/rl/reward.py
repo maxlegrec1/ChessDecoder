@@ -33,6 +33,7 @@ class RootRef:
     oracle_greedy: str
     search_best: str
     corpus_best: str | None
+    sensitive: bool = False
 
 
 class QRefTable:
@@ -53,7 +54,8 @@ class QRefTable:
                 self._table[_key(r.fen)] = RootRef(
                     moves=list(r.moves), q=np.asarray(r.q, dtype=np.float32),
                     oracle_greedy=r.oracle_greedy, search_best=r.search_best,
-                    corpus_best=getattr(r, "corpus_best", None))
+                    corpus_best=getattr(r, "corpus_best", None),
+                    sensitive=bool(getattr(r, "search_sensitive", False)))
                 added += 1
             self._loaded.add(f)
         return added
@@ -69,6 +71,13 @@ class QRefTable:
 
     def roots(self) -> list[str]:
         return list(self._table.keys())
+
+    def split_roots(self) -> tuple[list[str], list[str]]:
+        """(search-sensitive keys, quiet keys)."""
+        s, q = [], []
+        for k, v in self._table.items():
+            (s if v.sensitive else q).append(k)
+        return s, q
 
 
 def move_id_to_uci(root: chess.Board, move_id: int) -> str | None:

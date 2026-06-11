@@ -91,3 +91,37 @@ def test_weight_publish(tmp_path):
     sd2, v = out
     assert v == 3 and sd2["w"].dtype == torch.bfloat16
     assert torch.allclose(sd2["w"].float(), sd["w"], atol=0.01)
+
+
+def test_batch_positions_synthetic():
+    """Trainer batch assembly on a synthetic 2-episode group: shapes, mask
+    rows, advantage broadcast, zero-variance skip."""
+    from chessdecoder.agent.rl.grpo import _batch_positions
+    from chessdecoder.agent.rl.episodes import PREFIX_LEN
+
+    root = chess.Board()
+    # minimal episode: prefix + <answer> move  (k_budget=1, no probes)
+    mv = next(iter(root.legal_moves))
+    mid = pv.MOVE_TO_ID[pv.move_keys(root, mv)[0]]
+    ids = ([pv.ROOT] + pv.encode_board(root)
+           + [pv.ORACLE, pv.QBIN_BASE, pv.DBIN_BASE, mid, mid, mid, mid]
+           + [pv.num_token(1)] + [pv.ANSWER, mid])
+    assert len(ids) == PREFIX_LEN + 2
+    g = dict(root_fen=root.fen(), version=1, temperature=1.0, k_budget=1,
+             ids=torch.tensor([ids, ids], dtype=torch.int32),
+             logprobs=torch.zeros(2, len(ids)),
+             agent=torch.zeros(2, len(ids), dtype=torch.bool),
+             rewards=torch.tensor([0.0, -0.5]),
+             metrics=[], gen_seconds=0.0, tokens=0)
+    zero_g = dict(g, rewards=torch.tensor([-0.1, -0.1]))
+    out = _batch_positions([g, zero_g])
+    ids_t, pos_b, pos_t, masks, adv, beh, n_eps, zero_var = out
+    assert zero_var == 1 and n_eps == 2
+    assert pos_t.tolist() == [PREFIX_LEN, PREFIX_LEN + 1] * 2
+    assert masks.shape[1] == pv.VOCAB_SIZE
+    # verb mask row then legal-move row, per episode
+    assert masks[0][pv.ANSWER] and masks[0][pv.PROBE]
+    assert masks[1][mid] and not masks[1][pv.ANSWER]
+    # advantages: episode 0 (R=0.0) positive, episode 1 negative, broadcast
+    assert adv[0] == adv[1] and adv[2] == adv[3]
+    assert adv[0] > 0 > adv[2]
