@@ -6,11 +6,11 @@ project_name: "search-agent"
 run_name: "grpo-v1"
 
 rollout:
-  base_ckpt: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_231151/agent_50000.pt"
+  base_ckpt: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_144726/agent_35000.pt"
   qref_dir: "agent_data/qref"
   buffer_dir: "/dev/shm/grpo_buffer"
   weights_dir: "/dev/shm/grpo_weights"
-  min_roots: 20000          # wait for the qref producer before starting
+  min_roots: 8000           # table keeps growing during training
   batch_size: 128           # episodes per lockstep batch
   group_size: 8             # G episodes per root (GRPO group)
   probe_budget: 16          # K
@@ -21,7 +21,7 @@ rollout:
   seed: 0
 
 trainer:
-  base_ckpt: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_231151/agent_50000.pt"
+  base_ckpt: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_144726/agent_35000.pt"
   buffer_dir: "/dev/shm/grpo_buffer"
   weights_dir: "/dev/shm/grpo_weights"
   checkpoint_dir: "checkpoints/agent_grpo_v1"
@@ -30,9 +30,9 @@ trainer:
   weight_decay: 0.0
   grad_clip: 1.0
   clip_eps: 0.2
-  ent_coef: 0.003
-  groups_per_step: 16       # groups consumed per optimizer step
-  min_buffer_groups: 8
+  ent_coef: 0.01
+  groups_per_step: 4        # groups per optimizer step ([P,V] logits memory bound)
+  min_buffer_groups: 4
   max_staleness: 3          # drop groups older than this many versions
   sync_every: 4             # publish weights every N steps
   trainer_wait_s: 0.0       # artificial wait → GPU share for rollouts

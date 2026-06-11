@@ -1,0 +1,39 @@
+# GRPO overfit smoke: small fixed root pool, expect reward/beat_greedy to
+# climb within a few hundred steps. Validates the full 3-process loop.
+project_name: "search-agent"
+run_name: "grpo-smoke"
+
+rollout:
+  base_ckpt: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_144726/agent_35000.pt"
+  qref_dir: "agent_data/qref"
+  buffer_dir: "/dev/shm/grpo_smoke_buffer"
+  weights_dir: "/dev/shm/grpo_smoke_weights"
+  min_roots: 1000
+  batch_size: 128
+  group_size: 8
+  probe_budget: 8
+  temperature: 1.0
+  sensitive_frac: 0.7
+  invalid_eps: 0.01
+  buffer_max_depth: 64
+  seed: 0
+
+trainer:
+  base_ckpt: "checkpoints/agent_pretrain_v2/pretrain-v2_20260611_144726/agent_35000.pt"
+  buffer_dir: "/dev/shm/grpo_smoke_buffer"
+  weights_dir: "/dev/shm/grpo_smoke_weights"
+  checkpoint_dir: "checkpoints/agent_grpo_smoke"
+  optimizer: "muon"
+  learning_rate: 3.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  clip_eps: 0.2
+  ent_coef: 0.003
+  groups_per_step: 4
+  min_buffer_groups: 4
+  max_staleness: 3
+  sync_every: 4
+  trainer_wait_s: 0.0
+  ckpt_every: 100
+  max_steps: 400
+  seed: 0
