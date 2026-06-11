@@ -59,7 +59,7 @@ def build_dataset():
 def extract(model, ids):
     feats = []
     for i in range(0, len(ids), 256):
-        chunk = ids[i:i + 1024].to(DEV)
+        chunk = ids[i:i + 256].to(DEV)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             h = model(chunk)
         if POOL == "mean":
