@@ -101,7 +101,7 @@ def main():
         print("building probe dataset (held-out shard)...", flush=True)
         ids, ys = build_dataset()
         torch.save({"ids": ids, "ys": ys}, CACHE)
-    maj = ys[N_TRAIN:].bincount().max().item() / N_TEST
+    maj = ys[N_TRAIN:].bincount().max().item() / len(ys[N_TRAIN:])
     print(f"labels: dist={ys.bincount().tolist()}  majority-baseline={maj:.3f}",
           flush=True)
     for ckpt in sys.argv[1:]:
