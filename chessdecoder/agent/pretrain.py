@@ -100,10 +100,20 @@ def train():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"AgentDecoder: {n_params/1e6:.1f}M params", flush=True)
 
+    # Mix the resume step into the stream seed: otherwise every relaunch
+    # replays the identical example sequence from the workers' deterministic
+    # start (-> train-metric memorization bumps after each resume).
+    _resume_nonce = 0
+    if tc.get("resume_from"):
+        try:
+            _resume_nonce = torch.load(tc["resume_from"], map_location="cpu",
+                                       weights_only=False)["step"]
+        except Exception:
+            pass
     ds = AgentTaskDataset(dc["parquet_dir"], dc["label_glob"],
                           paired_glob=dc.get("paired_glob", ""),
                           task_mix=config.get("task_mix"),
-                          seed=tc.get("seed", 42))
+                          seed=tc.get("seed", 42) + _resume_nonce)
     loader = DataLoader(ds, batch_size=dc["batch_size"],
                         num_workers=dc["num_workers"], pin_memory=True,
                         prefetch_factor=2 if dc["num_workers"] else None)
