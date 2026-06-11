@@ -35,10 +35,15 @@ while True:
         if ck in seen:
             continue
         import sys
-        out = subprocess.run(
+        r = subprocess.run(
             [sys.executable, "scripts/probe_king_moves.py", ck],
             capture_output=True, text=True,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"}).stdout
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"})
+        if r.returncode != 0:
+            print(f"probe FAILED for {ck} (rc={r.returncode}):\n"
+                  + r.stderr[-2000:], flush=True)
+            continue                      # retry on next poll
+        out = r.stdout
         for line in out.splitlines():
             if line.startswith("PROBE step="):
                 step = int(line.split("step=")[1].split(":")[0])
