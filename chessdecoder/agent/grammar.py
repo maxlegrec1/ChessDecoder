@@ -52,9 +52,11 @@ def board_slot_mask(slot: int) -> torch.Tensor:
 class EpisodeGrammar:
     """Per-episode decoding state. The harness owns one per live episode."""
 
-    def __init__(self, root: chess.Board, budget: int):
+    def __init__(self, root: chess.Board, budget: int, min_probes: int = 0):
         self.root = root
         self.budget = budget
+        self.min_probes = min(min_probes, budget)
+        self.used = 0
         self.state = S.VERB
         self.slot = 0
         self._legal_root_mask = torch.zeros(pv.VOCAB_SIZE, dtype=torch.bool)
@@ -69,7 +71,8 @@ class EpisodeGrammar:
             m = torch.zeros(pv.VOCAB_SIZE, dtype=torch.bool)
             if self.budget > 0:
                 m[pv.PROBE] = True
-            m[pv.ANSWER] = True
+            if self.used >= self.min_probes:
+                m[pv.ANSWER] = True
             return m
         if self.state == S.BOARD:
             return board_slot_mask(self.slot)
@@ -99,3 +102,4 @@ class EpisodeGrammar:
     def on_probe_resolved(self) -> None:
         """Harness calls this after injecting the oracle reply / <invalid>."""
         self.budget -= 1
+        self.used += 1

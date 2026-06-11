@@ -43,6 +43,7 @@ ANSWER_MV = -2
 class Episode:
     root_fen: str
     k_budget: int
+    min_probes: int = 0
     ids: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)   # behavior logprobs
     agent: list[bool] = field(default_factory=list)        # agent-emitted?
@@ -52,33 +53,37 @@ class Episode:
     done: bool = False
 
 
-def replay(ids: list[int], root_fen: str,
-           k_budget: int) -> list[tuple[int, int, int]]:
-    """Parse a finished episode -> [(position, mask_kind, budget_left)] for
-    every agent-emitted position. mask_kind: VERB (-1), ANSWER_MV (-2), or
-    board slot index 0..18. budget_left is the remaining probe budget when
-    that token was sampled (needed to rebuild VERB masks exactly). Raises on
-    malformed episodes (engine bug)."""
+def replay(ids: list[int], root_fen: str, k_budget: int,
+           min_probes: int = 0) -> list[tuple[int, int, int, bool]]:
+    """Parse a finished episode -> [(position, mask_kind, budget_left,
+    answer_ok)] for every agent-emitted position. mask_kind: VERB (-1),
+    ANSWER_MV (-2), or board slot index 0..18. budget_left / answer_ok
+    rebuild the exact VERB mask (answer_ok = min-probe quota met). Raises
+    on malformed episodes (engine bug)."""
     out = []
     pos = PREFIX_LEN
     budget = k_budget
+    used = 0
+    min_p = min(min_probes, k_budget)
     while pos < len(ids):
         t = ids[pos]
         if t == pv.PAD:                       # trailing pad after answer
             pos += 1
             continue
-        out.append((pos, VERB, budget))
+        out.append((pos, VERB, budget, used >= min_p))
         if t == pv.PROBE:
             assert budget > 0, "probe after budget exhausted"
             for s in range(pv.BOARD_LEN):
-                out.append((pos + 1 + s, s, budget))
+                out.append((pos + 1 + s, s, budget, True))
             pos += PROBE_TOKENS
             r = ids[pos]
             assert r in (pv.ORACLE, pv.INVALID), f"bad reply token {r}"
             pos += REPLY_TOKENS
             budget -= 1
+            used += 1
         elif t == pv.ANSWER:
-            out.append((pos + 1, ANSWER_MV, budget))
+            assert used >= min_p, "answer before min-probe quota"
+            out.append((pos + 1, ANSWER_MV, budget, True))
             pos += ANSWER_TOKENS
         else:
             raise AssertionError(f"bad verb token {t} at {pos}")
@@ -102,9 +107,10 @@ def mask_for(kind: int, grammar_or_root) -> torch.Tensor:
     return board_slot_mask(kind)
 
 
-def verb_mask(budget: int) -> torch.Tensor:
+def verb_mask(budget: int, answer_ok: bool = True) -> torch.Tensor:
     m = torch.zeros(pv.VOCAB_SIZE, dtype=torch.bool)
     if budget > 0:
         m[pv.PROBE] = True
-    m[pv.ANSWER] = True
+    if answer_ok:
+        m[pv.ANSWER] = True
     return m

@@ -39,9 +39,11 @@ def _legal_mask(root: chess.Board) -> torch.Tensor:
     return m
 
 
-# static mask table rows: 0..18 board slots, 19 = verb(budget>0), 20 = verb(0)
+# static mask table rows: 0..18 board slots, then verb variants
+# 19 = probe+answer, 20 = answer only, 21 = probe only (min quota unmet)
 _STATIC = torch.stack([board_slot_mask(s) for s in range(pv.BOARD_LEN)]
-                      + [verb_mask(1), verb_mask(0)])
+                      + [verb_mask(1, True), verb_mask(0, True),
+                         verb_mask(1, False)])
 
 
 def _batch_positions(groups: list[dict]):
@@ -66,7 +68,9 @@ def _batch_positions(groups: list[dict]):
             ids = g["ids"][e].tolist()
             b = len(eps_ids)
             eps_ids.append(g["ids"][e])
-            for p, kind, budget in replay(ids, g["root_fen"], g["k_budget"]):
+            for p, kind, budget, ans_ok in replay(
+                    ids, g["root_fen"], g["k_budget"],
+                    g.get("min_probes", 0)):
                 pos_b.append(b)
                 pos_t.append(p)
                 beh.append(float(g["logprobs"][e][p]))
@@ -74,7 +78,7 @@ def _batch_positions(groups: list[dict]):
                 if kind == ANSWER_MV:
                     rows.append(len(masks_extra) + _STATIC.shape[0])
                 elif kind == VERB:
-                    rows.append(19 if budget > 0 else 20)
+                    rows.append((19 if ans_ok else 21) if budget > 0 else 20)
                 else:
                     rows.append(kind)
         masks_extra.append(legal)

@@ -73,8 +73,11 @@ def main(cfg_path: str):
         keys += list(rng.choice(quiet or sens,
                                 size=n_groups - len(keys), replace=False))
         roots = [chess.Board(k + " 0 1") for k in keys for _ in range(G)]
+        mp_choices = cfg.get("min_probes_choices", [0])
+        group_mp = [int(rng.choice(mp_choices)) for _ in range(n_groups)]
+        mps = [mp for mp in group_mp for _ in range(G)]
         t0 = time.perf_counter()
-        eps = engine.rollout(roots)
+        eps = engine.rollout(roots, min_probes=mps)
         dt = time.perf_counter() - t0
 
         for gi in range(n_groups):
@@ -90,6 +93,7 @@ def main(cfg_path: str):
                 version=version,
                 temperature=cfg["temperature"],
                 k_budget=grp[0].k_budget,
+                min_probes=group_mp[gi],
                 ids=torch.tensor([e.ids for e in grp], dtype=torch.int32),
                 logprobs=torch.tensor([e.logprobs for e in grp]),
                 agent=torch.tensor([e.agent for e in grp]),

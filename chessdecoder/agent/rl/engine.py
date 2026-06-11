@@ -63,15 +63,19 @@ class RolloutEngine:
     @torch.no_grad()
     def rollout(self, roots: list[chess.Board],
                 k_budgets: list[int] | None = None,
+                min_probes: list[int] | None = None,
                 greedy: bool = False) -> list[Episode]:
         """One lockstep batch of episodes. len(roots) must equal B (repeat
-        roots G times upstream for GRPO groups)."""
+        roots G times upstream for GRPO groups). min_probes[i] masks
+        <answer> until that many probes are used (probe-collapse counter)."""
         assert len(roots) == self.B
         ks = k_budgets or [self.K] * self.B
+        mps = min_probes or [0] * self.B
         replies = self.oracle.query_batch(roots)
-        eps = [Episode(root_fen=b.fen(), k_budget=k)
-               for b, k in zip(roots, ks)]
-        grams = [EpisodeGrammar(b, k) for b, k in zip(roots, ks)]
+        eps = [Episode(root_fen=b.fen(), k_budget=k, min_probes=mp)
+               for b, k, mp in zip(roots, ks, mps)]
+        grams = [EpisodeGrammar(b, k, mp)
+                 for b, k, mp in zip(roots, ks, mps)]
         queues: list[list[int]] = [[] for _ in range(self.B)]   # pending injections
         pend_board: list[list[int] | None] = [None] * self.B    # probe slots buf
 

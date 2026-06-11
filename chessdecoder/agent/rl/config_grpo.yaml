@@ -14,6 +14,7 @@ rollout:
   batch_size: 128           # episodes per lockstep batch
   group_size: 8             # G episodes per root (GRPO group)
   probe_budget: 16          # K
+  min_probes_choices: [0, 2, 4, 8]   # per-group <answer> quota (anti probe-collapse)
   temperature: 1.0
   sensitive_frac: 0.7       # fraction of roots that are search-sensitive
   invalid_eps: 0.01         # reward penalty per invalid probe
