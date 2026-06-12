@@ -18,7 +18,7 @@ rollout:
   temperature: 1.0
   sensitive_frac: 0.7       # fraction of roots that are search-sensitive
   invalid_eps: 0.01         # reward penalty per invalid probe
-  corpus_bonus: 0.1         # sparse bonus for matching the lc0 corpus best move
+  corpus_bonus: 0.15        # sparse bonus for matching the lc0 corpus best move
   buffer_max_depth: 64      # backpressure: stop generating beyond this
   seed: 0
 
