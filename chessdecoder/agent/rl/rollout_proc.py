@@ -9,6 +9,7 @@ buffer is deeper than buffer_max_depth.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -34,7 +35,13 @@ def load_model(ckpt: str) -> AgentDecoder:
 
 def main(cfg_path: str):
     cfg = yaml.safe_load(open(cfg_path))["rollout"]
-    torch.manual_seed(cfg.get("seed", 0))
+    # salt the seed per process start: a fixed seed replays the same root
+    # sequence after every restart (same bug class as the pretrain resume
+    # memorization bump), triple-sampling early roots across segments
+    salt = (os.getpid() * 31 + int(time.time())) % 1_000_000
+    seed = cfg.get("seed", 0) + salt
+    print(f"rollout seed {seed} (salt {salt})", flush=True)
+    torch.manual_seed(seed)
     model = load_model(cfg["base_ckpt"])
     oracle = OracleEngine()
     qref = QRefTable(cfg["qref_dir"])
@@ -50,7 +57,7 @@ def main(cfg_path: str):
                            temperature=cfg["temperature"],
                            dtype=torch.bfloat16)
     buf = GroupBuffer(cfg["buffer_dir"])
-    rng = np.random.default_rng(cfg.get("seed", 0))
+    rng = np.random.default_rng(seed)
     version, n_batches = 0, 0
     sens, quiet = qref.split_roots()
     print(f"rollout up: {len(qref)} roots ({len(sens)} sensitive)", flush=True)
