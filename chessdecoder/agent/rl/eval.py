@@ -107,7 +107,7 @@ def eval_model(ckpt: str, ks=(0, 4, 16), batch_size: int = 128,
             # L1: agent
             eng = RolloutEngine(model, oracle, batch_size=batch_size,
                                 k_budget=max(k, 1), dtype=torch.bfloat16)
-            regs, beats = [], []
+            regs, beats, equals = [], [], []
             for i in range(0, len(boards), batch_size):
                 chunk = boards[i:i + batch_size]
                 pad = batch_size - len(chunk)
@@ -116,12 +116,14 @@ def eval_model(ckpt: str, ks=(0, 4, 16), batch_size: int = 128,
                 for b, e, r in zip(chunk, eps[:len(chunk)], refs[i:i + batch_size]):
                     uci = move_id_to_uci(b, e.final_move)
                     reg = _regret(r.moves, r.q, uci)
+                    g = _regret(r.moves, r.q, r.oracle_greedy)
                     regs.append(reg)
-                    beats.append(reg > _regret(r.moves, r.q, r.oracle_greedy)
-                                 + 1e-9)
+                    beats.append(reg > g + 1e-9)
+                    equals.append(abs(reg - g) <= 1e-9)
             results.append(dict(suite=suite, policy="L1_agent", k=k,
                                 regret=float(np.mean(regs)),
-                                beat_greedy=float(np.mean(beats))))
+                                beat_greedy=float(np.mean(beats)),
+                                equal_greedy=float(np.mean(equals))))
             del eng
             torch.cuda.empty_cache()
             # L2: PUCT at k sims (k=0 == L0)
