@@ -161,6 +161,11 @@ def main(cfg_path: str):
         # -- metrics (trainer = sole wandb writer) ---------------------------
         ms = [m for g in groups for m in g["metrics"]]
         rew = torch.cat([g["rewards"] for g in groups])
+        # forced-vs-free probing: reward and beat_greedy split by quota.
+        # The thesis signal is quota>0 groups overtaking quota=0 groups.
+        by_q = {}
+        for g in groups:
+            by_q.setdefault(g.get("min_probes", 0), []).append(g)
         stale = [version - g["version"] for g in groups]
         log = {
             "train/pg_loss": pg_loss.item(),
@@ -190,6 +195,14 @@ def main(cfg_path: str):
                 sum(m["probes_valid"] for m in ms),
                 sum(m["probes_invalid"] for m in ms)),
         }
+        for mp, gs in by_q.items():
+            r_q = torch.cat([g["rewards"] for g in gs])
+            ms_q = [m for g in gs for m in g["metrics"]]
+            log[f"quota/reward_mp{mp}"] = r_q.mean().item()
+            log[f"quota/regret_mp{mp}"] = float(np.mean(
+                [m["regret"] for m in ms_q]))
+            log[f"quota/beat_greedy_mp{mp}"] = float(np.mean(
+                [m["beat_greedy"] for m in ms_q]))
         wandb.log(log, step=step)
         if step % 20 == 0:
             print(f"step {step}: R {log['reward/mean']:+.4f} "
