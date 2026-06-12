@@ -21,8 +21,25 @@ rollout:
   corpus_bonus: 0.15
   buffer_max_depth: 64
   seed: 0
+  budget_quota_choices:
+  - - 16
+    - 0
+  - - 16
+    - 16
+  - - 8
+    - 8
+  - - 4
+    - 4
+  - - 2
+    - 2
+  - - 1
+    - 1
+  - - 16
+    - 8
+  - - 16
+    - 0
 trainer:
-  base_ckpt: checkpoints/agent_grpo_v1/grpo_400.pt
+  base_ckpt: checkpoints/agent_grpo_v1/grpo_2800.pt
   buffer_dir: /dev/shm/grpo_buffer
   weights_dir: /dev/shm/grpo_weights
   checkpoint_dir: checkpoints/agent_grpo_v1

@@ -80,11 +80,22 @@ def main(cfg_path: str):
         keys += list(rng.choice(quiet or sens,
                                 size=n_groups - len(keys), replace=False))
         roots = [chess.Board(k + " 0 1") for k in keys for _ in range(G)]
-        mp_choices = cfg.get("min_probes_choices", [0])
-        group_mp = [int(rng.choice(mp_choices)) for _ in range(n_groups)]
+        # (K, min_probes) sampled jointly per group: trains the whole
+        # test-time-compute curve on-distribution (budget tokens K<16 were
+        # OOD at eval and produced a regret sink at K=8)
+        bq = cfg.get("budget_quota_choices")
+        if bq:
+            picks = [bq[int(rng.integers(len(bq)))] for _ in range(n_groups)]
+            group_k = [int(p[0]) for p in picks]
+            group_mp = [int(p[1]) for p in picks]
+        else:
+            group_k = [cfg["probe_budget"]] * n_groups
+            mp_choices = cfg.get("min_probes_choices", [0])
+            group_mp = [int(rng.choice(mp_choices)) for _ in range(n_groups)]
+        ks_ = [k for k in group_k for _ in range(G)]
         mps = [mp for mp in group_mp for _ in range(G)]
         t0 = time.perf_counter()
-        eps = engine.rollout(roots, min_probes=mps)
+        eps = engine.rollout(roots, k_budgets=ks_, min_probes=mps)
         dt = time.perf_counter() - t0
 
         for gi in range(n_groups):
