@@ -1,5 +1,5 @@
 project_name: search-agent
-run_name: grpo-v1
+run_name: grpo-v2
 rollout:
   base_ckpt: checkpoints/agent_pretrain_v2/pretrain-v2_20260611_144726/agent_35000.pt
   qref_dir: agent_data/qref
@@ -41,10 +41,10 @@ rollout:
   - - 1
     - 1
 trainer:
-  base_ckpt: checkpoints/agent_grpo_v1/grpo_2800.pt
+  base_ckpt: checkpoints/agent_pretrain_v2/pretrain-v2_20260611_144726/agent_35000.pt
   buffer_dir: /dev/shm/grpo_buffer
   weights_dir: /dev/shm/grpo_weights
-  checkpoint_dir: checkpoints/agent_grpo_v1
+  checkpoint_dir: checkpoints/agent_grpo_v2
   optimizer: muon
   learning_rate: 0.0001
   weight_decay: 0.0
