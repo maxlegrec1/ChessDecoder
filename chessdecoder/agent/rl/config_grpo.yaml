@@ -14,6 +14,7 @@ rollout:
   - 2
   - 4
   - 8
+  - 16
   temperature: 1.0
   sensitive_frac: 0.85
   invalid_eps: 0.01
@@ -21,7 +22,7 @@ rollout:
   buffer_max_depth: 64
   seed: 0
 trainer:
-  base_ckpt: checkpoints/agent_grpo_v1/grpo_2800.pt
+  base_ckpt: checkpoints/agent_grpo_v1/grpo_400.pt
   buffer_dir: /dev/shm/grpo_buffer
   weights_dir: /dev/shm/grpo_weights
   checkpoint_dir: checkpoints/agent_grpo_v1
@@ -39,13 +40,25 @@ trainer:
   ckpt_every: 200
   max_steps: 100000
   seed: 0
-  aux_coef: 0.7
+  aux_coef: 0.1
   aux_parquet_dir: /mnt/2tb_2/decoder/parquet_files_decoder
   aux_label_glob: agent_data/t5_labels_train_*.parquet
   aux_paired_glob: agent_data/paired_labels_train_*.parquet
   aux_mix:
-    t5_distill: 0.4
-    t2_apply: 0.25
+    t1_copy: 0.02
+    t2_apply: 0.11
     t3_line: 0.15
-    t12_path: 0.15
-    t1_copy: 0.05
+    t4_agg: 0.08
+    t5_distill: 0.2
+    t6_distance: 0.04
+    t7_legal: 0.06
+    t8_played: 0.06
+    t10_lastmove: 0.03
+    t11_horizon: 0.03
+    t12_path: 0.08
+    t13_traj: 0.03
+    t14_swing: 0.02
+    t15_bestcolor: 0.02
+    t16_reach: 0.01
+    t17_opening: 0.02
+    t18_fill: 0.04
