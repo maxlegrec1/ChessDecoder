@@ -32,8 +32,8 @@ trainer:
   grad_clip: 1.0
   clip_eps: 0.2
   ent_coef: 0.003
-  groups_per_step: 4
-  min_buffer_groups: 4
+  groups_per_step: 3
+  min_buffer_groups: 3
   max_staleness: 3
   sync_every: 4
   trainer_wait_s: 0.0
