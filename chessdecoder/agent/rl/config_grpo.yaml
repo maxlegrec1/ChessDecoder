@@ -26,18 +26,20 @@ rollout:
     - 0
   - - 16
     - 16
+  - - 16
+    - 8
   - - 8
     - 8
+  - - 8
+    - 0
   - - 4
     - 4
+  - - 4
+    - 0
   - - 2
     - 2
   - - 1
     - 1
-  - - 16
-    - 8
-  - - 16
-    - 0
 trainer:
   base_ckpt: checkpoints/agent_grpo_v1/grpo_2800.pt
   buffer_dir: /dev/shm/grpo_buffer
