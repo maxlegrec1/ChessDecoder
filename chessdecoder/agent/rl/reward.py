@@ -116,9 +116,13 @@ def score_episode(ep, ref: RootRef, root: chess.Board,
     """Returns reward + metrics. ep: rl.episodes.Episode (final_move set)."""
     uci = move_id_to_uci(root, ep.final_move)
     assert uci is not None, "grammar guarantees a legal final move"
-    i = ref.moves.index(uci)
     q_best = float(ref.q.max())
-    q_agent = float(ref.q[i])
+    if uci in ref.moves:
+        q_agent = float(ref.q[ref.moves.index(uci)])
+    else:
+        # legal move the table didn't score (knight underpromotions in
+        # pre-fix shards): floor it like an unvisited move
+        q_agent = float(ref.q.min()) - 0.1
     ig = ref.moves.index(ref.oracle_greedy)
     q_greedy = float(ref.q[ig])
     reward = (q_agent - q_best) - invalid_eps * ep.probes_invalid

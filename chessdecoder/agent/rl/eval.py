@@ -75,7 +75,10 @@ def build_suites(n_per_suite: int = 1000, sims: int = 800,
 
 def _regret(ref_moves, ref_q, uci) -> float:
     q = np.asarray(ref_q)
-    return float(q[list(ref_moves).index(uci)] - q.max())
+    moves = list(ref_moves)
+    if uci not in moves:                      # unscored legal move: floor
+        return float(q.min() - 0.1 - q.max())
+    return float(q[moves.index(uci)] - q.max())
 
 
 def eval_model(ckpt: str, ks=(0, 4, 16), batch_size: int = 128,

@@ -52,6 +52,15 @@ static void move_key_logits(const Board &b, const Move &mv,
     std::string k1 = chess::uci::moveToUci(mv);
     auto it = g_move_map.find(k1);
     if (it != g_move_map.end()) { best_logit = pol[it->second]; found = true; }
+    if (mv.typeOf() == Move::PROMOTION
+        && mv.promotionType() == chess::PieceType::KNIGHT) {
+        std::string k3 = k1.substr(0, 4);     // bare lc0 knight-promo key
+        auto it3 = g_move_map.find(k3);
+        if (it3 != g_move_map.end() && (!found || pol[it3->second] > best_logit)) {
+            best_logit = pol[it3->second];
+            found = true;
+        }
+    }
     if (mv.typeOf() == Move::CASTLING) {
         std::string k2;
         k2 += static_cast<std::string>(mv.from().file());
