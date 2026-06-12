@@ -7,7 +7,7 @@ rollout:
   weights_dir: /dev/shm/grpo_weights
   min_roots: 8000
   batch_size: 128
-  group_size: 8
+  group_size: 16
   probe_budget: 16
   min_probes_choices:
   - 0
@@ -15,13 +15,13 @@ rollout:
   - 4
   - 8
   temperature: 1.0
-  sensitive_frac: 0.7
+  sensitive_frac: 0.85
   invalid_eps: 0.01
   corpus_bonus: 0.15
   buffer_max_depth: 64
   seed: 0
 trainer:
-  base_ckpt: checkpoints/agent_grpo_v1/grpo_7000.pt
+  base_ckpt: checkpoints/agent_grpo_v1/grpo_800.pt
   buffer_dir: /dev/shm/grpo_buffer
   weights_dir: /dev/shm/grpo_weights
   checkpoint_dir: checkpoints/agent_grpo_v1
