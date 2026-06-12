@@ -116,6 +116,7 @@ def test_oracle_injection_parity(setup, episodes):
     checked = 0
     for e in episodes:
         i = PREFIX_LEN
+        seen = {e.root_fen.rsplit(" ", 2)[0]}
         while i < len(e.ids):
             t = e.ids[i]
             if t == pv.PROBE:
@@ -129,7 +130,10 @@ def test_oracle_injection_parity(setup, episodes):
                     b = None
                 if b is None or not b.is_valid() or b.is_game_over():
                     assert reply[0] == pv.INVALID
+                elif b.fen().rsplit(" ", 2)[0] in seen:
+                    assert reply[0] == pv.INVALID, "repeat must be no-info"
                 else:
+                    seen.add(b.fen().rsplit(" ", 2)[0])
                     r = oracle.query(b)
                     assert reply[:7] == r.tokens(), "reply != oracle"
                 checked += 1
@@ -145,7 +149,8 @@ def test_oracle_injection_parity(setup, episodes):
 def test_probe_stats_consistency(episodes):
     for e in episodes:
         n_probe = sum(1 for t in e.ids if t == pv.PROBE)
-        assert n_probe == e.probes_valid + e.probes_invalid
+        assert n_probe == (e.probes_valid + e.probes_invalid
+                           + e.probes_repeat)
 
 
 @pytest.mark.slow

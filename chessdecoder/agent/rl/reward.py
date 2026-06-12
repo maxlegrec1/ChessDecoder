@@ -134,5 +134,6 @@ def score_episode(ep, ref: RootRef, root: chess.Board,
         match_corpus_best=uci == ref.corpus_best,
         probes_valid=ep.probes_valid,
         probes_invalid=ep.probes_invalid,
+        probes_repeat=getattr(ep, "probes_repeat", 0),
         final_uci=uci,
     )

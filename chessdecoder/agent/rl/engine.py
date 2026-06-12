@@ -76,6 +76,9 @@ class RolloutEngine:
                for b, k, mp in zip(roots, ks, mps)]
         grams = [EpisodeGrammar(b, k, mp)
                  for b, k, mp in zip(roots, ks, mps)]
+        # honest repeat semantics: re-probing an already-answered position
+        # (incl. the root, answered in the prefix) returns no new information
+        seen_keys = [{b.fen().rsplit(" ", 2)[0]} for b in roots]
         queues: list[list[int]] = [[] for _ in range(self.B)]   # pending injections
         pend_board: list[list[int] | None] = [None] * self.B    # probe slots buf
 
@@ -165,7 +168,11 @@ class RolloutEngine:
                     if b is None:
                         eps[i].probes_invalid += 1
                         queues[i] = _invalid_tokens(g.budget)
+                    elif b.fen().rsplit(" ", 2)[0] in seen_keys[i]:
+                        eps[i].probes_repeat += 1
+                        queues[i] = _invalid_tokens(g.budget)
                     else:
+                        seen_keys[i].add(b.fen().rsplit(" ", 2)[0])
                         eps[i].probes_valid += 1
                         boards.append(b)
                         valid_rows.append(i)

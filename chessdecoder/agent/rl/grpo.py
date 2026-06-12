@@ -203,6 +203,8 @@ def main(cfg_path: str):
             "probes/valid_per_ep": np.mean([m["probes_valid"] for m in ms]),
             "probes/invalid_per_ep": np.mean([m["probes_invalid"]
                                               for m in ms]),
+            "probes/repeat_per_ep": np.mean([m.get("probes_repeat", 0)
+                                             for m in ms]),
             "probes/validity": (lambda v, i: v / max(v + i, 1))(
                 sum(m["probes_valid"] for m in ms),
                 sum(m["probes_invalid"] for m in ms)),

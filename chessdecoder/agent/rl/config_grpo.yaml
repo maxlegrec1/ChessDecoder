@@ -21,12 +21,12 @@ rollout:
   buffer_max_depth: 64
   seed: 0
 trainer:
-  base_ckpt: checkpoints/agent_grpo_v1/grpo_800.pt
+  base_ckpt: checkpoints/agent_grpo_v1/grpo_2800.pt
   buffer_dir: /dev/shm/grpo_buffer
   weights_dir: /dev/shm/grpo_weights
   checkpoint_dir: checkpoints/agent_grpo_v1
   optimizer: muon
-  learning_rate: 3.0e-05
+  learning_rate: 0.0001
   weight_decay: 0.0
   grad_clip: 1.0
   clip_eps: 0.2

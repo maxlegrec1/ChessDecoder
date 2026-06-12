@@ -49,6 +49,7 @@ class Episode:
     agent: list[bool] = field(default_factory=list)        # agent-emitted?
     probes_valid: int = 0
     probes_invalid: int = 0
+    probes_repeat: int = 0          # informationless re-queries (no penalty)
     final_move: int | None = None                          # agent MOVE id
     done: bool = False
 
