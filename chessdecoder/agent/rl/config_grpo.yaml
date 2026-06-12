@@ -39,13 +39,13 @@ trainer:
   ckpt_every: 200
   max_steps: 100000
   seed: 0
-  aux_coef: 0.5
+  aux_coef: 0.7
   aux_parquet_dir: /mnt/2tb_2/decoder/parquet_files_decoder
   aux_label_glob: agent_data/t5_labels_train_*.parquet
   aux_paired_glob: agent_data/paired_labels_train_*.parquet
   aux_mix:
-    t2_apply: 0.4
-    t3_line: 0.25
-    t1_copy: 0.1
-    t5_distill: 0.15
-    t12_path: 0.1
+    t5_distill: 0.4
+    t2_apply: 0.25
+    t3_line: 0.15
+    t12_path: 0.15
+    t1_copy: 0.05
