@@ -21,6 +21,33 @@ from chessdecoder.agent.rl.episodes import PREFIX_LEN, PROBE_TOKENS
 from chessdecoder.agent.rl.rollout_proc import load_model
 
 
+def _reachable_depth(root: chess.Board, key: str, max_plies: int = 4,
+                     node_cap: int = 60_000) -> int | None:
+    """Bounded BFS: plies from root to the position `key`, or None.
+    node_cap keeps worst-case cost ~tens of ms per probe."""
+    frontier = [root.fen()]
+    seen = {root.fen().rsplit(" ", 2)[0]}
+    visited = 0
+    for d in range(1, max_plies + 1):
+        nxt = []
+        for f in frontier:
+            b = chess.Board(f)
+            for mv in b.legal_moves:
+                b.push(mv)
+                k = b.fen().rsplit(" ", 2)[0]
+                if k == key:
+                    return d
+                if k not in seen:
+                    seen.add(k)
+                    nxt.append(b.fen())
+                b.pop()
+                visited += 1
+                if visited > node_cap:
+                    return None
+        frontier = nxt
+    return None
+
+
 def classify(root: chess.Board, b: chess.Board, top4: set[str]) -> str:
     key = b.fen().rsplit(" ", 2)[0]
     for mv in root.legal_moves:
@@ -30,17 +57,10 @@ def classify(root: chess.Board, b: chess.Board, top4: set[str]) -> str:
             root.pop()
             return ("child_top4" if mv.uci() in top4 else "child_other")
         root.pop()
-    # 2-ply scan (bounded)
-    for mv in list(root.legal_moves):
-        root.push(mv)
-        for mv2 in list(root.legal_moves):
-            root.push(mv2)
-            if root.fen().rsplit(" ", 2)[0] == key:
-                root.pop(); root.pop()
-                return "grandchild"
-            root.pop()
-        root.pop()
-    return "other"          # deeper, transposed, or counterfactual
+    d = _reachable_depth(root, key)
+    if d is not None:
+        return f"descendant_{d}ply"
+    return "counterfactual"      # not reachable within 4 plies
 
 
 def piece_distance(a: chess.Board, b: chess.Board) -> int:
