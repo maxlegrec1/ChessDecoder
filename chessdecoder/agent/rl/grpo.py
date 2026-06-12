@@ -9,6 +9,7 @@ trusted from the rollout process). Entropy bonus on the masked distribution.
 """
 from __future__ import annotations
 
+import gc
 import os
 import sys
 import time
@@ -214,6 +215,8 @@ def main(cfg_path: str):
             torch.save({"model_state_dict": model.state_dict(),
                         "step": step},
                        f"{cfg['checkpoint_dir']}/grpo_{step}.pt")
+        if step % 500 == 0:
+            gc.collect()                  # host-RAM creep mitigation
         if cfg["trainer_wait_s"] > 0:
             time.sleep(cfg["trainer_wait_s"])
 
