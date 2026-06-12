@@ -156,7 +156,7 @@ def main(cfg_path: str):
     prev = load_weights_if_newer(cfg["weights_dir"], -1)
     version = (prev[1] if prev is not None else 0) + 1
     publish_weights(cfg["weights_dir"], model.state_dict(), version)
-    print("published v1, waiting for groups...", flush=True)
+    print(f"published v{version}, waiting for groups...", flush=True)
 
     step = 0
     while step < cfg["max_steps"]:
