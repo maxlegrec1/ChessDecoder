@@ -57,6 +57,12 @@ def main(cfg_path: str):
                            temperature=cfg["temperature"],
                            dtype=torch.bfloat16)
     buf = GroupBuffer(cfg["buffer_dir"])
+    # never generate behavior data from the base ckpt while the trainer is
+    # about to publish a much newer policy (audit risk #5)
+    if cfg.get("wait_for_weights", True):
+        while load_weights_if_newer(cfg["weights_dir"], -1) is None:
+            print("waiting for trainer weights...", flush=True)
+            time.sleep(5)
     rng = np.random.default_rng(seed)
     version, n_batches = 0, 0
     sens, quiet = qref.split_roots()

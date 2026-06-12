@@ -127,6 +127,7 @@ class OracleEngine:
         """Drop-in for Oracle.query_batch (same Reply, FEN memo)."""
         keys = [b.fen().rsplit(" ", 2)[0] for b in boards]
         fresh = [i for i, k in enumerate(keys) if k not in self._memo]
+        fresh_replies: dict[int, Reply] = {}
         if fresh:
             fens = [boards[i].fen() for i in fresh]
             q, d, pol = self.eval_batch(fens)
@@ -173,10 +174,12 @@ class OracleEngine:
                     moves.append(moves[-1])
                 r = Reply(q_bin=pv.q_to_bin(qs[j]), d_bin=pv.d_to_bin(ds[j]),
                           top_moves=moves)
+                fresh_replies[i] = r
                 if len(self._memo) < self._memo_max:
                     self._memo[keys[i]] = r
         self.n_memo_hits += len(boards) - len(fresh)
-        return [self._memo[k] for k in keys]
+        return [self._memo.get(k, fresh_replies.get(i))
+                for i, k in enumerate(keys)]
 
     def query(self, board: chess.Board) -> Reply:
         return self.query_batch([board])[0]

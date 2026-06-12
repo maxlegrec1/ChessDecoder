@@ -22,7 +22,7 @@ CKPT = sys.argv[1]
 N_POS = int(sys.argv[2]) if len(sys.argv) > 2 else 100
 K = int(sys.argv[3]) if len(sys.argv) > 3 else 16
 B = 128
-MAX_PLIES = 160
+MAX_ROUNDS = 160      # loop rounds; most rounds advance games by 2 plies
 
 
 def main():
@@ -48,7 +48,7 @@ def main():
             return 1.0 if out.winner == g["agent_color"] else 0.0
         r = oracle.query(b)                       # stm POV q
         from chessdecoder.agent import patch_vocab as pv
-        q = (r.q_bin / 64.0) - 1.0                # bin -> approx q
+        q = ((r.q_bin + 0.5) / 64.0) - 1.0        # bin center -> q
         q_agent = q if b.turn == g["agent_color"] else -q
         if q_agent > 0.25:
             return 1.0
@@ -57,7 +57,7 @@ def main():
         return 0.5
 
     plies = 0
-    while plies < MAX_PLIES:
+    while plies < MAX_ROUNDS:
         live = [g for g in games if g["result"] is None]
         if not live:
             break
@@ -100,9 +100,13 @@ def main():
     l = n - w - d
     p = score / n
     import math
-    se = math.sqrt(p * (1 - p) / n)
+    # paired CI: aggregate the two colors of each start position
+    import numpy as _np
+    pair_scores = _np.array([(games[i]["result"] + games[i + 1]["result"]) / 2
+                             for i in range(0, n, 2)])
+    se = pair_scores.std(ddof=1) / math.sqrt(len(pair_scores))
     print(f"\nAGENT vs ORACLE-GREEDY (K={K}, {n} games, paired): "
-          f"+{w} ={d} -{l}  score {p:.3f} +/- {1.96*se:.3f} (95% CI)")
+          f"+{w} ={d} -{l}  score {p:.3f} +/- {1.96*se:.3f} (95% paired CI)")
     elo = 400 * math.log10(p / (1 - p)) if 0 < p < 1 else float("inf")
     print(f"elo diff: {elo:+.0f}")
 

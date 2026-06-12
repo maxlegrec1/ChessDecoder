@@ -208,12 +208,16 @@ def num_token(n: int) -> int:
 
 def move_keys(board: chess.Board, mv: chess.Move) -> list[str]:
     """All vocab spellings of mv: python-chess uci, plus the lc0
-    king-takes-rook form for castling."""
+    king-takes-rook form for castling and the bare lc0 spelling for
+    knight promotions (the vocab has "e7e8" = N-promo, not "e7e8n" —
+    audit: knight underpromotion was unrepresentable system-wide)."""
     keys = [mv.uci()]
     if board.is_castling(mv):
         frm = chess.square_name(mv.from_square)
         rook_file = "h" if board.is_kingside_castling(mv) else "a"
         keys.append(frm + rook_file + frm[1])
+    if mv.promotion == chess.KNIGHT:
+        keys.append(mv.uci()[:-1])
     return keys
 
 

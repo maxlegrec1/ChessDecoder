@@ -124,11 +124,13 @@ struct Tree {
             }
             path.emplace_back(nid, best);
             b.makeMove(n.moves[best]);
-            if (n.child[best] == -1) {
-                n.child[best] = static_cast<int32_t>(nodes.size());
-                nodes.emplace_back();
+            int next_id = n.child[best];
+            if (next_id == -1) {
+                next_id = static_cast<int32_t>(nodes.size());
+                n.child[best] = next_id;       // before emplace: realloc
+                nodes.emplace_back();          // invalidates n
             }
-            nid = n.child[best];
+            nid = next_id;
         }
     }
 

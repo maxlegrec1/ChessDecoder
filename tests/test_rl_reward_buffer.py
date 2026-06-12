@@ -115,17 +115,20 @@ def test_batch_positions_synthetic():
              metrics=[], gen_seconds=0.0, tokens=0)
     zero_g = dict(g, rewards=torch.tensor([-0.1, -0.1]))
     out = _batch_positions([g, zero_g])
-    ids_t, pos_b, pos_t, masks, adv, beh, n_eps, zero_var, fam = out
-    assert fam.tolist() == [1, 2] * 2          # verb, answer per episode
-    assert zero_var == 1 and n_eps == 2
-    assert pos_t.tolist() == [PREFIX_LEN, PREFIX_LEN + 1] * 2
+    ids_t, pos_b, pos_t, masks, adv, beh, n_eps, zero_var, fam, w = out
+    # zero-var group now KEPT with adv=0 (entropy still applies): 4 episodes
+    assert zero_var == 1 and n_eps == 4
+    assert fam.tolist() == [1, 2] * 4
+    assert pos_t.tolist() == [PREFIX_LEN, PREFIX_LEN + 1] * 4
     assert masks.shape[1] == pv.VOCAB_SIZE
-    # verb mask row then legal-move row, per episode
     assert masks[0][pv.ANSWER] and masks[0][pv.PROBE]
     assert masks[1][mid] and not masks[1][pv.ANSWER]
-    # advantages: episode 0 (R=0.0) positive, episode 1 negative, broadcast
+    # advantages: g episodes nonzero opposite-signed, zero_g episodes zero
     assert adv[0] == adv[1] and adv[2] == adv[3]
     assert adv[0] > 0 > adv[2]
+    assert adv[4] == adv[5] == adv[6] == adv[7] == 0.0
+    # per-episode weights: 2 positions each -> 0.5
+    assert torch.allclose(w, torch.full((8,), 0.5))
 
 
 def test_corpus_bonus():

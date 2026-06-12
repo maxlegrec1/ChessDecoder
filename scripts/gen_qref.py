@@ -38,7 +38,8 @@ def main():
     shards = sorted(glob.glob(SHARD_GLOB))[:-1]      # last shard = held out
     seen: set[str] = set()
     for f in sorted(glob.glob(f"{OUT_DIR}/qref_*.parquet")):
-        seen.update(pd.read_parquet(f, columns=["fen"]).fen)
+        seen.update(x.rsplit(" ", 2)[0]
+                    for x in pd.read_parquet(f, columns=["fen"]).fen)
     print(f"resuming with {len(seen)} roots already done", flush=True)
 
     counter = len(glob.glob(f"{OUT_DIR}/qref_*.parquet"))

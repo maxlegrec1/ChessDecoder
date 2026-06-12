@@ -50,6 +50,7 @@ class Tree:
         unexpanded (needs eval) or terminal."""
         nid, path = 0, []
         board = self.root_board.copy(stack=False)
+        board.clear_stack()          # repetition window = the search path
         while True:
             node = self.nodes[nid]
             if node.terminal_v is not None or node.P is None:
@@ -105,7 +106,8 @@ def _terminal_value(board: chess.Board) -> float | None:
     if board.is_checkmate():
         return -1.0                  # side to move is mated
     if (board.is_stalemate() or board.is_insufficient_material()
-            or board.can_claim_fifty_moves()):
+            or board.halfmove_clock >= 100        # match chess.hpp exactly
+            or board.is_repetition(3)):
         return 0.0
     return None
 

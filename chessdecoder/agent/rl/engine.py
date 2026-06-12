@@ -70,6 +70,8 @@ class RolloutEngine:
         <answer> until that many probes are used (probe-collapse counter)."""
         assert len(roots) == self.B
         ks = k_budgets or [self.K] * self.B
+        assert max(ks) <= self.K, "k_budget exceeds engine max_len sizing"
+        assert all(not b.is_game_over() for b in roots), "terminal root"
         mps = min_probes or [0] * self.B
         replies = self.oracle.query_batch(roots)
         eps = [Episode(root_fen=b.fen(), k_budget=k, min_probes=mp)
