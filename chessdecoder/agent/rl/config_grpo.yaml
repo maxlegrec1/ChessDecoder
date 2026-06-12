@@ -21,7 +21,7 @@ rollout:
   buffer_max_depth: 64
   seed: 0
 trainer:
-  base_ckpt: checkpoints/agent_grpo_v1/grpo_1200.pt
+  base_ckpt: checkpoints/agent_grpo_v1/grpo_2000.pt
   buffer_dir: /dev/shm/grpo_buffer
   weights_dir: /dev/shm/grpo_weights
   checkpoint_dir: checkpoints/agent_grpo_v1
