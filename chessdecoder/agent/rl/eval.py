@@ -123,7 +123,9 @@ def eval_model(ckpt: str, ks=(0, 4, 16), batch_size: int = 128,
             results.append(dict(suite=suite, policy="L1_agent", k=k,
                                 regret=float(np.mean(regs)),
                                 beat_greedy=float(np.mean(beats)),
-                                equal_greedy=float(np.mean(equals))))
+                                equal_greedy=float(np.mean(equals)),
+                                blunder=float(np.mean([x < -0.5
+                                                       for x in regs]))))
             del eng
             torch.cuda.empty_cache()
             # L2: PUCT at k sims (k=0 == L0)
