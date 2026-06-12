@@ -91,9 +91,14 @@ def _batch_positions(groups: list[dict]):
         ids[i, :x.shape[0]] = x
     table = torch.cat([_STATIC, torch.stack(masks_extra)]) \
         if masks_extra else _STATIC
+    rows_t = torch.tensor(rows)
+    # token family per position: 0=board slot, 1=verb, 2=answer move
+    fam = torch.where(rows_t < 19, 0,
+                      torch.where(rows_t < _STATIC.shape[0], 1, 2))
     return (ids, torch.tensor(pos_b), torch.tensor(pos_t),
-            table[torch.tensor(rows)], torch.tensor(advs, dtype=torch.float32),
-            torch.tensor(beh, dtype=torch.float32), len(eps_ids), zero_var)
+            table[rows_t], torch.tensor(advs, dtype=torch.float32),
+            torch.tensor(beh, dtype=torch.float32), len(eps_ids), zero_var,
+            fam)
 
 
 def main(cfg_path: str):
@@ -126,7 +131,7 @@ def main(cfg_path: str):
         if batch is None:
             time.sleep(1.0)
             continue
-        ids, pos_b, pos_t, masks, adv, beh, n_eps, zero_var = batch
+        ids, pos_b, pos_t, masks, adv, beh, n_eps, zero_var, fam = batch
         ids = ids.to(DEV)
         pos_b, pos_t = pos_b.to(DEV), pos_t.to(DEV)
         masks, adv, beh = masks.to(DEV), adv.to(DEV), beh.to(DEV)
@@ -171,6 +176,12 @@ def main(cfg_path: str):
         log = {
             "train/pg_loss": pg_loss.item(),
             "train/entropy": entropy.mean().item(),
+            "train/entropy_board": entropy[fam == 0].mean().item()
+                                   if (fam == 0).any() else 0.0,
+            "train/entropy_verb": entropy[fam == 1].mean().item()
+                                  if (fam == 1).any() else 0.0,
+            "train/entropy_answer": entropy[fam == 2].mean().item()
+                                    if (fam == 2).any() else 0.0,
             "train/clip_frac": ((ratio - 1).abs() > eps_clip).float()
                                .mean().item(),
             "train/ratio_dev": (ratio - 1).abs().mean().item(),

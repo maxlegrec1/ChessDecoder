@@ -115,7 +115,8 @@ def test_batch_positions_synthetic():
              metrics=[], gen_seconds=0.0, tokens=0)
     zero_g = dict(g, rewards=torch.tensor([-0.1, -0.1]))
     out = _batch_positions([g, zero_g])
-    ids_t, pos_b, pos_t, masks, adv, beh, n_eps, zero_var = out
+    ids_t, pos_b, pos_t, masks, adv, beh, n_eps, zero_var, fam = out
+    assert fam.tolist() == [1, 2] * 2          # verb, answer per episode
     assert zero_var == 1 and n_eps == 2
     assert pos_t.tolist() == [PREFIX_LEN, PREFIX_LEN + 1] * 2
     assert masks.shape[1] == pv.VOCAB_SIZE
